@@ -1,417 +1,80 @@
-﻿import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { parseProfileConstraints, runFullValidation, downloadCSV, resolveSeverity } from "./validation.js";
+import {
+    parseDexpiPackage, boundsFromElements, clampViewBox,
+    findAncestors, collectDescendantObjectIds, flattenTree,
+    parseColor,
+} from "./dexpiParser.js";
 
-const styles = {
-    app: { display: "grid", gridTemplateColumns: "320px 1fr 320px", height: "100vh", fontFamily: "Arial, sans-serif", color: "#111" },
-    appLeftCollapsed: { display: "grid", gridTemplateColumns: "44px 1fr 320px", height: "100vh", fontFamily: "Arial, sans-serif", color: "#111" },
-    appRightCollapsed: { display: "grid", gridTemplateColumns: "320px 1fr 44px", height: "100vh", fontFamily: "Arial, sans-serif", color: "#111" },
-    appBothCollapsed: { display: "grid", gridTemplateColumns: "44px 1fr 44px", height: "100vh", fontFamily: "Arial, sans-serif", color: "#111" },
-    panel: { borderRight: "1px solid #d0d7de", overflow: "auto", background: "#fff" },
-    collapsedPanel: { borderRight: "1px solid #d0d7de", overflow: "hidden", background: "#fff", display: "flex", alignItems: "stretch", justifyContent: "center" },
-    rightPanel: { borderLeft: "1px solid #d0d7de", overflow: "auto", background: "#fff" },
-    collapsedRightPanel: { borderLeft: "1px solid #d0d7de", overflow: "hidden", background: "#fff", display: "flex", alignItems: "stretch", justifyContent: "center" },
-    toolbar: { padding: 12, borderBottom: "1px solid #d0d7de", position: "sticky", top: 0, background: "#f6f8fa", zIndex: 2 },
-    button: { padding: "8px 10px", border: "1px solid #c7ced6", background: "white", borderRadius: 6, cursor: "pointer" },
-    input: { width: "100%", padding: 8, border: "1px solid #c7ced6", borderRadius: 6, boxSizing: "border-box" },
+// ---------- Data value formatting --------------------------------------------
+
+/**
+ * Render a parsed data value into a human-readable string or JSX.
+ * Handles PhysicalQuantity (UoM), DataReference (enums), strings, numbers, etc.
+ */
+function formatDataValue(value) {
+    if (value === null || value === undefined) return { text: "—", uom: null };
+
+    // Physical quantity: { kind:"PhysicalQuantity", value, unit, unitRef }
+    if (value && typeof value === "object" && value.kind === "PhysicalQuantity") {
+        const num = value.value !== null && value.value !== undefined ? String(value.value) : "—";
+        return { text: num, uom: value.unit || null, unitRef: value.unitRef || null };
+    }
+
+    // DataReference (enumeration): { kind:"DataReference", value:"..." }
+    if (value && typeof value === "object" && value.kind === "DataReference") {
+        const short = value.value.split(".").pop().split("/").pop();
+        return { text: short, uom: null, fullRef: value.value };
+    }
+
+    // Generic aggregated value fallback: { kind:"AggregatedValue", type, entries }
+    if (value && typeof value === "object" && value.kind === "AggregatedValue") {
+        const parts = Object.entries(value.entries || {})
+            .map(([k, v]) => `${k}: ${formatDataValue(v).text}`).join(", ");
+        return { text: parts || `(${value.type})`, uom: null };
+    }
+
+    // SingleLanguageString
+    if (value && typeof value === "object" && typeof value.value === "string") {
+        return { text: value.value, uom: null };
+    }
+
+    // Primitive
+    return { text: String(value), uom: null };
+}
+
+// ---------- Styles -----------------------------------------------------------
+
+const S = {
+    app: (lc, rc) => ({ display: "grid", gridTemplateColumns: `${lc ? 44 : 340}px 1fr ${rc ? 44 : 340}px`, height: "100vh", fontFamily: "Arial, sans-serif", color: "#111", overflow: "hidden" }),
+    panel: { borderRight: "1px solid #d0d7de", display: "flex", flexDirection: "column", background: "#fff", minWidth: 0, overflow: "hidden" },
+    rPanel: { borderLeft: "1px solid #d0d7de", display: "flex", flexDirection: "column", background: "#fff", minWidth: 0, overflow: "hidden" },
+    collapsed: { borderRight: "1px solid #d0d7de", background: "#f6f8fa", display: "flex", alignItems: "center", justifyContent: "center" },
+    rCollapsed: { borderLeft: "1px solid #d0d7de", background: "#f6f8fa", display: "flex", alignItems: "center", justifyContent: "center" },
+    toolbar: { padding: "10px 12px", borderBottom: "1px solid #d0d7de", background: "#f6f8fa", flexShrink: 0 },
+    scroll: { flex: 1, overflow: "auto" },
     section: { padding: 12, borderBottom: "1px solid #eef2f6" },
-    center: { position: "relative", overflow: "hidden", background: "#f8fafc" },
-    badge: { display: "inline-block", padding: "3px 8px", border: "1px solid #d0d7de", borderRadius: 999, fontSize: 12, background: "#fff" },
-    collapseButton: { width: "100%", height: "100%", border: "none", background: "#f6f8fa", cursor: "pointer", fontSize: 18, color: "#57606a" },
-    toolbarRow: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 },
+    btn: { padding: "6px 10px", border: "1px solid #c7ced6", background: "white", borderRadius: 6, cursor: "pointer", fontSize: 13 },
+    btnPrimary: { padding: "6px 10px", border: "1px solid #0969da", background: "#0969da", color: "white", borderRadius: 6, cursor: "pointer", fontSize: 13 },
+    btnSmall: { padding: "3px 7px", border: "1px solid #c7ced6", background: "white", borderRadius: 4, cursor: "pointer", fontSize: 12 },
+    btnDanger: { padding: "3px 7px", border: "1px solid #cf222e", background: "white", color: "#cf222e", borderRadius: 4, cursor: "pointer", fontSize: 12 },
+    input: { width: "100%", padding: "6px 8px", border: "1px solid #c7ced6", borderRadius: 6, boxSizing: "border-box", fontSize: 13 },
+    badge: (color) => ({ display: "inline-block", padding: "2px 7px", borderRadius: 999, fontSize: 11, fontWeight: 600, background: color || "#eef2f6", color: color ? "white" : "#444" }),
+    tabBar: { display: "flex", gap: 0, borderBottom: "1px solid #d0d7de", background: "#f6f8fa", flexShrink: 0 },
+    tab: (active) => ({ padding: "8px 14px", cursor: "pointer", fontWeight: active ? 700 : 400, fontSize: 13, color: active ? "#0969da" : "#57606a", background: "none", border: "none", borderBottom: active ? "2px solid #0969da" : "2px solid transparent" }),
+    collapseBtn: { width: 30, height: 30, border: "none", background: "transparent", cursor: "pointer", fontSize: 18, color: "#57606a" },
+    sevColor: { Error: "#cf222e", Warning: "#9a6700", Info: "#0969da" },
 };
 
-function qsa(node, selector) {
-    return Array.from(node.querySelectorAll(selector));
-}
+// ---------- SVG Rendering ----------------------------------------------------
 
-function directChildrenByTag(node, tag) {
-    if (!node || !node.children) return [];
-    return Array.from(node.children).filter((c) => c && c.tagName === tag);
-}
-
-function directComponentsObjects(node, property = null) {
-    if (!node) return [];
-    const comps = directChildrenByTag(node, "Components").filter((c) => !property || c.getAttribute("property") === property);
-    return comps.flatMap((c) => directChildrenByTag(c, "Object"));
-}
-
-function dataValue(dataNode) {
-    if (!dataNode) return null;
-    const first = dataNode.firstElementChild;
-    if (!first) return null;
-    if (first.tagName === "String") return first.textContent || "";
-    if (first.tagName === "Boolean") return (first.textContent || "").trim() === "true";
-    if (first.tagName === "Integer") return parseInt(first.textContent || "0", 10);
-    if (first.tagName === "Double") return parseFloat(first.textContent || "0");
-    if (first.tagName === "Undefined") return null;
-    if (first.tagName === "DataReference") return { kind: "DataReference", value: first.getAttribute("data") || "" };
-    if (first.tagName === "AggregatedDataValue") return aggregatedValue(first);
-    return first.textContent?.trim() || null;
-}
-
-function getData(node, property) {
-    if (!node) return undefined;
-    return directChildrenByTag(node, "Data").find((d) => d.getAttribute("property") === property);
-}
-
-function aggregatedValue(aggNode) {
-    if (!aggNode || typeof aggNode.getAttribute !== "function") return null;
-    const type = aggNode.getAttribute("type") || "";
-    if (type === "Core/Diagram.Point") {
-        return { x: numberFromData(aggNode, "X"), y: numberFromData(aggNode, "Y") };
-    }
-    if (type === "Core/Diagram.Color") {
-        return { r: intFromData(aggNode, "R", 0), g: intFromData(aggNode, "G", 0), b: intFromData(aggNode, "B", 0) };
-    }
-    if (type === "Core/Diagram.Stroke") return parseStroke(aggNode);
-    if (type === "Core/Diagram.TextStyle") {
-        return {
-            color: aggregatedValue(getData(aggNode, "Color")?.firstElementChild),
-            font: valueFromData(aggNode, "Font") || "Arial",
-            size: numberFromData(aggNode, "Height") || 3.5,
-            horizontal: refName(valueFromData(aggNode, "HorizontalAlignment")) || "Center",
-            vertical: refName(valueFromData(aggNode, "VerticalAlignment")) || "Center",
-        };
-    }
-    if (type === "Core/DataTypes.MultiLanguageString") {
-        const items = directChildrenByTag(aggNode, "Data").filter((d) => d.getAttribute("property") === "SingleLanguageStrings");
-        const vals = items.map((d) => aggregatedValue(d.firstElementChild)).filter(Boolean);
-        return vals.map((v) => v.value).join(" ");
-    }
-    if (type === "Core/DataTypes.SingleLanguageString") {
-        return { language: valueFromData(aggNode, "Language") || "", value: valueFromData(aggNode, "Value") || "" };
-    }
-    return { type, raw: aggNode };
-}
-
-function valueFromData(node, property) {
-    return dataValue(getData(node, property));
-}
-
-function numberFromData(node, property, fallback = 0) {
-    const v = valueFromData(node, property);
-    return typeof v === "number" ? v : fallback;
-}
-
-function intFromData(node, property, fallback = 0) {
-    const v = valueFromData(node, property);
-    return Number.isInteger(v) ? v : fallback;
-}
-
-function parseColor(value) {
-    if (!value) return "#000000";
-    const r = (value.r ?? 0).toString(16).padStart(2, "0");
-    const g = (value.g ?? 0).toString(16).padStart(2, "0");
-    const b = (value.b ?? 0).toString(16).padStart(2, "0");
-    return `#${r}${g}${b}`;
-}
-
-function refName(value) {
-    if (!value) return "";
-    if (typeof value === "string") return value.split(".").pop().split("/").pop();
-    if (value.kind === "DataReference") return value.value.split(".").pop().split("/").pop();
-    return "";
-}
-
-function parseStroke(node) {
-    const color = aggregatedValue(getData(node, "Color")?.firstElementChild);
-    const width = numberFromData(node, "Width", 0.25);
-    const dashStyle = refName(valueFromData(node, "DashStyle")) || "Solid";
-    const dashMap = {
-        Solid: "",
-        Dash: `${4 * width} ${2 * width}`,
-        Dot: `${width} ${2 * width}`,
-        DashDot: `${4 * width} ${2 * width} ${width} ${2 * width}`,
-        DashDotDot: `${4 * width} ${2 * width} ${width} ${2 * width} ${width} ${2 * width}`,
-    };
-    return { color: parseColor(color), width, dashArray: dashMap[dashStyle] || "", dashOffset: numberFromData(node, "Offset", 0) };
-}
-
-function parseFill(node) {
-    const style = refName(valueFromData(node, "FillStyle")) || "Transparent";
-    const color = aggregatedValue(getData(node, "Color")?.firstElementChild);
-    return { style, color: parseColor(color) };
-}
-
-function parsePointsFromData(dataNode) {
-    return directChildrenByTag(dataNode, "AggregatedDataValue").map((p) => aggregatedValue(p)).filter(Boolean);
-}
-
-function parsePrimitive(objectNode, idx) {
-    if (!objectNode || typeof objectNode.getAttribute !== "function") return null;
-    const type = objectNode.getAttribute("type") || "";
-    const key = `${type}_${idx}`;
-
-    if (type === "Core/Diagram.PolyLine") {
-        return { kind: "polyline", key, points: parsePointsFromData(getData(objectNode, "Points")), stroke: aggregatedValue(getData(objectNode, "Stroke")?.firstElementChild) || { color: "#000", width: 0.25 } };
-    }
-    if (type === "Core/Diagram.Polygon") {
-        return { kind: "polygon", key, points: parsePointsFromData(getData(objectNode, "Points")), stroke: aggregatedValue(getData(objectNode, "Stroke")?.firstElementChild) || { color: "#000", width: 0.25 }, fill: parseFill(objectNode) };
-    }
-    if (type === "Core/Diagram.Circle") {
-        return { kind: "circle", key, center: aggregatedValue(getData(objectNode, "Center")?.firstElementChild) || { x: 0, y: 0 }, radius: numberFromData(objectNode, "Radius", 1), stroke: aggregatedValue(getData(objectNode, "Stroke")?.firstElementChild) || { color: "#000", width: 0.25 }, fill: parseFill(objectNode) };
-    }
-    if (type === "Core/Diagram.Ellipse") {
-        return { kind: "ellipse", key, center: aggregatedValue(getData(objectNode, "Center")?.firstElementChild) || { x: 0, y: 0 }, rx: numberFromData(objectNode, "HorizontalSemiAxis", 1), ry: numberFromData(objectNode, "VerticalSemiAxis", 1), rotation: numberFromData(objectNode, "Rotation", 0), stroke: aggregatedValue(getData(objectNode, "Stroke")?.firstElementChild) || { color: "#000", width: 0.25 }, fill: parseFill(objectNode) };
-    }
-    if (type === "Core/Diagram.Rectangle") {
-        return { kind: "rect", key, center: aggregatedValue(getData(objectNode, "Center")?.firstElementChild) || { x: 0, y: 0 }, width: numberFromData(objectNode, "Width", 1), height: numberFromData(objectNode, "Height", 1), rotation: numberFromData(objectNode, "Rotation", 0), stroke: aggregatedValue(getData(objectNode, "Stroke")?.firstElementChild) || { color: "#000", width: 0.25 }, fill: parseFill(objectNode) };
-    }
-    if (type === "Core/Diagram.Text") {
-        return {
-            kind: "text",
-            key,
-            position: aggregatedValue(getData(objectNode, "Position")?.firstElementChild) || { x: 0, y: 0 },
-            value: valueFromData(objectNode, "Value") || valueFromData(objectNode, "Text") || "",
-            rotation: numberFromData(objectNode, "Rotation", 0),
-            style: {
-                color: aggregatedValue(getData(objectNode, "Color")?.firstElementChild) || { r: 0, g: 0, b: 0 },
-                font: valueFromData(objectNode, "Font") || "Arial",
-                size: numberFromData(objectNode, "Size", numberFromData(objectNode, "Height", 3.5)),
-                horizontal: refName(valueFromData(objectNode, "Alignment")) || refName(valueFromData(objectNode, "HorizontalAlignment")) || "Center",
-                vertical: refName(valueFromData(objectNode, "Alignment")) || refName(valueFromData(objectNode, "VerticalAlignment")) || "Center",
-            },
-        };
-    }
-    if (type === "Core/Diagram.ConnectorLine") {
-        return { kind: "connectorLine", key, innerPoints: parsePointsFromData(getData(objectNode, "InnerPoints")), stroke: aggregatedValue(getData(objectNode, "Stroke")?.firstElementChild) || { color: "#000", width: 0.25 }, sourceRef: referenceTargets(objectNode, "Source")[0] || null, targetRef: referenceTargets(objectNode, "Target")[0] || null };
-    }
-    return null;
-}
-
-function parseSymbolCatalogue(discDoc) {
-    if (!discDoc) return new Map();
-    const map = new Map();
-    qsa(discDoc, 'Object[type="Profile/Symbol"]').forEach((obj) => {
-        const name = obj.getAttribute("name") || obj.getAttribute("id") || "";
-        const symbolKey = `DiscProfile/${name}`;
-        const variants = directComponentsObjects(obj, "Variants").map((variant, i) => ({
-            key: `${symbolKey}_${i}`,
-            name: variant.getAttribute("name") || `${name}_${i}`,
-            minX: numberFromData(variant, "MinX", 0),
-            minY: numberFromData(variant, "MinY", 0),
-            maxX: numberFromData(variant, "MaxX", 0),
-            maxY: numberFromData(variant, "MaxY", 0),
-            mirroringAllowed: !!valueFromData(variant, "MirroringAllowed"),
-            resizeX: !!valueFromData(variant, "ResizingXAllowed"),
-            resizeY: !!valueFromData(variant, "ResizingYAllowed"),
-            rotationAllowed: !!valueFromData(variant, "RotationAllowed"),
-            primitives: directComponentsObjects(variant, "Primitives").map(parsePrimitive).filter(Boolean),
-            nodePositions: [],
-            labelTemplates: [],
-        }));
-        map.set(symbolKey, { key: symbolKey, name, usage: "external-symbol", description: "", variants });
-    });
-    return map;
-}
-
-function inferBoundsFromPrimitives(primitives) {
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    const visit = (p) => {
-        if (!p) return;
-        minX = Math.min(minX, p.x);
-        minY = Math.min(minY, p.y);
-        maxX = Math.max(maxX, p.x);
-        maxY = Math.max(maxY, p.y);
-    };
-    primitives.forEach((p) => {
-        if (p.kind === "polyline" || p.kind === "polygon") p.points.forEach(visit);
-        else if (p.kind === "circle") { visit({ x: p.center.x - p.radius, y: p.center.y - p.radius }); visit({ x: p.center.x + p.radius, y: p.center.y + p.radius }); }
-        else if (p.kind === "ellipse") { visit({ x: p.center.x - p.rx, y: p.center.y - p.ry }); visit({ x: p.center.x + p.rx, y: p.center.y + p.ry }); }
-        else if (p.kind === "rect") { visit({ x: p.center.x - p.width / 2, y: p.center.y - p.height / 2 }); visit({ x: p.center.x + p.width / 2, y: p.center.y + p.height / 2 }); }
-        else if (p.kind === "text") visit(p.position);
-    });
-    if (!Number.isFinite(minX)) return { minX: -1, minY: -1, maxX: 1, maxY: 1 };
-    return { minX, minY, maxX, maxY };
-}
-
-function parseInternalShapeCatalogue(mainDoc) {
-    if (!mainDoc) return new Map();
-    const map = new Map();
-    qsa(mainDoc, 'Object[type="Core/Diagram.ShapeCatalogue"] > Components[property="Shapes"] > Object[type="Core/Diagram.Shape"]').forEach((obj, idx) => {
-        const id = obj.getAttribute("id") || `internal_shape_${idx}`;
-        const primitives = directComponentsObjects(obj, "Elements").map(parsePrimitive).filter(Boolean).concat(directComponentsObjects(obj, "Primitives").map(parsePrimitive).filter(Boolean));
-        const bounds = inferBoundsFromPrimitives(primitives);
-        const shape = {
-            key: id,
-            name: valueFromData(obj, "Name") || id,
-            usage: "internal-shape",
-            description: valueFromData(obj, "SymbolRegistrationNumber") || "",
-            variants: [{ key: `${id}_variant_0`, name: valueFromData(obj, "Name") || id, minX: bounds.minX, minY: bounds.minY, maxX: bounds.maxX, maxY: bounds.maxY, mirroringAllowed: true, resizeX: true, resizeY: true, rotationAllowed: true, primitives, nodePositions: [], labelTemplates: [] }],
-        };
-        map.set(id, shape);
-        map.set(`#${id}`, shape);
-    });
-    return map;
-}
-
-function parseTreeFromConceptual(rootObject) {
-    if (!rootObject) throw new Error("Conceptual model root object is missing.");
-    function walk(obj, path = []) {
-        if (!obj || typeof obj.getAttribute !== "function") return null;
-        const id = obj.getAttribute("id") || "";
-        const type = obj.getAttribute("type") || "";
-        const label = valueFromData(obj, "DiscProfile/ObjectDisplayName") || valueFromData(obj, "DiscProfile/ItemTag") || valueFromData(obj, "InstrumentationLoopFunctionNumber") || id || type.split("/").pop();
-        const data = directChildrenByTag(obj, "Data").map((d) => ({ property: d.getAttribute("property") || "", value: dataValue(d) }));
-        const persistentIdentifiers = directComponentsObjects(obj, "PersistentIdentifiers").map((pidObj) => ({ context: valueFromData(pidObj, "Context") || "", value: valueFromData(pidObj, "Value") || "" })).filter((pid) => pid.context || pid.value);
-        const refs = directChildrenByTag(obj, "References").map((r) => ({ property: r.getAttribute("property") || "", objects: (r.getAttribute("objects") || "").split(/\s+/).filter(Boolean).map((v) => (v.startsWith("#") ? v.slice(1) : v)) }));
-        const children = directChildrenByTag(obj, "Components").flatMap((comp, compIdx) => {
-            const prop = comp.getAttribute("property") || `comp_${compIdx}`;
-            return directChildrenByTag(comp, "Object").map((child, i) => ({ prop, child: walk(child, [...path, `${prop}:${i}`]) }));
-        }).filter(({ child }) => !!child).map(({ prop, child }) => ({ ...child, edgeLabel: prop }));
-        return { id: id || `${type}_${path.join("_")}`, objectId: id || null, type, label, data, persistentIdentifiers, refs, children };
-    }
-    return walk(rootObject);
-}
-
-function flattenTree(node, arr = []) {
-    if (!node) return arr;
-    arr.push(node);
-    node.children.forEach((c) => flattenTree(c, arr));
-    return arr;
-}
-
-function referenceTargets(node, property = null) {
-    if (!node) return [];
-    return directChildrenByTag(node, "References").filter((r) => !property || r.getAttribute("property") === property).flatMap((r) => (r.getAttribute("objects") || "").split(/\s+/).filter(Boolean).map((v) => (v.startsWith("#") ? v.slice(1) : v)));
-}
-
-function parseNodePositionsById(mainDoc) {
-    const map = new Map();
-    qsa(mainDoc, 'Object[type="Plant/Diagram.PipingNodePosition"], Object[type="Plant/Diagram.InstrumentationNodePosition"], Object[type="Core/Diagram.NodePosition"]').forEach((obj, idx) => {
-        const id = obj.getAttribute("id") || `nodePos_${idx}`;
-        const position = aggregatedValue(getData(obj, "Position")?.firstElementChild);
-        if (position) map.set(id, position);
-    });
-    return map;
-}
-
-function collectGraphicalElements(mainDoc, symbolMap) {
-    const nodePosMap = parseNodePositionsById(mainDoc);
-    const drawn = [];
-    function resolveRepresentedId(node, fallback = null) {
-        return referenceTargets(node, "Represents")[0] || fallback;
-    }
-    function resolveShapeReference(ref) {
-        if (!ref) return null;
-        return symbolMap.get(ref) || symbolMap.get(ref.startsWith("#") ? ref.slice(1) : `#${ref}`) || symbolMap.get(`DiscProfile/${ref.split("/").pop()}`) || null;
-    }
-    function pushSymbolUsage(rawRef, el, representedId, key) {
-        const symbol = resolveShapeReference(rawRef);
-        const variant = symbol?.variants?.[0];
-        if (!variant) return;
-        drawn.push({ kind: "symbolUsage", key, representedId, symbolKey: rawRef, symbol, variant, position: aggregatedValue(getData(el, "Position")?.firstElementChild) || { x: 0, y: 0 }, rotation: numberFromData(el, "Rotation", 0), scaleX: numberFromData(el, "ScaleX", 1), scaleY: numberFromData(el, "ScaleY", 1), isMirrored: !!valueFromData(el, "IsMirrored") });
-    }
-    function traverseGroup(groupNode, currentRepresents = null, keyPrefix = "g") {
-        const localRepresents = resolveRepresentedId(groupNode, currentRepresents);
-        directComponentsObjects(groupNode, "Elements").forEach((el, i) => {
-            const type = el.getAttribute("type") || "";
-            if (type === "Profile/SymbolUsage") {
-                pushSymbolUsage(referenceTargets(el, "Symbol")[0] || null, el, localRepresents, `${keyPrefix}_su_${i}`);
-            } else if (type === "Core/Diagram.ShapeUsage") {
-                pushSymbolUsage(referenceTargets(el, "Shape")[0] || null, el, localRepresents, `${keyPrefix}_shu_${i}`);
-            } else if (type === "Core/Diagram.Label") {
-                const labelRepresents = resolveRepresentedId(el, localRepresents);
-                directComponentsObjects(el, "Elements").forEach((labelEl, labelIdx) => {
-                    const labelType = labelEl.getAttribute("type") || "";
-                    if (labelType === "Core/Diagram.Text") {
-                        const prim = parsePrimitive(labelEl, labelIdx);
-                        if (prim) drawn.push({ kind: "primitive", primitive: prim, representedId: labelRepresents, key: `${keyPrefix}_lbltxt_${i}_${labelIdx}` });
-                    } else if (labelType === "Core/Diagram.ShapeUsage") {
-                        pushSymbolUsage(referenceTargets(labelEl, "Shape")[0] || null, labelEl, labelRepresents, `${keyPrefix}_lblshape_${i}_${labelIdx}`);
-                    } else if (labelType === "Profile/SymbolUsage") {
-                        pushSymbolUsage(referenceTargets(labelEl, "Symbol")[0] || null, labelEl, labelRepresents, `${keyPrefix}_lblsym_${i}_${labelIdx}`);
-                    }
-                });
-            } else {
-                const prim = parsePrimitive(el, i);
-                if (!prim) return;
-                if (prim.kind === "connectorLine") drawn.push({ kind: "connectorLine", primitive: prim, representedId: localRepresents, key: `${keyPrefix}_cl_${i}` });
-                else drawn.push({ kind: "primitive", primitive: prim, representedId: localRepresents, key: `${keyPrefix}_p_${i}` });
-            }
-        });
-        directComponentsObjects(groupNode, "Groups").forEach((child, i) => traverseGroup(child, localRepresents, `${keyPrefix}_${i}`));
-    }
-    qsa(mainDoc, 'Object[type="Core/Diagram.RepresentationGroup"]').forEach((g, i) => traverseGroup(g, null, `rg_${i}`));
-    return { elements: drawn, nodePosMap };
-}
-
-function parseDexpiPackage(mainXml, discProfileXml) {
-    const parser = new DOMParser();
-    const mainDoc = parser.parseFromString(mainXml, "application/xml");
-    const discDoc = discProfileXml ? parser.parseFromString(discProfileXml, "application/xml") : null;
-    if (mainDoc.querySelector("parsererror")) throw new Error("Main XML is not valid.");
-    if (discDoc && discDoc.querySelector("parsererror")) throw new Error("DiscProfile XML is not valid.");
-    const conceptualRoot = mainDoc.querySelector('Object[type="Core/EngineeringModel"] > Components[property="ConceptualModel"] > Object');
-    if (!conceptualRoot) throw new Error("Could not find ConceptualModel in the main DEXPI file.");
-    const tree = parseTreeFromConceptual(conceptualRoot);
-    const flatTree = flattenTree(tree);
-    const treeMap = new Map(flatTree.filter((n) => n.objectId).map((n) => [n.objectId, n]));
-    const externalSymbolMap = parseSymbolCatalogue(discDoc);
-    const internalShapeMap = parseInternalShapeCatalogue(mainDoc);
-    const symbolMap = new Map([...internalShapeMap, ...externalSymbolMap]);
-    const graphics = collectGraphicalElements(mainDoc, symbolMap);
-    const metaNode = mainDoc.querySelector('Components[property="MetaData"] > Object');
-    const meta = metaNode ? { drawingName: valueFromData(metaNode, "DrawingName") || "", drawingNumber: valueFromData(metaNode, "DrawingNumber") || "", subtitle: aggregatedValue(getData(metaNode, "DrawingSubTitle")?.firstElementChild) || "", processPlantName: valueFromData(metaNode, "ProcessPlantName") || "", creatorName: valueFromData(metaNode, "CreatorName") || "" } : {};
-    return { mainDoc, discDoc, tree, flatTree, treeMap, symbolMap, graphics, meta };
-}
-
-function boundsFromElements(graphics) {
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    const visit = (p) => {
-        if (!p) return;
-        minX = Math.min(minX, p.x);
-        minY = Math.min(minY, p.y);
-        maxX = Math.max(maxX, p.x);
-        maxY = Math.max(maxY, p.y);
-    };
-    graphics.elements.forEach((el) => {
-        if (el.kind === "symbolUsage") {
-            const v = el.variant;
-            visit({ x: el.position.x + v.minX * el.scaleX, y: el.position.y + v.minY * el.scaleY });
-            visit({ x: el.position.x + v.maxX * el.scaleX, y: el.position.y + v.maxY * el.scaleY });
-        } else if (el.primitive.kind === "polyline" || el.primitive.kind === "polygon") {
-            el.primitive.points.forEach(visit);
-        } else if (el.primitive.kind === "connectorLine") {
-            el.primitive.innerPoints.forEach(visit);
-        } else if (el.primitive.kind === "circle") {
-            visit({ x: el.primitive.center.x - el.primitive.radius, y: el.primitive.center.y - el.primitive.radius });
-            visit({ x: el.primitive.center.x + el.primitive.radius, y: el.primitive.center.y + el.primitive.radius });
-        } else if (el.primitive.kind === "ellipse") {
-            visit({ x: el.primitive.center.x - el.primitive.rx, y: el.primitive.center.y - el.primitive.ry });
-            visit({ x: el.primitive.center.x + el.primitive.rx, y: el.primitive.center.y + el.primitive.ry });
-        } else if (el.primitive.kind === "rect") {
-            visit({ x: el.primitive.center.x - el.primitive.width / 2, y: el.primitive.center.y - el.primitive.height / 2 });
-            visit({ x: el.primitive.center.x + el.primitive.width / 2, y: el.primitive.center.y + el.primitive.height / 2 });
-        } else if (el.primitive.kind === "text") {
-            visit(el.primitive.position);
-        }
-    });
-    if (!Number.isFinite(minX)) return { minX: 0, minY: 0, maxX: 1000, maxY: 1000 };
-    return { minX: minX - 30, minY: minY - 30, maxX: maxX + 30, maxY: maxY + 30 };
-}
-
-function clampViewBox(nextView, fullBounds) {
-    const totalW = Math.max(1, fullBounds.maxX - fullBounds.minX);
-    const totalH = Math.max(1, fullBounds.maxY - fullBounds.minY);
-    const w = Math.min(Math.max(nextView.w, 20), totalW);
-    const h = Math.min(Math.max(nextView.h, 20), totalH);
-    const maxX = fullBounds.maxX - w;
-    const maxY = fullBounds.maxY - h;
-    return {
-        x: Math.min(Math.max(nextView.x, fullBounds.minX), Math.max(fullBounds.minX, maxX)),
-        y: Math.min(Math.max(nextView.y, fullBounds.minY), Math.max(fullBounds.minY, maxY)),
-        w,
-        h,
-    };
-}
-
-function renderPrimitive(primitive, key, selected) {
-    const opacity = selected ? 1 : 0.98;
-    if (primitive.kind === "polyline") return <polyline key={key} points={primitive.points.map((p) => `${p.x},${p.y}`).join(" ")} fill="none" stroke={primitive.stroke.color} strokeWidth={primitive.stroke.width} strokeDasharray={primitive.stroke.dashArray || undefined} strokeDashoffset={primitive.stroke.dashOffset || undefined} vectorEffect="non-scaling-stroke" opacity={opacity} />;
-    if (primitive.kind === "polygon") return <polygon key={key} points={primitive.points.map((p) => `${p.x},${p.y}`).join(" ")} fill={primitive.fill?.style === "Transparent" ? "none" : (primitive.fill?.color || "none")} stroke={primitive.stroke.color} strokeWidth={primitive.stroke.width} strokeDasharray={primitive.stroke.dashArray || undefined} vectorEffect="non-scaling-stroke" opacity={opacity} />;
-    if (primitive.kind === "circle") return <circle key={key} cx={primitive.center.x} cy={primitive.center.y} r={primitive.radius} fill={primitive.fill?.style === "Transparent" ? "none" : (primitive.fill?.color || "none")} stroke={primitive.stroke.color} strokeWidth={primitive.stroke.width} vectorEffect="non-scaling-stroke" opacity={opacity} />;
-    if (primitive.kind === "ellipse") return <ellipse key={key} cx={primitive.center.x} cy={primitive.center.y} rx={primitive.rx} ry={primitive.ry} transform={`rotate(${primitive.rotation} ${primitive.center.x} ${primitive.center.y})`} fill={primitive.fill?.style === "Transparent" ? "none" : (primitive.fill?.color || "none")} stroke={primitive.stroke.color} strokeWidth={primitive.stroke.width} vectorEffect="non-scaling-stroke" opacity={opacity} />;
-    if (primitive.kind === "rect") return <rect key={key} x={primitive.center.x - primitive.width / 2} y={primitive.center.y - primitive.height / 2} width={primitive.width} height={primitive.height} transform={`rotate(${primitive.rotation} ${primitive.center.x} ${primitive.center.y})`} fill={primitive.fill?.style === "Transparent" ? "none" : (primitive.fill?.color || "none")} stroke={primitive.stroke.color} strokeWidth={primitive.stroke.width} vectorEffect="non-scaling-stroke" opacity={opacity} />;
+function renderPrimitive(primitive, key) {
+    const fill = v => v?.style === "Transparent" ? "none" : (v?.color || "none");
+    if (primitive.kind === "polyline") return <polyline key={key} points={primitive.points.map(p => `${p.x},${p.y}`).join(" ")} fill="none" stroke={primitive.stroke.color} strokeWidth={primitive.stroke.width} strokeDasharray={primitive.stroke.dashArray || undefined} vectorEffect="non-scaling-stroke" />;
+    if (primitive.kind === "polygon") return <polygon key={key} points={primitive.points.map(p => `${p.x},${p.y}`).join(" ")} fill={fill(primitive.fill)} stroke={primitive.stroke.color} strokeWidth={primitive.stroke.width} vectorEffect="non-scaling-stroke" />;
+    if (primitive.kind === "circle") return <circle key={key} cx={primitive.center.x} cy={primitive.center.y} r={primitive.radius} fill={fill(primitive.fill)} stroke={primitive.stroke.color} strokeWidth={primitive.stroke.width} vectorEffect="non-scaling-stroke" />;
+    if (primitive.kind === "ellipse") return <ellipse key={key} cx={primitive.center.x} cy={primitive.center.y} rx={primitive.rx} ry={primitive.ry} transform={`rotate(${primitive.rotation} ${primitive.center.x} ${primitive.center.y})`} fill={fill(primitive.fill)} stroke={primitive.stroke.color} strokeWidth={primitive.stroke.width} vectorEffect="non-scaling-stroke" />;
+    if (primitive.kind === "rect") return <rect key={key} x={primitive.center.x - primitive.width / 2} y={primitive.center.y - primitive.height / 2} width={primitive.width} height={primitive.height} transform={`rotate(${primitive.rotation} ${primitive.center.x} ${primitive.center.y})`} fill={fill(primitive.fill)} stroke={primitive.stroke.color} strokeWidth={primitive.stroke.width} vectorEffect="non-scaling-stroke" />;
     if (primitive.kind === "text") {
         const anchor = primitive.style.horizontal.toLowerCase().includes("left") ? "start" : primitive.style.horizontal.toLowerCase().includes("right") ? "end" : "middle";
         const baseline = primitive.style.vertical.toLowerCase().includes("bottom") ? "baseline" : primitive.style.vertical.toLowerCase().includes("top") ? "hanging" : "middle";
@@ -420,26 +83,45 @@ function renderPrimitive(primitive, key, selected) {
     return null;
 }
 
-function renderConnectorLine(el, nodePosMap, key, selected) {
-    const { primitive } = el;
-    const source = primitive.sourceRef ? nodePosMap.get(primitive.sourceRef) : null;
-    const target = primitive.targetRef ? nodePosMap.get(primitive.targetRef) : null;
-    const points = [source, ...primitive.innerPoints, target].filter(Boolean);
-    if (points.length < 2) return null;
-    return <polyline key={key} points={points.map((p) => `${p.x},${p.y}`).join(" ")} fill="none" stroke={selected ? "#d1242f" : primitive.stroke.color} strokeWidth={selected ? Math.max(primitive.stroke.width * 2, primitive.stroke.width + 0.4) : primitive.stroke.width} strokeDasharray={primitive.stroke.dashArray || undefined} vectorEffect="non-scaling-stroke" />;
-}
-
-function highlightPrimitive(p, key) {
-    if (p.kind === "polyline") return <polyline key={key} points={p.points.map((pt) => `${pt.x},${pt.y}`).join(" ")} fill="none" stroke="#d1242f" strokeWidth={Math.max((p.stroke?.width || 0.25) * 2.5, 0.9)} vectorEffect="non-scaling-stroke" opacity="0.9" />;
-    if (p.kind === "polygon") return <polygon key={key} points={p.points.map((pt) => `${pt.x},${pt.y}`).join(" ")} fill="none" stroke="#d1242f" strokeWidth={Math.max((p.stroke?.width || 0.25) * 2.5, 0.9)} vectorEffect="non-scaling-stroke" opacity="0.9" />;
-    if (p.kind === "circle") return <circle key={key} cx={p.center.x} cy={p.center.y} r={p.radius} fill="none" stroke="#d1242f" strokeWidth={Math.max((p.stroke?.width || 0.25) * 2.5, 0.9)} vectorEffect="non-scaling-stroke" opacity="0.9" />;
-    if (p.kind === "ellipse") return <ellipse key={key} cx={p.center.x} cy={p.center.y} rx={p.rx} ry={p.ry} transform={`rotate(${p.rotation} ${p.center.x} ${p.center.y})`} fill="none" stroke="#d1242f" strokeWidth={Math.max((p.stroke?.width || 0.25) * 2.5, 0.9)} vectorEffect="non-scaling-stroke" opacity="0.9" />;
-    if (p.kind === "rect") return <rect key={key} x={p.center.x - p.width / 2} y={p.center.y - p.height / 2} width={p.width} height={p.height} transform={`rotate(${p.rotation} ${p.center.x} ${p.center.y})`} fill="none" stroke="#d1242f" strokeWidth={Math.max((p.stroke?.width || 0.25) * 2.5, 0.9)} vectorEffect="non-scaling-stroke" opacity="0.9" />;
-    if (p.kind === "text") return <text key={key} x={p.position.x} y={p.position.y} fontFamily={p.style.font} fontSize={p.style.size} fill="#d1242f" textAnchor="middle" dominantBaseline="middle" transform={`rotate(${p.rotation} ${p.position.x} ${p.position.y})`}>{p.value}</text>;
+function highlightPrimitive(p, key, color) {
+    const sw = Math.max((p.stroke?.width || 0.25) * 2.5, 0.9);
+    if (p.kind === "polyline") return <polyline key={key} points={p.points.map(pt => `${pt.x},${pt.y}`).join(" ")} fill="none" stroke={color} strokeWidth={sw} vectorEffect="non-scaling-stroke" opacity="0.85" />;
+    if (p.kind === "polygon") return <polygon key={key} points={p.points.map(pt => `${pt.x},${pt.y}`).join(" ")} fill="none" stroke={color} strokeWidth={sw} vectorEffect="non-scaling-stroke" opacity="0.85" />;
+    if (p.kind === "circle") return <circle key={key} cx={p.center.x} cy={p.center.y} r={p.radius} fill="none" stroke={color} strokeWidth={sw} vectorEffect="non-scaling-stroke" opacity="0.85" />;
+    if (p.kind === "ellipse") return <ellipse key={key} cx={p.center.x} cy={p.center.y} rx={p.rx} ry={p.ry} fill="none" stroke={color} strokeWidth={sw} vectorEffect="non-scaling-stroke" opacity="0.85" />;
+    if (p.kind === "rect") return <rect key={key} x={p.center.x - p.width / 2} y={p.center.y - p.height / 2} width={p.width} height={p.height} fill="none" stroke={color} strokeWidth={sw} vectorEffect="non-scaling-stroke" opacity="0.85" />;
     return null;
 }
 
-function SymbolGraphic({ el, selected, onSelect }) {
+function ConnectorLineSvg({ el, nodePosMap, selected, connColor }) {
+    const { primitive: prim } = el;
+    const src = prim.sourceRef ? nodePosMap.get(prim.sourceRef) : null;
+    const tgt = prim.targetRef ? nodePosMap.get(prim.targetRef) : null;
+    const pts = [src, ...prim.innerPoints, tgt].filter(Boolean);
+    if (pts.length < 2) return null;
+    const color = connColor || (selected ? "#d1242f" : prim.stroke.color);
+    const sw = selected ? Math.max(prim.stroke.width * 2, prim.stroke.width + 0.4) : prim.stroke.width;
+    const mid = Math.floor(pts.length / 2);
+    const p1 = pts[mid - 1] || pts[0]; const p2 = pts[mid];
+    const dx = p2.x - p1.x; const dy = p2.y - p1.y;
+    const len = Math.sqrt(dx * dx + dy * dy) || 1;
+    const ux = dx / len; const uy = dy / len;
+    const mx = (p1.x + p2.x) / 2; const my = (p1.y + p2.y) / 2;
+    const ar = Math.max(prim.stroke.width * 3, 1.5);
+    return (
+        <g>
+            <polyline points={pts.map(p => `${p.x},${p.y}`).join(" ")} fill="none" stroke={color} strokeWidth={sw} strokeDasharray={prim.stroke.dashArray || undefined} vectorEffect="non-scaling-stroke" />
+            {(selected || connColor) && (
+                <polygon
+                    points={`${mx},${my} ${mx - ux * ar - uy * ar * 0.5},${my - uy * ar + ux * ar * 0.5} ${mx - ux * ar + uy * ar * 0.5},${my - uy * ar - ux * ar * 0.5}`}
+                    fill={color} stroke="none" vectorEffect="non-scaling-stroke"
+                />
+            )}
+        </g>
+    );
+}
+
+function SymbolGraphic({ el, selected, connHighlight, onSelect }) {
     const mirror = el.isMirrored ? -1 : 1;
     const transform = `translate(${el.position.x} ${el.position.y}) rotate(${el.rotation}) scale(${el.scaleX * mirror} ${el.scaleY})`;
     const hitPad = 2.5;
@@ -447,134 +129,215 @@ function SymbolGraphic({ el, selected, onSelect }) {
     const hitY = Math.min(el.variant.minY, el.variant.maxY) - hitPad;
     const hitW = Math.abs(el.variant.maxX - el.variant.minX) + hitPad * 2;
     const hitH = Math.abs(el.variant.maxY - el.variant.minY) + hitPad * 2;
+    const hlColor = selected ? "#d1242f" : connHighlight || null;
     return (
-        <g onClick={(e) => { e.stopPropagation(); onSelect(el.representedId); }} style={{ cursor: el.representedId ? "pointer" : "default" }}>
+        <g onClick={e => { e.stopPropagation(); if (el.representedId) onSelect(el.representedId); }} style={{ cursor: el.representedId ? "pointer" : "default" }}>
             <g transform={transform}>
-                <rect x={hitX} y={hitY} width={hitW} height={hitH} fill="transparent" stroke="none" pointerEvents="all" style={{ cursor: el.representedId ? "pointer" : "default" }} />
+                <rect x={hitX} y={hitY} width={hitW} height={hitH} fill="transparent" stroke="none" pointerEvents="all" />
             </g>
-            {selected && <g transform={transform} pointerEvents="none">{el.variant.primitives.map((p, i) => highlightPrimitive(p, `hl_${el.key}_${i}`))}</g>}
+            {hlColor && <g transform={transform} pointerEvents="none">{el.variant.primitives.map((p, i) => highlightPrimitive(p, `hl_${el.key}_${i}`, hlColor))}</g>}
             <g transform={transform} pointerEvents="none">
-                {el.variant.primitives.map((p, i) => renderPrimitive(p, `${el.key}_${i}`, selected))}
-                {selected && <rect x={el.variant.minX - 0.8} y={el.variant.minY - 0.8} width={(el.variant.maxX - el.variant.minX) + 1.6} height={(el.variant.maxY - el.variant.minY) + 1.6} fill="none" stroke="#d1242f" strokeWidth={0.6} vectorEffect="non-scaling-stroke" />}
+                {el.variant.primitives.map((p, i) => renderPrimitive(p, `${el.key}_${i}`))}
+                {hlColor && <rect x={el.variant.minX - 0.8} y={el.variant.minY - 0.8} width={(el.variant.maxX - el.variant.minX) + 1.6} height={(el.variant.maxY - el.variant.minY) + 1.6} fill="none" stroke={hlColor} strokeWidth={0.6} vectorEffect="non-scaling-stroke" />}
             </g>
         </g>
     );
 }
 
-function PrimitiveGraphic({ el, selected, onSelect, nodePosMap }) {
+function PrimitiveGraphic({ el, selected, connHighlight, onSelect, nodePosMap }) {
     const hitPad = 2.0;
-    const content = el.kind === "connectorLine" ? renderConnectorLine(el, nodePosMap, el.key, selected) : renderPrimitive(el.primitive, el.key, false);
+    const hlColor = selected ? "#d1242f" : connHighlight || null;
+    const prim = el.primitive;
     return (
-        <g onClick={(e) => { e.stopPropagation(); if (el.representedId) onSelect(el.representedId); }} style={{ cursor: el.representedId ? "pointer" : "default" }}>
-            {el.kind !== "connectorLine" && el.primitive?.kind === "circle" && <circle cx={el.primitive.center.x} cy={el.primitive.center.y} r={el.primitive.radius + hitPad} fill="transparent" stroke="none" pointerEvents="all" style={{ cursor: el.representedId ? "pointer" : "default" }} />}
-            {el.kind !== "connectorLine" && el.primitive?.kind === "ellipse" && <ellipse cx={el.primitive.center.x} cy={el.primitive.center.y} rx={el.primitive.rx + hitPad} ry={el.primitive.ry + hitPad} transform={`rotate(${el.primitive.rotation} ${el.primitive.center.x} ${el.primitive.center.y})`} fill="transparent" stroke="none" pointerEvents="all" style={{ cursor: el.representedId ? "pointer" : "default" }} />}
-            {el.kind !== "connectorLine" && el.primitive?.kind === "rect" && <rect x={el.primitive.center.x - el.primitive.width / 2 - hitPad} y={el.primitive.center.y - el.primitive.height / 2 - hitPad} width={el.primitive.width + hitPad * 2} height={el.primitive.height + hitPad * 2} transform={`rotate(${el.primitive.rotation} ${el.primitive.center.x} ${el.primitive.center.y})`} fill="transparent" stroke="none" pointerEvents="all" style={{ cursor: el.representedId ? "pointer" : "default" }} />}
-            {el.kind !== "connectorLine" && (el.primitive?.kind === "polyline" || el.primitive?.kind === "polygon") && <polyline points={el.primitive.points.map((pt) => `${pt.x},${pt.y}`).join(" ")} fill="none" stroke="transparent" strokeWidth={Math.max((el.primitive.stroke?.width || 0.25) + 4, 5)} vectorEffect="non-scaling-stroke" pointerEvents="stroke" style={{ cursor: el.representedId ? "pointer" : "default" }} />}
+        <g onClick={e => { e.stopPropagation(); if (el.representedId) onSelect(el.representedId); }} style={{ cursor: el.representedId ? "pointer" : "default" }}>
+            {prim?.kind === "circle" && <circle cx={prim.center.x} cy={prim.center.y} r={prim.radius + hitPad} fill="transparent" stroke="none" pointerEvents="all" />}
+            {prim?.kind === "ellipse" && <ellipse cx={prim.center.x} cy={prim.center.y} rx={prim.rx + hitPad} ry={prim.ry + hitPad} fill="transparent" stroke="none" pointerEvents="all" />}
+            {prim?.kind === "rect" && <rect x={prim.center.x - prim.width / 2 - hitPad} y={prim.center.y - prim.height / 2 - hitPad} width={prim.width + hitPad * 2} height={prim.height + hitPad * 2} fill="transparent" stroke="none" pointerEvents="all" />}
+            {(prim?.kind === "polyline" || prim?.kind === "polygon") && <polyline points={prim.points.map(pt => `${pt.x},${pt.y}`).join(" ")} fill="none" stroke="transparent" strokeWidth={Math.max((prim.stroke?.width || 0.25) + 4, 5)} vectorEffect="non-scaling-stroke" pointerEvents="stroke" />}
             {el.kind === "connectorLine" && (() => {
-                const src = el.primitive.sourceRef ? nodePosMap.get(el.primitive.sourceRef) : null;
-                const tgt = el.primitive.targetRef ? nodePosMap.get(el.primitive.targetRef) : null;
-                const pts = [src, ...el.primitive.innerPoints, tgt].filter(Boolean);
+                const s = prim.sourceRef ? nodePosMap.get(prim.sourceRef) : null;
+                const t = prim.targetRef ? nodePosMap.get(prim.targetRef) : null;
+                const pts = [s, ...prim.innerPoints, t].filter(Boolean);
                 if (pts.length < 2) return null;
-                return <polyline points={pts.map((pt) => `${pt.x},${pt.y}`).join(" ")} fill="none" stroke="transparent" strokeWidth={Math.max((el.primitive.stroke?.width || 0.25) + 4, 5)} vectorEffect="non-scaling-stroke" pointerEvents="stroke" style={{ cursor: el.representedId ? "pointer" : "default" }} />;
+                return <polyline points={pts.map(pt => `${pt.x},${pt.y}`).join(" ")} fill="none" stroke="transparent" strokeWidth={Math.max((prim.stroke?.width || 0.25) + 4, 5)} vectorEffect="non-scaling-stroke" pointerEvents="stroke" />;
             })()}
-            {selected && el.kind !== "connectorLine" && highlightPrimitive(el.primitive, `sel_${el.key}`)}
-            {content}
-            {selected && el.primitive?.kind === "text" && <circle cx={el.primitive.position.x} cy={el.primitive.position.y} r={2} fill="none" stroke="#d1242f" strokeWidth={0.5} vectorEffect="non-scaling-stroke" />}
+            {hlColor && el.kind !== "connectorLine" && highlightPrimitive(prim, `hl_${el.key}`, hlColor)}
+            {el.kind === "connectorLine" ? <ConnectorLineSvg el={el} nodePosMap={nodePosMap} selected={selected} connColor={connHighlight} /> : renderPrimitive(prim, el.key)}
         </g>
     );
 }
 
-function TreeNode({ node, selectedId, onSelect, expanded, setExpanded, level = 0 }) {
+// ---------- Tree Node --------------------------------------------------------
+
+function TreeNode({ node, selectedId, onSelect, expanded, setExpanded, level, issueMap }) {
     const isOpen = expanded.has(node.id);
     const hasChildren = node.children.length > 0;
-    const selected = selectedId === node.objectId;
+    const isSelected = selectedId === node.objectId;
+    const nodeIssues = node.objectId ? (issueMap.get(node.objectId) || []) : [];
+    const hasError = nodeIssues.some(i => i.severity === "Error");
+    const hasWarn = !hasError && nodeIssues.some(i => i.severity === "Warning");
     return (
         <div>
-            <div id={node.objectId ? `tree-node-${node.objectId}` : undefined} onClick={() => { if (!node.objectId) return; onSelect(node.objectId); }} style={{ padding: "4px 8px", paddingLeft: 8 + level * 16, background: selected ? "#dbeafe" : "transparent", cursor: "pointer", borderRadius: 6, marginBottom: 2, display: "flex", alignItems: "center", gap: 6 }}>
-                <span onClick={(e) => { e.stopPropagation(); if (!hasChildren) return; const next = new Set(expanded); if (next.has(node.id)) next.delete(node.id); else next.add(node.id); setExpanded(next); }} style={{ width: 16, display: "inline-block", textAlign: "center" }}>{hasChildren ? (isOpen ? "▾" : "▸") : "·"}</span>
-                <span style={{ fontWeight: selected ? 700 : 400 }}>{node.label}</span>
+            <div
+                id={node.objectId ? `tree-node-${node.objectId}` : undefined}
+                onClick={() => { if (!node.objectId) return; onSelect(node.objectId); }}
+                style={{ padding: "3px 8px", paddingLeft: 8 + level * 14, background: isSelected ? "#dbeafe" : "transparent", cursor: "pointer", borderRadius: 4, marginBottom: 1, display: "flex", alignItems: "center", gap: 5 }}
+            >
+                <span onClick={e => { e.stopPropagation(); if (!hasChildren) return; setExpanded(prev => { const n = new Set(prev); n.has(node.id) ? n.delete(node.id) : n.add(node.id); return n; }); }} style={{ width: 14, display: "inline-block", textAlign: "center", flexShrink: 0, color: "#888" }}>
+                    {hasChildren ? (isOpen ? "▾" : "▸") : "·"}
+                </span>
+                {hasError && <span title="Has validation errors" style={{ color: "#cf222e", fontSize: 10, flexShrink: 0 }}>{"●"}</span>}
+                {hasWarn && <span title="Has validation warnings" style={{ color: "#9a6700", fontSize: 10, flexShrink: 0 }}>{"●"}</span>}
+                <span style={{ fontWeight: isSelected ? 700 : 400, fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{node.label}</span>
+                <span style={{ fontSize: 10, color: "#aaa", flexShrink: 0, marginLeft: "auto" }}>{node.type.split(".").pop()}</span>
             </div>
-            {isOpen && node.children.map((child) => <TreeNode key={child.id} node={child} selectedId={selectedId} onSelect={onSelect} expanded={expanded} setExpanded={setExpanded} level={level + 1} />)}
+            {isOpen && node.children.map(child => (
+                <TreeNode key={child.id} node={child} selectedId={selectedId} onSelect={onSelect} expanded={expanded} setExpanded={setExpanded} level={level + 1} issueMap={issueMap} />
+            ))}
         </div>
     );
 }
 
-function findAncestors(node, targetId, trail = [], out = []) {
-    if (node.objectId === targetId) out.push(...trail.map((t) => t.id));
-    node.children.forEach((child) => findAncestors(child, targetId, [...trail, node], out));
-    return out;
+// ---------- Severity Editor --------------------------------------------------
+
+function SeverityEditor({ issues, severityConfig, onUpdate }) {
+    const ruleIds = useMemo(() => [...new Set(issues.map(i => i.ruleId))].sort(), [issues]);
+    if (!ruleIds.length) return <div style={{ color: "#888", fontSize: 13 }}>Run validation first to see rules.</div>;
+    const scoreFor = l => l === "Error" ? 3 : l === "Warning" ? 2 : l === "Info" ? 1 : 0;
+    const dotColor = l => l === "Error" ? "#cf222e" : l === "Warning" ? "#9a6700" : l === "Info" ? "#0969da" : "#aaa";
+    return (
+        <div>
+            {ruleIds.map(ruleId => {
+                const effective = resolveSeverity(ruleId, severityConfig);
+                const overridden = !!severityConfig[ruleId];
+                return (
+                    <div key={ruleId} style={{ marginBottom: 6, display: "flex", alignItems: "center", gap: 6, padding: "4px 6px", borderRadius: 4, background: overridden ? "#f0f7ff" : "transparent" }}>
+                        <span style={{ width: 8, height: 8, borderRadius: "50%", background: dotColor(effective.level), flexShrink: 0, display: "inline-block" }} />
+                        <span style={{ fontSize: 12, flex: 1, overflow: "hidden", textOverflow: "ellipsis", fontFamily: "monospace" }} title={ruleId}>{ruleId}</span>
+                        <select value={effective.level} onChange={e => { const l = e.target.value; onUpdate(ruleId, { level: l, score: scoreFor(l) }); }} style={{ fontSize: 12, padding: "2px 4px", border: "1px solid #c7ced6", borderRadius: 4 }}>
+                            <option value="Error">Error</option>
+                            <option value="Warning">Warning</option>
+                            <option value="Info">Info</option>
+                            <option value="Ignore">Ignore</option>
+                        </select>
+                        {overridden && <button title="Reset to default" style={{ fontSize: 10, padding: "1px 5px", border: "1px solid #c7ced6", borderRadius: 4, cursor: "pointer", background: "white", color: "#57606a" }} onClick={() => onUpdate(ruleId, null)}>↺</button>}
+                    </div>
+                );
+            })}
+        </div>
+    );
 }
 
-function collectDescendantObjectIds(node, out = new Set()) {
-    if (!node) return out;
-    if (node.objectId) out.add(node.objectId);
-    node.children.forEach((child) => collectDescendantObjectIds(child, out));
-    return out;
-}
-
-function sampleDiscProfileHint(mode) {
-    if (mode === "internal") return "Load one DEXPI XML file that already contains a Core/Diagram.ShapeCatalogue with embedded primitives. In that mode, ShapeUsage references such as #CheckValve_444437D160 are resolved internally from the uploaded file.";
-    return "Load a main DEXPI XML file and, if needed, a separate DiscProfile.xml file. External symbol references are resolved from DiscProfile; embedded Core/Diagram.ShapeCatalogue shapes are also supported automatically.";
-}
+// ---------- App --------------------------------------------------------------
 
 export default function App() {
     const [leftCollapsed, setLeftCollapsed] = useState(false);
     const [rightCollapsed, setRightCollapsed] = useState(false);
+    const [leftTab, setLeftTab] = useState("topology");
+    const [rightTab, setRightTab] = useState("details");
     const [mainXmlText, setMainXmlText] = useState("");
-    const [discXmlText, setDiscXmlText] = useState("");
     const [loadMode, setLoadMode] = useState("with-profile");
+    const [discXmlText, setDiscXmlText] = useState("");
     const [parsed, setParsed] = useState(null);
+    const [parseError, setParseError] = useState("");
     const [selectedId, setSelectedId] = useState(null);
     const [search, setSearch] = useState("");
-    const [error, setError] = useState("");
+    const [expanded, setExpanded] = useState(new Set());
     const [viewBox, setViewBox] = useState({ x: 0, y: 0, w: 1000, h: 1000 });
     const [fullBounds, setFullBounds] = useState({ minX: 0, minY: 0, maxX: 1000, maxY: 1000 });
-    const [expanded, setExpanded] = useState(new Set());
     const [isPanning, setIsPanning] = useState(false);
     const [panStart, setPanStart] = useState(null);
+    const [bgImage, setBgImage] = useState(null);
+    const [showBgControls, setShowBgControls] = useState(false);
+    const [profiles, setProfiles] = useState([]);
+    const [validationIssues, setValidationIssues] = useState([]);
+    const [validationDone, setValidationDone] = useState(false);
+    const [validationFilter, setValidationFilter] = useState("All");
+    const [severityConfig, setSeverityConfig] = useState({});
+    const [showConnectivity, setShowConnectivity] = useState(false);
+    const [spaceDown, setSpaceDown] = useState(false);
+
     const mainInputRef = useRef(null);
     const discInputRef = useRef(null);
+    const profileInputRef = useRef(null);
+    const bgInputRef = useRef(null);
     const svgViewportRef = useRef(null);
 
-    function rebuild(nextMain, nextDisc, mode = loadMode) {
+    const issueMap = useMemo(() => {
+        const m = new Map();
+        validationIssues.forEach(issue => {
+            const id = issue.objectId;
+            if (!id || id.startsWith("(")) return;
+            if (!m.has(id)) m.set(id, []);
+            m.get(id).push(issue);
+        });
+        return m;
+    }, [validationIssues]);
+
+    const connectivityHighlight = useMemo(() => {
+        if (!showConnectivity || !selectedId || !parsed?.connectivityMap) return { upstream: new Set(), downstream: new Set(), group: new Set() };
+        return parsed.connectivityMap.get(selectedId) || { upstream: new Set(), downstream: new Set(), group: new Set() };
+    }, [showConnectivity, selectedId, parsed]);
+
+    function rebuild(nextMain, nextDisc, mode) {
         if (!nextMain) return;
-        if (mode === "with-profile" && !nextDisc) return;
+        if ((mode || loadMode) === "with-profile" && !nextDisc) return;
         try {
-            const nextParsed = parseDexpiPackage(nextMain, mode === "with-profile" ? nextDisc : "");
-            const b = boundsFromElements(nextParsed.graphics);
+            const p = parseDexpiPackage(nextMain, (mode || loadMode) === "with-profile" ? nextDisc : "");
+            const b = boundsFromElements(p.graphics);
             setFullBounds(b);
-            setParsed(nextParsed);
-            setSelectedId(nextParsed.tree.objectId);
-            setExpanded(new Set([nextParsed.tree.id, ...nextParsed.tree.children.slice(0, 5).map((c) => c.id)]));
+            setParsed(p);
+            setSelectedId(p.tree.objectId);
+            setExpanded(new Set([p.tree.id, ...p.tree.children.slice(0, 5).map(c => c.id)]));
             setViewBox({ x: b.minX, y: b.minY, w: Math.max(100, b.maxX - b.minX), h: Math.max(100, b.maxY - b.minY) });
-            setError("");
-        } catch (e) {
-            setError(e.message || String(e));
-        }
+            setParseError("");
+            setValidationIssues([]); setValidationDone(false);
+        } catch (e) { setParseError(e.message || String(e)); }
     }
 
     async function handleMainFile(e) {
-        const file = e.target.files?.[0];
-        if (!file) return;
-        const txt = await file.text();
-        setMainXmlText(txt);
+        const file = e.target.files?.[0]; if (!file) return;
+        const txt = await file.text(); setMainXmlText(txt);
         rebuild(txt, discXmlText, loadMode);
     }
-
     async function handleDiscFile(e) {
-        const file = e.target.files?.[0];
-        if (!file) return;
-        const txt = await file.text();
-        setDiscXmlText(txt);
+        const file = e.target.files?.[0]; if (!file) return;
+        const txt = await file.text(); setDiscXmlText(txt);
         rebuild(mainXmlText, txt, "with-profile");
+    }
+    async function handleProfileFile(e) {
+        const file = e.target.files?.[0]; if (!file) return;
+        const xml = await file.text();
+        const name = file.name.replace(".xml", "");
+        const constraints = parseProfileConstraints(xml, name);
+        setProfiles(prev => [...prev, { name, xml, constraints }]);
+        e.target.value = "";
+    }
+    async function handleBgFile(e) {
+        const file = e.target.files?.[0]; if (!file) return;
+        const reader = new FileReader();
+        reader.onload = ev => setBgImage({ src: ev.target.result, opacity: 0.4, scale: 1, offsetX: 0, offsetY: 0, visible: true });
+        reader.readAsDataURL(file);
+        e.target.value = "";
+    }
+
+    function runValidation() {
+        if (!parsed) return;
+        const allIssues = runFullValidation({ mainXml: mainXmlText, flatTree: parsed.flatTree, profiles, severityConfig });
+        // Drop rules the user has set to Ignore
+        const issues = allIssues.filter(i => resolveSeverity(i.ruleId, severityConfig).level !== "Ignore");
+        setValidationIssues(issues);
+        setValidationDone(true);
+        setLeftTab("validation");
     }
 
     const filteredTree = useMemo(() => {
         if (!parsed) return null;
         const q = search.trim().toLowerCase();
         if (!q) return parsed.tree;
-        const filter = (node) => {
-            const match = [node.label, node.objectId, node.type].filter(Boolean).some((v) => String(v).toLowerCase().includes(q));
+        const filter = node => {
+            const terms = [node.label, node.objectId, node.type, node.tagName, node.subTagName, node.loopNum, ...node.persistentIdentifiers.map(p => p.value)].filter(Boolean);
+            const match = terms.some(v => String(v).toLowerCase().includes(q));
             const children = node.children.map(filter).filter(Boolean);
             return match || children.length ? { ...node, children } : null;
         };
@@ -584,139 +347,402 @@ export default function App() {
     const selectedNode = useMemo(() => parsed?.treeMap?.get(selectedId) || null, [parsed, selectedId]);
     const selectedRepresentedIds = useMemo(() => selectedNode ? collectDescendantObjectIds(selectedNode) : new Set(), [selectedNode]);
 
-    const appStyle = leftCollapsed && rightCollapsed ? styles.appBothCollapsed : leftCollapsed ? styles.appLeftCollapsed : rightCollapsed ? styles.appRightCollapsed : styles.app;
+    const handleSelect = useCallback((id) => {
+        if (!id) return;
+        setSelectedId(id);
+        setSearch("");
+        if (parsed) {
+            const ancestors = findAncestors(parsed.tree, id);
+            setExpanded(prev => new Set([...prev, ...ancestors]));
+        }
+    }, [parsed]);
 
     useEffect(() => {
         if (!selectedId) return;
-        const handle = window.requestAnimationFrame(() => {
-            const el = document.getElementById(`tree-node-${selectedId}`);
-            if (el) el.scrollIntoView({ block: "nearest", behavior: "smooth" });
+        const h = requestAnimationFrame(() => { document.getElementById(`tree-node-${selectedId}`)?.scrollIntoView({ block: "nearest", behavior: "smooth" }); });
+        return () => cancelAnimationFrame(h);
+    }, [selectedId]);
+
+    // Attach wheel listener directly with passive:false so preventDefault() works.
+    // Plain scroll over the drawing zooms; the listener is scoped to the SVG container
+    // so scrolling the topology tree or other panels is unaffected.
+    useEffect(() => {
+        const el = svgViewportRef.current;
+        if (!el) return;
+        const onWheel = e => {
+            e.preventDefault();
+            const rect = el.getBoundingClientRect();
+            const factor = e.deltaY > 0 ? 1.12 : 0.88;
+            const mx = ((e.clientX - rect.left) / rect.width) * viewBox.w + viewBox.x;
+            const my = ((e.clientY - rect.top) / rect.height) * viewBox.h + viewBox.y;
+            setViewBox(v => clampViewBox({ x: mx - (mx - v.x) * factor, y: my - (my - v.y) * factor, w: v.w * factor, h: v.h * factor }, fullBounds));
+        };
+        el.addEventListener("wheel", onWheel, { passive: false });
+        return () => el.removeEventListener("wheel", onWheel);
+    }, [fullBounds]);
+
+    useEffect(() => {
+        const onKeyDown = e => { if (e.code === "Space" && e.target === document.body) { e.preventDefault(); setSpaceDown(true); } };
+        const onKeyUp   = e => { if (e.code === "Space") { setSpaceDown(false); setIsPanning(false); setPanStart(null); } };
+        window.addEventListener("keydown", onKeyDown);
+        window.addEventListener("keyup", onKeyUp);
+        return () => { window.removeEventListener("keydown", onKeyDown); window.removeEventListener("keyup", onKeyUp); };
+    }, []);
+
+    function updateSeverity(ruleId, config) {
+        setSeverityConfig(prev => {
+            const next = { ...prev };
+            if (config === null) delete next[ruleId];
+            else next[ruleId] = config;
+            return next;
         });
-        return () => window.cancelAnimationFrame(handle);
-    }, [selectedId, expanded, leftCollapsed, rightCollapsed]);
+    }
+    function exportSeverityConfig() {
+        // Export full effective config for every rule seen in the current run,
+        // so the user gets a complete file they can edit and re-import.
+        const full = {};
+        [...new Set(validationIssues.map(i => i.ruleId))].sort().forEach(id => {
+            full[id] = severityConfig[id] || resolveSeverity(id, severityConfig);
+        });
+        const b = new Blob([JSON.stringify(full, null, 2)], { type: "application/json" });
+        const u = URL.createObjectURL(b); const a = document.createElement("a");
+        a.href = u; a.download = "severity-config.json"; a.click(); URL.revokeObjectURL(u);
+    }
+    async function importSeverityConfig(e) { const f = e.target.files?.[0]; if (!f) return; try { setSeverityConfig(JSON.parse(await f.text())); } catch (_) { alert("Invalid config file."); } e.target.value = ""; }
+    function expandAll() { if (!parsed) return; const ids = new Set(); flattenTree(parsed.tree).forEach(n => ids.add(n.id)); setExpanded(ids); }
+    function collapseAll() { if (!parsed) return; setExpanded(new Set([parsed.tree.id])); }
+    const moveProfile = (i, dir) => setProfiles(prev => { const a = [...prev]; const j = i + dir; if (j < 0 || j >= a.length) return a; [a[i], a[j]] = [a[j], a[i]]; return a; });
+
+    const issueCounts = useMemo(() => { const c = { Error: 0, Warning: 0, Info: 0 }; validationIssues.forEach(i => { c[i.severity] = (c[i.severity] || 0) + 1; }); return c; }, [validationIssues]);
+    const filteredIssues = useMemo(() => validationFilter === "All" ? validationIssues : validationIssues.filter(i => i.severity === validationFilter), [validationIssues, validationFilter]);
+
+    const bgStyle = bgImage ? { transform: `translate(${bgImage.offsetX}px, ${bgImage.offsetY}px) scale(${bgImage.scale})`, transformOrigin: "top left", opacity: bgImage.opacity, position: "absolute", top: 0, left: 0, width: "100%", height: "100%", pointerEvents: "none", display: bgImage.visible ? "block" : "none" } : {};
 
     return (
-        <div style={appStyle}>
+        <div style={S.app(leftCollapsed, rightCollapsed)}>
+
+            {/* LEFT PANEL */}
             {leftCollapsed ? (
-                <div style={styles.collapsedPanel}><button style={styles.collapseButton} title="Expand hierarchy panel" onClick={() => setLeftCollapsed(false)}>⟩</button></div>
+                <div style={S.collapsed}><button style={S.collapseBtn} onClick={() => setLeftCollapsed(false)} title="Expand">{">"}</button></div>
             ) : (
-                <div style={styles.panel}>
-                    <div style={styles.toolbar}>
-                        <div style={styles.toolbarRow}>
-                            <div><div style={{ fontSize: 20, fontWeight: 700, marginBottom: 6 }}>DEXPI → SVG Viewer</div></div>
-                            <button style={styles.button} title="Collapse hierarchy panel" onClick={() => setLeftCollapsed(true)}>⟨</button>
+                <div style={S.panel}>
+                    <div style={S.toolbar}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                            <div style={{ fontWeight: 700, fontSize: 15 }}>DEXPI Verificator</div>
+                            <button style={S.collapseBtn} onClick={() => setLeftCollapsed(true)}>{"<"}</button>
                         </div>
-                        <div style={{ display: "grid", gap: 8, marginTop: 10 }}>
-                            <div style={{ display: "flex", gap: 8 }}>
-                                <button style={{ ...styles.button, background: loadMode === "with-profile" ? "#eaf2ff" : "white" }} onClick={() => setLoadMode("with-profile")}>Load with profile</button>
-                                <button style={{ ...styles.button, background: loadMode === "internal" ? "#eaf2ff" : "white" }} onClick={() => { setLoadMode("internal"); setDiscXmlText(""); if (mainXmlText) rebuild(mainXmlText, "", "internal"); }}>Load without profile</button>
+                        <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+                            <button style={{ ...S.btn, background: loadMode === "with-profile" ? "#eaf2ff" : "white" }} onClick={() => setLoadMode("with-profile")}>With profile</button>
+                            <button style={{ ...S.btn, background: loadMode === "internal" ? "#eaf2ff" : "white" }} onClick={() => { setLoadMode("internal"); setDiscXmlText(""); if (mainXmlText) rebuild(mainXmlText, "", "internal"); }}>Internal</button>
+                        </div>
+                        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                            <button style={S.btn} onClick={() => mainInputRef.current?.click()}>Load DEXPI XML</button>
+                            {loadMode === "with-profile" && <button style={S.btn} onClick={() => discInputRef.current?.click()}>DiscProfile.xml</button>}
+                            <button style={S.btn} onClick={() => profileInputRef.current?.click()} title="Load a validation profile">+ Profile</button>
+                        </div>
+                        <input ref={mainInputRef} type="file" accept=".xml" style={{ display: "none" }} onChange={handleMainFile} />
+                        <input ref={discInputRef} type="file" accept=".xml" style={{ display: "none" }} onChange={handleDiscFile} />
+                        <input ref={profileInputRef} type="file" accept=".xml" style={{ display: "none" }} onChange={handleProfileFile} />
+                        {parsed && <button style={{ ...S.btnPrimary, marginTop: 8, width: "100%" }} onClick={runValidation}>Run Validation</button>}
+                        {validationDone && (
+                            <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
+                                <span style={{ ...S.badge("#cf222e"), cursor: "pointer" }} onClick={() => { setValidationFilter("Error"); setLeftTab("validation"); }}>{issueCounts.Error} Errors</span>
+                                <span style={{ ...S.badge("#9a6700"), cursor: "pointer" }} onClick={() => { setValidationFilter("Warning"); setLeftTab("validation"); }}>{issueCounts.Warning} Warn</span>
+                                <span style={{ ...S.badge("#0969da"), cursor: "pointer" }} onClick={() => { setValidationFilter("Info"); setLeftTab("validation"); }}>{issueCounts.Info} Info</span>
+                                <button style={S.btnSmall} onClick={() => downloadCSV(validationIssues)}>CSV</button>
                             </div>
-                            <button style={styles.button} onClick={() => mainInputRef.current?.click()}>Load main DEXPI XML</button>
-                            <input ref={mainInputRef} type="file" accept=".xml" style={{ display: "none" }} onChange={handleMainFile} />
-                            {loadMode === "with-profile" && <><button style={styles.button} onClick={() => discInputRef.current?.click()}>Load DiscProfile.xml</button><input ref={discInputRef} type="file" accept=".xml" style={{ display: "none" }} onChange={handleDiscFile} /></>}
-                            <input style={styles.input} placeholder="Search hierarchy" value={search} onChange={(e) => setSearch(e.target.value)} />
+                        )}
+                    </div>
+
+                    <div style={S.tabBar}>
+                        {[["topology", "Topology"], ["validation", `Validation${validationDone ? ` (${validationIssues.length})` : ""}`], ["config", "Config"]].map(([t, label]) => (
+                            <button key={t} style={S.tab(leftTab === t)} onClick={() => setLeftTab(t)}>{label}</button>
+                        ))}
+                    </div>
+
+                    {leftTab === "topology" && (
+                        <div style={S.scroll}>
+                            <div style={{ padding: "6px 10px", borderBottom: "1px solid #eef2f6" }}>
+                                <input style={S.input} placeholder="Search tag, type, ID, persistent ID..." value={search} onChange={e => setSearch(e.target.value)} />
+                            </div>
+                            <div style={{ padding: "4px 8px", borderBottom: "1px solid #eef2f6", display: "flex", gap: 6 }}>
+                                <button style={S.btnSmall} onClick={expandAll}>Expand all</button>
+                                <button style={S.btnSmall} onClick={collapseAll}>Collapse all</button>
+                                {parsed && <span style={{ fontSize: 12, color: "#888", marginLeft: "auto" }}>{parsed.flatTree.length} objects</span>}
+                            </div>
+                            <div style={{ padding: 6 }}>
+                                {parseError && <div style={{ color: "#cf222e", padding: 8, fontSize: 13 }}>{parseError}</div>}
+                                {filteredTree ? (
+                                    <TreeNode node={filteredTree} selectedId={selectedId} onSelect={handleSelect} expanded={expanded} setExpanded={setExpanded} level={0} issueMap={issueMap} />
+                                ) : (
+                                    <div style={{ color: "#888", fontSize: 13, padding: 8 }}>Load a DEXPI XML file to view the topology.</div>
+                                )}
+                            </div>
                         </div>
-                    </div>
-                    <div style={styles.section}><div style={{ fontWeight: 700, marginBottom: 6 }}>Files needed</div><pre style={{ whiteSpace: "pre-wrap", fontSize: 12, margin: 0 }}>{sampleDiscProfileHint(loadMode)}</pre></div>
-                    {parsed && <div style={styles.section}><div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}><span style={styles.badge}>{parsed.flatTree.length} model objects</span><span style={styles.badge}>{parsed.graphics.elements.length} graphic elements</span><span style={styles.badge}>{parsed.symbolMap.size} symbols</span></div></div>}
-                    <div style={{ padding: 12 }}>
-                        {filteredTree ? <TreeNode node={filteredTree} selectedId={selectedId} onSelect={(id) => { setSelectedId(id); setSearch(""); const ancestors = parsed ? findAncestors(parsed.tree, id) : []; setExpanded((prev) => new Set([...prev, ...ancestors])); }} expanded={expanded} setExpanded={setExpanded} /> : <div style={{ color: "#57606a" }}>{error || "Load the XML files to begin."}</div>}
-                    </div>
+                    )}
+
+                    {leftTab === "validation" && (
+                        <div style={S.scroll}>
+                            {!validationDone ? (
+                                <div style={{ padding: 16, color: "#888", fontSize: 13 }}>
+                                    {parsed ? 'Click "Run Validation" above.' : "Load a DEXPI XML file first."}
+                                    {profiles.length > 0 && <div style={{ marginTop: 8 }}>{profiles.length} profile(s) loaded.</div>}
+                                </div>
+                            ) : (
+                                <>
+                                    <div style={{ padding: "6px 10px", borderBottom: "1px solid #eef2f6", display: "flex", gap: 5, flexWrap: "wrap", alignItems: "center" }}>
+                                        {["All", "Error", "Warning", "Info"].map(f => (
+                                            <button key={f} style={{ ...S.btnSmall, background: validationFilter === f ? "#0969da" : "white", color: validationFilter === f ? "white" : "#111", borderColor: validationFilter === f ? "#0969da" : "#c7ced6" }} onClick={() => setValidationFilter(f)}>
+                                                {f}{f !== "All" ? ` (${issueCounts[f]})` : ` (${validationIssues.length})`}
+                                            </button>
+                                        ))}
+                                        <button style={{ ...S.btnSmall, marginLeft: "auto" }} onClick={() => downloadCSV(validationIssues)}>CSV</button>
+                                    </div>
+                                    {filteredIssues.map((issue, i) => (
+                                        <div key={i} style={{ padding: "8px 10px", borderBottom: "1px solid #eef2f6", cursor: parsed?.treeMap?.has(issue.objectId) ? "pointer" : "default" }} onClick={() => { if (parsed?.treeMap?.has(issue.objectId)) handleSelect(issue.objectId); }}>
+                                            <div style={{ display: "flex", gap: 5, alignItems: "center", marginBottom: 3 }}>
+                                                <span style={{ ...S.badge(S.sevColor[issue.severity]) }}>{issue.severity}</span>
+                                                <span style={{ fontSize: 11, fontFamily: "monospace", color: "#555" }}>{issue.ruleId}</span>
+                                                <span style={{ fontSize: 10, color: "#888", marginLeft: "auto" }}>{issue.profileSource}</span>
+                                            </div>
+                                            <div style={{ fontSize: 12, color: "#333", marginBottom: 2 }}>{issue.description}</div>
+                                            {issue.objectId && !issue.objectId.startsWith("(") && <div style={{ fontSize: 11, color: "#57606a", fontFamily: "monospace" }}>{issue.objectId}</div>}
+                                            {issue.suggestedCorrection && <div style={{ fontSize: 11, color: "#0969da", marginTop: 2 }}>Suggestion: {issue.suggestedCorrection}</div>}
+                                        </div>
+                                    ))}
+                                    {filteredIssues.length === 0 && <div style={{ padding: 16, color: "#888", fontSize: 13 }}>No {validationFilter !== "All" ? validationFilter.toLowerCase() + " " : ""}issues found.</div>}
+                                </>
+                            )}
+                        </div>
+                    )}
+
+                    {leftTab === "config" && (
+                        <div style={S.scroll}>
+                            <div style={S.section}>
+                                <div style={{ fontWeight: 700, marginBottom: 8, fontSize: 13 }}>Profiles (later = higher precedence)</div>
+                                {profiles.length === 0 && <div style={{ color: "#888", fontSize: 12 }}>No profiles loaded.</div>}
+                                {profiles.map((p, i) => (
+                                    <div key={i} style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 5, padding: "4px 8px", background: "#f6f8fa", borderRadius: 4 }}>
+                                        <span style={{ fontSize: 12, flex: 1 }}>{p.name}</span>
+                                        <span style={{ fontSize: 11, color: "#888" }}>{p.constraints.length} rules</span>
+                                        <button style={S.btnSmall} onClick={() => moveProfile(i, -1)} disabled={i === 0}>up</button>
+                                        <button style={S.btnSmall} onClick={() => moveProfile(i, 1)} disabled={i === profiles.length - 1}>dn</button>
+                                        <button style={S.btnDanger} onClick={() => setProfiles(prev => prev.filter((_, j) => j !== i))}>x</button>
+                                    </div>
+                                ))}
+                            </div>
+                            <div style={S.section}>
+                                <div style={{ fontWeight: 700, marginBottom: 8, fontSize: 13 }}>Severity Configuration</div>
+                                <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+                                    <button style={S.btnSmall} onClick={exportSeverityConfig}>Export JSON</button>
+                                    <label style={{ ...S.btnSmall, cursor: "pointer" }}>Import JSON<input type="file" accept=".json" style={{ display: "none" }} onChange={importSeverityConfig} /></label>
+                                </div>
+                                <SeverityEditor issues={validationIssues} severityConfig={severityConfig} onUpdate={updateSeverity} />
+                            </div>
+                        </div>
+                    )}
                 </div>
             )}
 
-            <div style={styles.center}>
-                <div style={styles.toolbar}>
-                    <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}>
-                        <div>
-                            <div style={{ fontWeight: 700 }}>{parsed?.meta?.drawingNumber || "No drawing loaded"}</div>
-                            <div style={{ fontSize: 12, color: "#57606a" }}>{parsed?.meta?.drawingName || ""} {parsed?.meta?.subtitle ? `— ${parsed.meta.subtitle}` : ""}</div>
-                        </div>
-                        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                            <button style={styles.button} onClick={() => parsed && (() => { const b = boundsFromElements(parsed.graphics); setFullBounds(b); setViewBox({ x: b.minX, y: b.minY, w: b.maxX - b.minX, h: b.maxY - b.minY }); })()}>Fit</button>
-                            <button style={styles.button} onClick={() => setViewBox((v) => clampViewBox({ x: v.x + v.w * 0.1, y: v.y + v.h * 0.1, w: v.w * 0.8, h: v.h * 0.8 }, fullBounds))}>Zoom in</button>
-                            <button style={styles.button} onClick={() => setViewBox((v) => {
-                                const totalW = Math.max(100, fullBounds.maxX - fullBounds.minX);
-                                const totalH = Math.max(100, fullBounds.maxY - fullBounds.minY);
-                                const nextW = Math.max(v.w * 1.25, totalW);
-                                const nextH = Math.max(v.h * 1.25, totalH);
-                                return {
-                                    x: fullBounds.minX,
-                                    y: fullBounds.minY,
-                                    w: nextW,
-                                    h: nextH,
-                                };
-                            })}>Zoom out</button>
-                            <button style={styles.button} onClick={() => setViewBox((v) => ({ ...v, x: v.x - Math.max(20, v.w * 0.12) }))}>←</button>
-                            <button style={styles.button} onClick={() => setViewBox((v) => ({ ...v, x: v.x + Math.max(20, v.w * 0.12) }))}>→</button>
-                            <button style={styles.button} onClick={() => setViewBox((v) => ({ ...v, y: v.y - Math.max(20, v.h * 0.12) }))}>↑</button>
-                            <button style={styles.button} onClick={() => setViewBox((v) => ({ ...v, y: v.y + Math.max(20, v.h * 0.12) }))}>↓</button>
-                        </div>
+            {/* CENTER PANEL */}
+            <div style={{ position: "relative", overflow: "hidden", background: "#f8fafc", display: "flex", flexDirection: "column" }}>
+                <div style={{ ...S.toolbar, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{parsed?.meta?.drawingNumber || "No drawing loaded"}</div>
+                        <div style={{ fontSize: 12, color: "#57606a" }}>{parsed?.meta?.drawingName || ""}{parsed?.meta?.subtitle ? ` - ${parsed.meta.subtitle}` : ""}</div>
+                    </div>
+                    <div style={{ display: "flex", gap: 5, flexWrap: "wrap", alignItems: "center" }}>
+                        <button style={S.btn} onClick={() => { if (!parsed) return; const b = boundsFromElements(parsed.graphics); setFullBounds(b); setViewBox({ x: b.minX, y: b.minY, w: b.maxX - b.minX, h: b.maxY - b.minY }); }} title="Fit drawing to window">Fit</button>
+                        <button style={{ ...S.btn, background: showConnectivity ? "#eaf2ff" : "white" }} onClick={() => setShowConnectivity(p => !p)} title="Connectivity mode: highlights the upstream (blue), downstream (green), and group (purple) connections of the selected object. Directional arrows appear on connector lines.">Connectivity</button>
+                        <button style={S.btn} onClick={() => bgInputRef.current?.click()} title="Overlay an image or PDF behind the drawing">BG Image</button>
+                        {bgImage && <button style={{ ...S.btn, background: showBgControls ? "#eaf2ff" : "white" }} onClick={() => setShowBgControls(p => !p)}>BG Controls</button>}
+                        <input ref={bgInputRef} type="file" accept="image/*,.pdf" style={{ display: "none" }} onChange={handleBgFile} />
+                        <span style={{ fontSize: 11, color: "#888", marginLeft: 4 }}>Scroll to zoom · Space+drag to pan</span>
                     </div>
                 </div>
-                {error && <div style={{ color: "#b42318", padding: 12 }}>{error}</div>}
-                <div
-                    ref={svgViewportRef}
-                    style={{ width: "100%", height: "calc(100% - 68px)", background: "white", cursor: isPanning ? "grabbing" : "default" }}
-                    onMouseDown={(e) => {
-                        if (e.button !== 1) return;
-                        e.preventDefault();
-                        setIsPanning(true);
-                        setPanStart({ x: e.clientX, y: e.clientY, view: viewBox });
-                    }}
-                    onMouseMove={(e) => {
+
+                {bgImage && showBgControls && (
+                    <div style={{ padding: "6px 12px", borderBottom: "1px solid #d0d7de", background: "#f6f8fa", display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center", fontSize: 12 }}>
+                        <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                            <input type="checkbox" checked={bgImage.visible} onChange={e => setBgImage(b => ({ ...b, visible: e.target.checked }))} /> Visible
+                        </label>
+                        <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                            Opacity
+                            <input type="range" min={0} max={1} step={0.05} value={bgImage.opacity} onChange={e => setBgImage(b => ({ ...b, opacity: parseFloat(e.target.value) }))} style={{ width: 70 }} />
+                            <input type="number" min={0} max={100} step={5} value={Math.round(bgImage.opacity * 100)} onChange={e => setBgImage(b => ({ ...b, opacity: Math.min(1, Math.max(0, parseInt(e.target.value) || 0) / 100) }))} style={{ width: 48, padding: "1px 4px", border: "1px solid #c7ced6", borderRadius: 4, fontSize: 12 }} />%
+                        </label>
+                        <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                            Scale
+                            <input type="range" min={0.1} max={3} step={0.05} value={bgImage.scale} onChange={e => setBgImage(b => ({ ...b, scale: parseFloat(e.target.value) }))} style={{ width: 70 }} />
+                            <input type="number" min={0.1} max={3} step={0.05} value={bgImage.scale.toFixed(2)} onChange={e => setBgImage(b => ({ ...b, scale: Math.min(3, Math.max(0.1, parseFloat(e.target.value) || 1)) }))} style={{ width: 52, padding: "1px 4px", border: "1px solid #c7ced6", borderRadius: 4, fontSize: 12 }} />x
+                        </label>
+                        <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                            X
+                            <input type="range" min={-500} max={500} step={1} value={bgImage.offsetX} onChange={e => setBgImage(b => ({ ...b, offsetX: parseInt(e.target.value) }))} style={{ width: 70 }} />
+                            <input type="number" min={-500} max={500} step={1} value={bgImage.offsetX} onChange={e => setBgImage(b => ({ ...b, offsetX: Math.min(500, Math.max(-500, parseInt(e.target.value) || 0)) }))} style={{ width: 52, padding: "1px 4px", border: "1px solid #c7ced6", borderRadius: 4, fontSize: 12 }} />px
+                        </label>
+                        <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                            Y
+                            <input type="range" min={-500} max={500} step={1} value={bgImage.offsetY} onChange={e => setBgImage(b => ({ ...b, offsetY: parseInt(e.target.value) }))} style={{ width: 70 }} />
+                            <input type="number" min={-500} max={500} step={1} value={bgImage.offsetY} onChange={e => setBgImage(b => ({ ...b, offsetY: Math.min(500, Math.max(-500, parseInt(e.target.value) || 0)) }))} style={{ width: 52, padding: "1px 4px", border: "1px solid #c7ced6", borderRadius: 4, fontSize: 12 }} />px
+                        </label>
+                        <button style={S.btnDanger} onClick={() => { setBgImage(null); setShowBgControls(false); }}>Remove</button>
+                    </div>
+                )}
+
+                {parseError && <div style={{ color: "#cf222e", padding: "8px 12px", fontSize: 13 }}>{parseError}</div>}
+
+                <div ref={svgViewportRef} style={{ flex: 1, position: "relative", background: "white", cursor: isPanning ? "grabbing" : spaceDown ? "grab" : "default", overflow: "hidden" }}
+                    onMouseDown={e => { if (e.button !== 0 || !spaceDown) return; e.preventDefault(); setIsPanning(true); setPanStart({ x: e.clientX, y: e.clientY, view: viewBox }); }}
+                    onMouseMove={e => {
                         if (!isPanning || !panStart || !svgViewportRef.current) return;
                         const rect = svgViewportRef.current.getBoundingClientRect();
-                        const dxPx = e.clientX - panStart.x;
-                        const dyPx = e.clientY - panStart.y;
-                        const dx = (dxPx / rect.width) * panStart.view.w;
-                        const dy = (dyPx / rect.height) * panStart.view.h;
+                        const dx = ((e.clientX - panStart.x) / rect.width) * panStart.view.w;
+                        const dy = ((e.clientY - panStart.y) / rect.height) * panStart.view.h;
                         setViewBox(clampViewBox({ ...panStart.view, x: panStart.view.x - dx, y: panStart.view.y - dy }, fullBounds));
                     }}
                     onMouseUp={() => { setIsPanning(false); setPanStart(null); }}
                     onMouseLeave={() => { setIsPanning(false); setPanStart(null); }}
-                    onWheel={(e) => {
-                        e.preventDefault();
-                    }}
                 >
-                    <svg viewBox={`${viewBox.x} ${viewBox.y} ${viewBox.w} ${viewBox.h}`} width="100%" height="100%" style={{ background: "white", display: "block" }} onAuxClick={(e) => e.preventDefault()}>
-                        {parsed?.graphics.elements.map((el) => {
+                    {bgImage && <img src={bgImage.src} alt="background overlay" style={bgStyle} draggable={false} />}
+                    <svg viewBox={`${viewBox.x} ${viewBox.y} ${viewBox.w} ${viewBox.h}`} width="100%" height="100%" style={{ display: "block" }} onAuxClick={e => e.preventDefault()}>
+                        {parsed?.graphics.elements.map(el => {
                             const isSelected = !!el.representedId && selectedRepresentedIds.has(el.representedId);
-                            if (el.kind === "symbolUsage") {
-                                return <SymbolGraphic key={el.key} el={el} selected={isSelected} onSelect={(id) => { if (!id) return; setSelectedId(id); setSearch(""); const ancestors = parsed ? findAncestors(parsed.tree, id) : []; setExpanded((prev) => new Set([...prev, ...ancestors])); }} />;
-                            }
-                            return <PrimitiveGraphic key={el.key} el={el} selected={isSelected} onSelect={(id) => { if (!id) return; setSelectedId(id); setSearch(""); const ancestors = parsed ? findAncestors(parsed.tree, id) : []; setExpanded((prev) => new Set([...prev, ...ancestors])); }} nodePosMap={parsed.graphics.nodePosMap} />;
+                            const ch = connectivityHighlight;
+                            const connColor = el.representedId ? (ch.upstream.has(el.representedId) ? "#0969da" : ch.downstream.has(el.representedId) ? "#1a7f37" : ch.group.has(el.representedId) ? "#8250df" : null) : null;
+                            if (el.kind === "symbolUsage") return <SymbolGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} />;
+                            return <PrimitiveGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} nodePosMap={parsed.graphics.nodePosMap} />;
                         })}
                     </svg>
+                    {showConnectivity && selectedId && (
+                        <div style={{ position: "absolute", bottom: 10, left: 10, background: "rgba(255,255,255,0.9)", padding: "5px 10px", borderRadius: 6, border: "1px solid #d0d7de", fontSize: 11, display: "flex", gap: 8 }}>
+                            <span style={{ color: "#d1242f" }}>o Selected</span>
+                            <span style={{ color: "#0969da" }}>o Upstream</span>
+                            <span style={{ color: "#1a7f37" }}>o Downstream</span>
+                            <span style={{ color: "#8250df" }}>o Group</span>
+                        </div>
+                    )}
                 </div>
             </div>
 
+            {/* RIGHT PANEL */}
             {rightCollapsed ? (
-                <div style={styles.collapsedRightPanel}><button style={styles.collapseButton} title="Expand details panel" onClick={() => setRightCollapsed(false)}>⟨</button></div>
+                <div style={S.rCollapsed}><button style={S.collapseBtn} onClick={() => setRightCollapsed(false)}>{"<"}</button></div>
             ) : (
-                <div style={styles.rightPanel}>
-                    <div style={styles.toolbar}>
-                        <div style={styles.toolbarRow}>
-                            <div><div style={{ fontWeight: 700 }}>Selection details</div><div style={{ fontSize: 12, color: "#57606a" }}>Click hierarchy or graphic to sync selection.</div></div>
-                            <button style={styles.button} title="Collapse details panel" onClick={() => setRightCollapsed(true)}>⟩</button>
+                <div style={S.rPanel}>
+                    <div style={S.toolbar}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                            <div style={{ fontWeight: 700 }}>Details</div>
+                            <button style={S.collapseBtn} onClick={() => setRightCollapsed(true)}>{">"}</button>
                         </div>
                     </div>
-                    <div style={styles.section}>
-                        <div><strong>Selected object:</strong> {selectedNode?.label || "—"}</div>
-                        <div style={{ fontSize: 12, color: "#57606a", marginTop: 4 }}>{selectedNode?.type || ""}</div>
-                        <div style={{ marginTop: 8, fontSize: 12 }}>{selectedNode?.objectId || ""}</div>
-                        <div style={{ marginTop: 10 }}>
-                            <div style={{ fontWeight: 700, marginBottom: 6 }}>Persistent identifier(s)</div>
-                            {selectedNode?.persistentIdentifiers?.length ? selectedNode.persistentIdentifiers.map((pid, i) => <div key={`${pid.context}_${pid.value}_${i}`} style={{ fontSize: 13, marginBottom: 8 }}><div style={{ color: "#57606a", fontSize: 12 }}>{pid.context || "No context"}</div><div style={{ wordBreak: "break-all" }}>{pid.value || ""}</div></div>) : <div style={{ color: "#57606a", fontSize: 13 }}>No persistent identifiers found.</div>}
-                        </div>
+                    <div style={S.tabBar}>
+                        {[["details", "Object"], ["connectivity", "Connections"], ["issues", "Issues"]].map(([t, label]) => (
+                            <button key={t} style={S.tab(rightTab === t)} onClick={() => setRightTab(t)}>{label}</button>
+                        ))}
                     </div>
-                    <div style={styles.section}>
-                        <div style={{ fontWeight: 700, marginBottom: 8 }}>Data</div>
-                        {selectedNode?.data?.length ? selectedNode.data.map((d) => <div key={d.property} style={{ marginBottom: 8 }}><div style={{ fontSize: 12, color: "#57606a" }}>{d.property}</div><div style={{ fontSize: 13 }}>{typeof d.value === "object" ? JSON.stringify(d.value) : String(d.value)}</div></div>) : <div style={{ color: "#57606a" }}>No direct data.</div>}
-                    </div>
-                    <div style={styles.section}>
-                        <div style={{ fontWeight: 700, marginBottom: 8 }}>References</div>
-                        {selectedNode?.refs?.length ? selectedNode.refs.map((r, i) => <div key={`${r.property}_${i}`} style={{ marginBottom: 8 }}><div style={{ fontSize: 12, color: "#57606a" }}>{r.property}</div><div style={{ fontSize: 13 }}>{r.objects.join(", ")}</div></div>) : <div style={{ color: "#57606a" }}>No direct references.</div>}
+                    <div style={S.scroll}>
+                        {rightTab === "details" && (
+                            <>
+                                <div style={S.section}>
+                                    <div style={{ fontWeight: 600, marginBottom: 4 }}>{selectedNode?.label || "No selection"}</div>
+                                    <div style={{ fontSize: 12, color: "#57606a" }}>{selectedNode?.type || ""}</div>
+                                    {selectedNode?.objectId && <div style={{ marginTop: 6, fontSize: 12, fontFamily: "monospace", wordBreak: "break-all" }}>{selectedNode.objectId}</div>}
+                                    {selectedNode?.persistentIdentifiers?.length > 0 && (
+                                        <div style={{ marginTop: 10 }}>
+                                            <div style={{ fontWeight: 600, fontSize: 12, marginBottom: 4 }}>Persistent Identifiers</div>
+                                            {selectedNode.persistentIdentifiers.map((pid, i) => (
+                                                <div key={i} style={{ fontSize: 12, marginBottom: 5 }}>
+                                                    <div style={{ color: "#888", fontSize: 11 }}>{pid.context || "No context"}</div>
+                                                    <div style={{ wordBreak: "break-all" }}>{pid.value}</div>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+                                <div style={S.section}>
+                                    <div style={{ fontWeight: 600, fontSize: 12, marginBottom: 6 }}>Data</div>
+                                    {selectedNode?.data?.length ? selectedNode.data.map((d, i) => {
+                                        const fmt = formatDataValue(d.value);
+                                        const shortProp = d.property.split(".").pop() || d.property;
+                                        return (
+                                            <div key={`${d.property}_${i}`} style={{ marginBottom: 6, padding: "4px 6px", background: "#f9fafb", borderRadius: 4 }}>
+                                                <div style={{ fontSize: 11, color: "#888", marginBottom: 1 }} title={d.property}>{shortProp}</div>
+                                                <div style={{ fontSize: 13, display: "flex", alignItems: "baseline", gap: 5 }}>
+                                                    <span style={{ fontWeight: 500 }}>{fmt.text}</span>
+                                                    {fmt.uom && (
+                                                        <span style={{ fontSize: 11, color: "#0969da", fontWeight: 600, padding: "0 4px", background: "#ddf4ff", borderRadius: 3 }} title={fmt.unitRef || fmt.uom}>
+                                                            {fmt.uom}
+                                                        </span>
+                                                    )}
+                                                    {fmt.fullRef && !fmt.uom && (
+                                                        <span style={{ fontSize: 11, color: "#888" }} title={fmt.fullRef}>{fmt.text !== fmt.fullRef ? "" : ""}</span>
+                                                    )}
+                                                </div>
+                                                {d.property !== shortProp && (
+                                                    <div style={{ fontSize: 10, color: "#aaa", marginTop: 1 }}>{d.property}</div>
+                                                )}
+                                            </div>
+                                        );
+                                    }) : <div style={{ color: "#888", fontSize: 12 }}>No data.</div>}
+                                </div>
+                                <div style={S.section}>
+                                    <div style={{ fontWeight: 600, fontSize: 12, marginBottom: 6 }}>References</div>
+                                    {selectedNode?.refs?.length ? selectedNode.refs.map((r, i) => (
+                                        <div key={i} style={{ marginBottom: 5 }}>
+                                            <div style={{ fontSize: 11, color: "#888" }}>{r.property}</div>
+                                            <div style={{ fontSize: 12 }}>
+                                                {r.objects.map((oid, j) => (
+                                                    <span key={j} style={{ cursor: parsed?.treeMap?.has(oid) ? "pointer" : "default", color: parsed?.treeMap?.has(oid) ? "#0969da" : "#cf222e", marginRight: 5 }} onClick={() => parsed?.treeMap?.has(oid) && handleSelect(oid)}>{oid}</span>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    )) : <div style={{ color: "#888", fontSize: 12 }}>No references.</div>}
+                                </div>
+                            </>
+                        )}
+                        {rightTab === "connectivity" && (
+                            <div style={S.section}>
+                                {!selectedNode ? <div style={{ color: "#888", fontSize: 12 }}>Select an object.</div> : (() => {
+                                    const conn = parsed?.connectivityMap?.get(selectedId) || { upstream: new Set(), downstream: new Set(), group: new Set() };
+                                    const makeList = (ids, color, label) => (
+                                        <div style={{ marginBottom: 12 }}>
+                                            <div style={{ fontWeight: 600, fontSize: 12, color, marginBottom: 4 }}>{label} ({ids.size})</div>
+                                            {ids.size === 0 ? <div style={{ fontSize: 12, color: "#888" }}>None</div> : [...ids].map(id => {
+                                                const n = parsed?.treeMap?.get(id);
+                                                return <div key={id} style={{ fontSize: 12, padding: "2px 5px", cursor: "pointer", borderRadius: 3, marginBottom: 2, background: "#f6f8fa" }} onClick={() => handleSelect(id)}>{n?.label || id} <span style={{ fontSize: 10, color: "#888" }}>({id})</span></div>;
+                                            })}
+                                        </div>
+                                    );
+                                    return (
+                                        <div>
+                                            {makeList(conn.upstream, "#0969da", "Upstream")}
+                                            {makeList(conn.downstream, "#1a7f37", "Downstream")}
+                                            {makeList(conn.group, "#8250df", "Group")}
+                                        </div>
+                                    );
+                                })()}
+                            </div>
+                        )}
+                        {rightTab === "issues" && (
+                            <div style={S.scroll}>
+                                {!selectedNode ? <div style={{ padding: 12, color: "#888", fontSize: 12 }}>Select an object.</div> : (() => {
+                                    const nodeIssues = selectedId ? (issueMap.get(selectedId) || []) : [];
+                                    if (!validationDone) return <div style={{ padding: 12, color: "#888", fontSize: 12 }}>Run validation first.</div>;
+                                    if (nodeIssues.length === 0) return <div style={{ padding: 12, color: "#888", fontSize: 12 }}>No issues for this object.</div>;
+                                    return nodeIssues.map((issue, i) => (
+                                        <div key={i} style={{ padding: "8px 10px", borderBottom: "1px solid #eef2f6" }}>
+                                            <div style={{ display: "flex", gap: 5, alignItems: "center", marginBottom: 3 }}>
+                                                <span style={{ ...S.badge(S.sevColor[issue.severity]) }}>{issue.severity}</span>
+                                                <span style={{ fontSize: 11, fontFamily: "monospace", color: "#555" }}>{issue.ruleId}</span>
+                                            </div>
+                                            <div style={{ fontSize: 12, color: "#333", marginBottom: 2 }}>{issue.description}</div>
+                                            {issue.suggestedCorrection && <div style={{ fontSize: 11, color: "#0969da", marginTop: 2 }}>Suggestion: {issue.suggestedCorrection}</div>}
+                                        </div>
+                                    ));
+                                })()}
+                            </div>
+                        )}
                     </div>
                 </div>
             )}
