@@ -117,6 +117,17 @@ globalThis.DOMParser = DOMParser;
             const all = qsaImpl(this, sel);
             return all.length > 0 ? all[0] : null;
         };
+        // closest(sel): walk up parentNode chain returning the first ancestor that matches sel
+        nodeProto.closest = function(sel) {
+            const selectors = sel.split(/\s*,\s*/).map(s => s.trim()).filter(Boolean);
+            const parts = selectors.map(s => s.split(/\s*>\s*/).map(parseSegment));
+            let node = this;
+            while (node && node.nodeType === 1) {
+                if (parts.some(parsed => matchesChain(node, parsed, parsed.length - 1))) return node;
+                node = node.parentNode;
+            }
+            return null;
+        };
     }
 }());
 
@@ -225,6 +236,17 @@ if (xmlFiles.length > 1 || summaryOnly) {
     console.log(line);
     for (const r of summaryRows) {
         const name = r.file.length > W - 1 ? r.file.slice(0, W - 4) + "..." : r.file;
+        console.log(`${name.padEnd(W)} ${String(r.errors).padStart(7)} ${String(r.warnings).padStart(9)} ${String(r.infos).padStart(5)}`);
+    }
+    console.log(line);
+    const totE = summaryRows.reduce((s, r) => s + r.errors,   0);
+    const totW = summaryRows.reduce((s, r) => s + r.warnings, 0);
+    const totI = summaryRows.reduce((s, r) => s + r.infos,    0);
+    console.log(`${"TOTAL".padEnd(W)} ${String(totE).padStart(7)} ${String(totW).padStart(9)} ${String(totI).padStart(5)}`);
+}
+
+process.exit(anyErrors ? 1 : 0);
+gth > W - 1 ? r.file.slice(0, W - 4) + "..." : r.file;
         console.log(`${name.padEnd(W)} ${String(r.errors).padStart(7)} ${String(r.warnings).padStart(9)} ${String(r.infos).padStart(5)}`);
     }
     console.log(line);

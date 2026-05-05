@@ -1,4 +1,4 @@
-// DEXPI XML parser utilities – shared between App.jsx and validation engine
+﻿// DEXPI XML parser utilities â€“ shared between App.jsx and validation engine
 
 export function qsa(node, selector) { return Array.from(node.querySelectorAll(selector)); }
 
@@ -339,7 +339,7 @@ export function collectGraphicalElements(mainDoc, symbolMap) {
             || null;
     }
 
-    // elementRole: "symbol" | "label" | "connector" — used for selective highlight colouring in App.jsx
+    // elementRole: "symbol" | "label" | "connector" â€” used for selective highlight colouring in App.jsx
     function pushSymbolUsage(rawRef, el, representedId, key, elementRole = "symbol") {
         const symbol = resolveShapeReference(rawRef);
         const variant = symbol?.variants?.[0];
@@ -355,14 +355,21 @@ export function collectGraphicalElements(mainDoc, symbolMap) {
     }
 
     function traverseGroup(groupNode, currentRepresents = null, keyPrefix = "g") {
+        // If this group node is itself a Core/Diagram.Label, everything inside it
+        // is annotation text and should highlight orange (elementRole "label"),
+        // not the primary red used for symbol outlines.
+        const groupType = groupNode.getAttribute ? (groupNode.getAttribute("type") || "") : "";
+        const isLabelGroup = groupType === "Core/Diagram.Label";
+
         const localRepresents = resolveRepresentedId(groupNode, currentRepresents);
         directComponentsObjects(groupNode, "Elements").forEach((el, i) => {
             const type = el.getAttribute("type") || "";
             if (type === "Profile/SymbolUsage") {
-                pushSymbolUsage(referenceTargets(el, "Symbol")[0] || null, el, localRepresents, `${keyPrefix}_su_${i}`, "symbol");
+                pushSymbolUsage(referenceTargets(el, "Symbol")[0] || null, el, localRepresents, `${keyPrefix}_su_${i}`, isLabelGroup ? "label" : "symbol");
             } else if (type === "Core/Diagram.ShapeUsage") {
-                pushSymbolUsage(referenceTargets(el, "Shape")[0] || null, el, localRepresents, `${keyPrefix}_shu_${i}`, "symbol");
+                pushSymbolUsage(referenceTargets(el, "Shape")[0] || null, el, localRepresents, `${keyPrefix}_shu_${i}`, isLabelGroup ? "label" : "symbol");
             } else if (type === "Core/Diagram.Label") {
+                // Label as a direct Element child (less common â€” most files put Labels in Groups)
                 const labelRepresents = resolveRepresentedId(el, localRepresents);
                 directComponentsObjects(el, "Elements").forEach((lel, li) => {
                     const lt = lel.getAttribute("type") || "";
@@ -381,7 +388,7 @@ export function collectGraphicalElements(mainDoc, symbolMap) {
                 if (prim.kind === "connectorLine") {
                     drawn.push({ kind: "connectorLine", primitive: prim, representedId: localRepresents, elementRole: "connector", key: `${keyPrefix}_cl_${i}` });
                 } else {
-                    drawn.push({ kind: "primitive", primitive: prim, representedId: localRepresents, elementRole: "symbol", key: `${keyPrefix}_p_${i}` });
+                    drawn.push({ kind: "primitive", primitive: prim, representedId: localRepresents, elementRole: isLabelGroup ? "label" : "symbol", key: `${keyPrefix}_p_${i}` });
                 }
             }
         });

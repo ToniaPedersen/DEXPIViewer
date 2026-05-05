@@ -95,7 +95,7 @@ function ellipseArcToPath(cx, cy, rx, ry, startDeg, endDeg, rotation) {
 
 // ---------- SVG Rendering ----------------------------------------------------
 
-function renderPrimitive(primitive, key) {
+function renderPrimitive(primitive, key, textColorOverride = null) {
     const fill = v => v?.style === "Transparent" ? "none" : (v?.color || "none");
     if (primitive.kind === "polyline") return <polyline key={key} points={primitive.points.map(p => `${p.x},${p.y}`).join(" ")} fill="none" stroke={primitive.stroke.color} strokeWidth={primitive.stroke.width} strokeDasharray={primitive.stroke.dashArray || undefined} vectorEffect="non-scaling-stroke" />;
     if (primitive.kind === "polygon") return <polygon key={key} points={primitive.points.map(p => `${p.x},${p.y}`).join(" ")} fill={fill(primitive.fill)} stroke={primitive.stroke.color} strokeWidth={primitive.stroke.width} vectorEffect="non-scaling-stroke" />;
@@ -105,7 +105,10 @@ function renderPrimitive(primitive, key) {
     if (primitive.kind === "text") {
         const anchor = primitive.style.horizontal.toLowerCase().includes("left") ? "start" : primitive.style.horizontal.toLowerCase().includes("right") ? "end" : "middle";
         const baseline = primitive.style.vertical.toLowerCase().includes("bottom") ? "baseline" : primitive.style.vertical.toLowerCase().includes("top") ? "hanging" : "middle";
-        return <text key={key} x={primitive.position.x} y={primitive.position.y} fontFamily={primitive.style.font} fontSize={primitive.style.size} fill={parseColor(primitive.style.color)} textAnchor={anchor} dominantBaseline={baseline} transform={`rotate(${primitive.rotation} ${primitive.position.x} ${primitive.position.y})`}>{primitive.value}</text>;
+        // textColorOverride applies the selection highlight colour directly to text fill,
+        // since text has no stroke geometry for highlightPrimitive to overlay.
+        const textFill = textColorOverride || parseColor(primitive.style.color);
+        return <text key={key} x={primitive.position.x} y={primitive.position.y} fontFamily={primitive.style.font} fontSize={primitive.style.size} fill={textFill} textAnchor={anchor} dominantBaseline={baseline} transform={`rotate(${primitive.rotation} ${primitive.position.x} ${primitive.position.y})`}>{primitive.value}</text>;
     }
     if (primitive.kind === "ellipseArc") {
         const d = ellipseArcToPath(primitive.center.x, primitive.center.y, primitive.rx, primitive.ry, primitive.startAngle, primitive.endAngle, primitive.rotation);
@@ -135,17 +138,31 @@ function ConnectorLineSvg({ el, nodePosMap, selected, connColor }) {
     const pts = [src, ...prim.innerPoints, tgt].filter(Boolean);
     if (pts.length < 2) return null;
     const color = connColor || (selected ? "#d1242f" : prim.stroke.color);
-    const sw = selected ? Math.max(prim.stroke.width * 2, prim.stroke.width + 0.4) : prim.stroke.width;
+    // Signal/instrument connector lines often have sub-pixel stroke widths (e.g. 0.09–0.35 SVG units)
+    // in a diagram that spans ~800 SVG units on a ~900px panel (≈1.1 px/unit). Enforce a minimum
+    // of 1.0 SVG unit so the line renders as at least 1 CSS pixel at default zoom. When we bump
+    // the stroke width, scale the dash pattern proportionally so dashes remain clearly visible.
+    const minWidth = 1.0;
+    const baseWidth = prim.stroke.width;
+    const sw = selected
+        ? Math.max(baseWidth * 2, baseWidth + 0.4)
+        : Math.max(baseWidth, minWidth);
+    const rawDash = prim.stroke.dashArray || "";
+    const scaledDash = (!selected && rawDash && baseWidth > 0 && sw > baseWidth)
+        ? rawDash.split(/\s+/).map(v => (parseFloat(v) * (sw / baseWidth)).toFixed(3)).join(" ")
+        : rawDash;
     const mid = Math.floor(pts.length / 2);
     const p1 = pts[mid - 1] || pts[0]; const p2 = pts[mid];
     const dx = p2.x - p1.x; const dy = p2.y - p1.y;
     const len = Math.sqrt(dx * dx + dy * dy) || 1;
     const ux = dx / len; const uy = dy / len;
     const mx = (p1.x + p2.x) / 2; const my = (p1.y + p2.y) / 2;
-    const ar = Math.max(prim.stroke.width * 3, 1.5);
+    const ar = Math.max(baseWidth * 3, 1.5);
     return (
         <g>
-            <polyline points={pts.map(p => `${p.x},${p.y}`).join(" ")} fill="none" stroke={color} strokeWidth={sw} strokeDasharray={prim.stroke.dashArray || undefined} vectorEffect="non-scaling-stroke" />
+            {/* Unselected: no vectorEffect so stroke scales naturally with the viewBox.
+                Selected/connectivity: vectorEffect keeps highlight width constant while zooming. */}
+            <polyline points={pts.map(p => `${p.x},${p.y}`).join(" ")} fill="none" stroke={color} strokeWidth={sw} strokeDasharray={scaledDash || undefined} vectorEffect={(selected || connColor) ? "non-scaling-stroke" : "none"} />
             {(selected || connColor) && (
                 <polygon
                     points={`${mx},${my} ${mx - ux * ar - uy * ar * 0.5},${my - uy * ar + ux * ar * 0.5} ${mx - ux * ar + uy * ar * 0.5},${my - uy * ar - ux * ar * 0.5}`}
@@ -212,8 +229,10 @@ function PrimitiveGraphic({ el, selected, connHighlight, onSelect, nodePosMap })
                 if (pts.length < 2) return null;
                 return <polyline points={pts.map(pt => `${pt.x},${pt.y}`).join(" ")} fill="none" stroke="transparent" strokeWidth={Math.max((prim.stroke?.width || 0.25) + 4, 5)} vectorEffect="non-scaling-stroke" pointerEvents="stroke" />;
             })()}
-            {hlColor && el.kind !== "connectorLine" && highlightPrimitive(prim, `hl_${el.key}`, hlColor)}
-            {el.kind === "connectorLine" ? <ConnectorLineSvg el={el} nodePosMap={nodePosMap} selected={selected} connColor={connHighlight} /> : renderPrimitive(prim, el.key)}
+            {hlColor && el.kind !== "connectorLine" && prim?.kind !== "text" && highlightPrimitive(prim, `hl_${el.key}`, hlColor)}
+            {el.kind === "connectorLine"
+                ? <ConnectorLineSvg el={el} nodePosMap={nodePosMap} selected={selected} connColor={connHighlight} />
+                : renderPrimitive(prim, el.key, prim?.kind === "text" ? hlColor : null)}
         </g>
     );
 }

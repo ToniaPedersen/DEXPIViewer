@@ -1,5 +1,5 @@
 // DEXPI Verificator – Validation Engine
-// Implements: VAL-001..005, VAX-001..005, VAE-001..004, VAE-005, PRF-001..007, ERR-001..004, RPT-001..004
+// Implements: VAL-001..005, VAX-001..005, VAE-001..006, PRF-001..007, ERR-001..010, RPT-001..004
 
 import { DEXPI_ALL_TYPES, DEXPI_STD_PREFIXES as _DEXPI_STD_PREFIXES } from "./dexpiTypes.js";
 
@@ -27,6 +27,7 @@ export const DEFAULT_SEVERITIES = {
     "VAE-003": { level: "Warning", score: 2 },
     "VAE-004": { level: "Warning", score: 2 },
     "VAE-005": { level: "Warning", score: 2 },
+    "VAE-006": { level: "Warning", score: 2 },
     "PRF":     { level: "Warning", score: 2 },
     "ERR-E01": { level: "Error",   score: 3 },
     "ERR":     { level: "Error",   score: 3 },
@@ -852,19 +853,36 @@ export function runEngineeringValidation(flatTree, severityConfig) {
             }
         }
 
-        // VAE-002: PipingNetworkSegment should contain at least one piping item
+        // VAE-002: PipingNetworkSegment should contain at least one PipingComponent (or subtype).
+        // In the DEXPI Plant Meta Model, PipingComponent subtypes include Pipe, all Valve types,
+        // Fittings, FlowMeasuringElements, etc. — essentially every Plant/Piping.* type that is
+        // not a network/structural type. We match by namespace prefix and exclude the non-component
+        // structural types. Children may sit under any Components property (Items, Connections, etc.).
         if (typeSuffix === "PipingNetworkSegment") {
-            const hasItems = node.children.some(c =>
-                c.type.includes("PipingComponent") || c.type.includes("PipingItem") ||
-                c.edgeLabel === "Items");
+            // Types in the Plant/Piping namespace that are NOT PipingComponent subtypes.
+            const PIPING_NON_COMPONENT_SUFFIXES = new Set([
+                "PipingNetworkSegment", "PipingNetworkSystem", "PipingNode", "PropertyBreak",
+            ]);
+            const isPipingComponent = t => {
+                if (!t) return false;
+                // Explicit string match for legacy / profile types
+                if (t.includes("PipingComponent") || t.includes("PipingItem")) return true;
+                // Any Plant/Piping.* type that is not a network/structural container
+                if (t.startsWith("Plant/Piping.")) {
+                    const suffix = t.split(".").pop();
+                    return !PIPING_NON_COMPONENT_SUFFIXES.has(suffix);
+                }
+                return false;
+            };
+            const hasItems = node.children.some(c => isPipingComponent(c.type));
             if (!hasItems) {
                 const sev = resolveSeverity("VAE-002", severityConfig);
                 issues.push({
                     objectId: node.objectId || "(no id)", objectType: node.type, ruleId: "VAE-002",
                     severity: sev.level, score: sev.score,
-                    description: `PipingNetworkSegment '${node.label}' contains no piping items. A segment should contain at least one piping component or instrument.`,
+                    description: `PipingNetworkSegment '${node.label || node.objectId}' contains no PipingComponent or subtype. A segment should contain at least one piping component (Pipe, Valve, Fitting, etc.).`,
                     location: loc, profileSource: "Base",
-                    suggestedCorrection: "Add piping items (valves, instruments, pipe runs, etc.) to this segment."
+                    suggestedCorrection: "Add at least one PipingComponent subtype (e.g. Pipe, Valve, Fitting) to this PipingNetworkSegment."
                 });
             }
         }
@@ -907,6 +925,45 @@ export function runEngineeringValidation(flatTree, severityConfig) {
             }
         }
     });
+
+    // VAE-006: ProcessInstrumentationFunction not connected to any SignalConveyingFunction or subtype.
+    // In a well-formed DEXPI model every PIF should appear as the Source or Target of at least one
+    // signal line (MeasuringLineFunction, SignalConveyingFunction, ActuatingLineFunction, etc.).
+    // A PIF that is referenced by no signal line is either unconnected or its signal lines are missing.
+    {
+        // Types that convey instrument signals and whose Source/Target refs must include the PIF.
+        const SCF_KEYWORDS = [
+            "SignalConveyingFunction", "MeasuringLineFunction",
+            "ActuatingLineFunction",   "ControlLineFunction",
+            "SignalBranchFunction",
+        ];
+
+        // Collect every ID that appears as Source or Target of any signal-conveying function.
+        const scfRefIds = new Set();
+        flatTree.forEach(node => {
+            if (!SCF_KEYWORDS.some(kw => node.type.includes(kw))) return;
+            node.refs.forEach(ref => {
+                if (ref.property === "Source" || ref.property === "Target") {
+                    ref.objects.forEach(id => scfRefIds.add(id));
+                }
+            });
+        });
+
+        // Flag every ProcessInstrumentationFunction whose objectId is absent from those refs.
+        flatTree.forEach(node => {
+            if (!node.type.includes("ProcessInstrumentationFunction")) return;
+            if (!node.objectId) return;
+            if (scfRefIds.has(node.objectId)) return;   // connected — OK
+            const sev = resolveSeverity("VAE-006", severityConfig);
+            issues.push({
+                objectId: node.objectId, objectType: node.type, ruleId: "VAE-006",
+                severity: sev.level, score: sev.score,
+                description: `ProcessInstrumentationFunction '${node.label || node.objectId}' is not the Source or Target of any SignalConveyingFunction or subtype (MeasuringLineFunction, ActuatingLineFunction, etc.). Every instrumentation function should be connected to a signal line.`,
+                location: `//*[@id='${node.objectId}']`, profileSource: "Base",
+                suggestedCorrection: "Add a MeasuringLineFunction or SignalConveyingFunction whose Source or Target references this ProcessInstrumentationFunction, or verify that the signal connection exists and the reference is not broken."
+            });
+        });
+    }
 
     return issues;
 }
@@ -1420,6 +1477,7 @@ export function runFullValidation({ mainXml, flatTree, profiles, severityConfig,
         allIssues.push(...runProfileValidation(flatTree, mergedConstraints, overrideLog, severityConfig));
         profiles.forEach(p => {
             if (p.xml) allIssues.push(...validateProfileContent(p.xml, p.name, severityConfig));
+            if (p.xml) allIssues.push(...validateProfileContent(p.xml, p.name, severityConfig));
             if (p.xml) allIssues.push(...validateSymbolRules(mainXml, p.xml, p.name, severityConfig));
         });
     }
@@ -1434,7 +1492,7 @@ export function exportCSV(issues) {
         "Object ID", "Line Number", "Object Type", "Rule ID", "Severity", "Severity Score",
         "Rule Description", "Location (XPath)", "Profile Source", "Suggested Correction"
     ];
-    const escape = v => (v2 => `"${v2.replace(/"/g, '""')}"`)(String(v ?? ""));
+        const escape = v => (v2 => `"${v2.replace(/"/g, '""')}"`)(String(v ?? ""));
     const rows = issues.map(i => [
         i.objectId, i.lineNumber ?? "", i.objectType, i.ruleId, i.severity, i.score,
         i.description, i.location, i.profileSource, i.suggestedCorrection

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * DEXPI 2.0 Type Registry
  *
  * Generated from uploaded DEXPI XML model definition files.
@@ -509,3 +509,4 @@ export const DEXPI_STD_PREFIXES = new Set([
     "MetaData",
     "Builtin",
 ]);
+
