@@ -858,6 +858,39 @@ export default function App() {
                                         </div>
                                     )) : <div style={{ color: "#888", fontSize: 12 }}>No references.</div>}
                                 </div>
+                                {(() => {
+                                    if (!selectedNode?.objectId || !parsed?.flatTree) return null;
+                                    const referencedBy = [];
+                                    parsed.flatTree.forEach(node => {
+                                        if (node.objectId === selectedNode.objectId) return;
+                                        node.refs.forEach(r => {
+                                            if (r.objects.includes(selectedNode.objectId)) {
+                                                referencedBy.push({ node, property: r.property });
+                                            }
+                                        });
+                                    });
+                                    return (
+                                        <div style={S.section}>
+                                            <div style={{ fontWeight: 600, fontSize: 12, marginBottom: 6 }}>Referenced By</div>
+                                            {referencedBy.length ? referencedBy.map((entry, i) => (
+                                                <div key={i} style={{ marginBottom: 5 }}>
+                                                    <div style={{ fontSize: 11, color: "#888" }}>{entry.property}</div>
+                                                    <div style={{ fontSize: 12, display: "flex", alignItems: "baseline", gap: 5 }}>
+                                                        <span
+                                                            style={{ cursor: "pointer", color: "#0969da" }}
+                                                            onClick={() => handleSelect(entry.node.objectId)}
+                                                        >
+                                                            {entry.node.label || entry.node.objectId}
+                                                        </span>
+                                                        <span style={{ fontSize: 10, color: "#aaa" }}>
+                                                            {entry.node.type.split(".").pop()}
+                                                        </span>
+                                                    </div>
+                                                </div>
+                                            )) : <div style={{ color: "#888", fontSize: 12 }}>Not referenced by any object.</div>}
+                                        </div>
+                                    );
+                                })()}
                                 {selectedNode?.children?.length > 0 && (
                                     <div style={S.section}>
                                         <div style={{ fontWeight: 600, fontSize: 12, marginBottom: 6 }}>
