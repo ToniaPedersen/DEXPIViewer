@@ -423,6 +423,7 @@ export default function App() {
         const allIssues = runFullValidation({
             mainXml: mainXmlText, flatTree: parsed.flatTree,
             profiles, severityConfig, externalValidIds,
+            discXml: discXmlText || null,
         });
         const issues = allIssues.filter(i => resolveSeverity(i.ruleId, severityConfig).level !== "Ignore");
         setValidationIssues(issues);
@@ -888,6 +889,34 @@ export default function App() {
                                                     </div>
                                                 </div>
                                             )) : <div style={{ color: "#888", fontSize: 12 }}>Not referenced by any object.</div>}
+                                        </div>
+                                    );
+                                })()}
+                                {(() => {
+                                    if (!selectedNode?.objectId || !parsed?.flatTree) return null;
+                                    const parent = parsed.flatTree.find(n =>
+                                        n.objectId && n.objectId !== selectedNode.objectId &&
+                                        n.children.some(c => c.objectId === selectedNode.objectId)
+                                    ) || null;
+                                    if (!parent) return null;
+                                    const typeSuffix = parent.type.split(".").pop();
+                                    const parentIssues = parent.objectId ? (issueMap.get(parent.objectId) || []) : [];
+                                    const hasErr  = parentIssues.some(x => x.severity === "Error");
+                                    const hasWarn = !hasErr && parentIssues.some(x => x.severity === "Warning");
+                                    return (
+                                        <div style={S.section}>
+                                            <div style={{ fontWeight: 600, fontSize: 12, marginBottom: 6 }}>Parent Component</div>
+                                            <div
+                                                onClick={() => handleSelect(parent.objectId)}
+                                                style={{ display: "flex", alignItems: "center", gap: 5, padding: "4px 6px", background: "#f9fafb", borderRadius: 4, cursor: "pointer", border: "1px solid #eef2f6" }}
+                                            >
+                                                {hasErr  && <span title="Has errors"   style={{ color: "#cf222e", fontSize: 10, flexShrink: 0 }}>●</span>}
+                                                {hasWarn && <span title="Has warnings" style={{ color: "#9a6700", fontSize: 10, flexShrink: 0 }}>●</span>}
+                                                <span style={{ fontSize: 12, fontWeight: 500, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                                    {parent.label || parent.objectId || typeSuffix}
+                                                </span>
+                                                <span style={{ fontSize: 10, color: "#aaa", flexShrink: 0 }}>{typeSuffix}</span>
+                                            </div>
                                         </div>
                                     );
                                 })()}

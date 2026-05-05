@@ -1292,6 +1292,26 @@ export function validateSymbolRules(mainXml, profileXml, profileName, severityCo
         return { px, py };
     };
 
+    // Helper: walk up the DOM from `el` and return the first Object that has a
+    // References[@property="Represents"] child, plus the referenced id.
+    // This handles profiles where the Represents ref is on an ancestor RepresentationGroup
+    // rather than the immediate parent (e.g. multi-level Aibel symbol groups).
+    function findRepresentsAncestor(el) {
+        let node = el.parentElement;
+        while (node) {
+            if (node.tagName === "Object") {
+                for (const ch of node.children) {
+                    if (ch.tagName === "References" && ch.getAttribute("property") === "Represents") {
+                        const raw = (ch.getAttribute("objects") || "").replace(/^#/, "");
+                        if (raw) return { representsId: raw, repGroupEl: node };
+                    }
+                }
+            }
+            node = node.parentElement;
+        }
+        return { representsId: null, repGroupEl: null };
+    }
+
     // Inspect every Profile/SymbolUsage in the drawing
     doc.querySelectorAll('Object[type="Profile/SymbolUsage"]').forEach(su => {
         // Symbol name: "DiscProfile/PE037A" → strip prefix → "PE037A"
@@ -1300,7 +1320,30 @@ export function validateSymbolRules(mainXml, profileXml, profileName, severityCo
             c => c.tagName === "References" && c.getAttribute("property") === "Symbol"
         );
         if (!symRefEl) return;
-        const symName = (symRefEl.getAttribute("objects") || "").split("/").pop().replace(/^#/, "");
+        const symRefObjects = symRefEl.getAttribute("objects") || "";
+        const symName = symRefObjects.split("/").pop().replace(/^#/, "");
+
+        // ── PRF-E04 Sub-rule A: symbol must exist in the profile ─────────────
+        // Checked here — before any RepresentationGroup navigation — so that
+        // deeply-nested or non-standard group structures never bypass it.
+        if (symName && !symbolUsage.has(symName)) {
+            // Walk up to find context (best-effort; may be null for orphaned usages)
+            const { representsId: qId } = findRepresentsAncestor(su);
+            const qType = qId ? (objectTypes.get(qId) || "") : "";
+            const sev = resolveSeverity("PRF-E04", severityConfig);
+            issues.push({
+                objectId:    qId || "(unknown)",
+                objectType:  qType,
+                ruleId:      "PRF-E04",
+                severity:    sev.level,
+                score:       sev.score,
+                description: `SymbolUsage references symbol '${symName}' (${symRefObjects}) which is not defined in profile '${profileName}'. Every SymbolUsage Symbol reference must resolve to a Profile/Symbol declared in the active profile.`,
+                location:    qId ? `//*[@id='${qId}']` : "/",
+                profileSource: profileName,
+                suggestedCorrection: `Use a symbol name declared as a Profile/Symbol in '${profileName}', or add the missing symbol definition to the profile.`,
+            });
+            return; // Can't meaningfully check PRF-E05 without the symbol definition
+        }
 
         // Read placement parameters
         let posX = 0, posY = 0, rotation = 0, scaleX = 1, scaleY = 1, isMirrored = false;
@@ -1322,24 +1365,27 @@ export function validateSymbolRules(mainXml, profileXml, profileName, severityCo
         const topRepGroup  = groupsComp?.parentElement;   // Object type="Core/Diagram.RepresentationGroup"
         if (!topRepGroup || topRepGroup.getAttribute("type") !== "Core/Diagram.RepresentationGroup") return;
 
-        // Determine which model object this RepresentationGroup represents
-        let representsId = null;
-        for (const child of topRepGroup.children) {
-            if (child.tagName === "References" && child.getAttribute("property") === "Represents") {
-                representsId = (child.getAttribute("objects") || "").replace(/^#/, "");
-                break;
-            }
-        }
+        // Determine which model object this RepresentationGroup represents.
+        // Walk upward through the DOM — some profiles nest Static inside sub-RepGroups
+        // whose ancestor (not immediate parent) carries the Represents reference.
+        const { representsId } = findRepresentsAncestor(staticEl);
         const modelType     = representsId ? (objectTypes.get(representsId) || "") : "";
         const normModelType = modelType.replace(/\//g, ".");
 
-        // ── PRF-E04: symbol type must match the model object's DEXPI type ───────
+        // ── PRF-E04 Sub-rule B: symbol's allowed types must match the model type ─
         const allowedTypes = symbolUsage.get(symName);
         if (modelType && allowedTypes && allowedTypes.length > 0) {
+            // Only consider usages that are valid DEXPI type strings (dot-separated namespaced
+            // types). File-path usages (e.g. "\Piping\Valves\...sym") from non-standard profiles
+            // are not comparable to DEXPI type strings and are skipped.
+            const dexpiUsages = allowedTypes.filter(at =>
+                /^[A-Za-z][A-Za-z0-9]*\.[A-Za-z]/.test(at)
+            );
+
             // Skip decorator / label symbols (usage entirely Core.Diagram.*).
-            const isDecorator = allowedTypes.every(at => at.startsWith("Core.Diagram."));
-            if (!isDecorator) {
-                const isAllowed = allowedTypes.some(at => at === normModelType);
+            const isDecorator = dexpiUsages.length > 0 && dexpiUsages.every(at => at.startsWith("Core.Diagram."));
+            if (!isDecorator && dexpiUsages.length > 0) {
+                const isAllowed = dexpiUsages.some(at => at === normModelType);
                 if (!isAllowed) {
                     // Rule 1 – only flag when the profile defines at least one dedicated
                     // symbol for this model type. If none exist, the object legitimately
@@ -1350,7 +1396,7 @@ export function validateSymbolRules(mainXml, profileXml, profileName, severityCo
                     // Rule 2 – within the same top-level category (e.g. Plant.ProcessEquipment)
                     // subtype symbol usage is acceptable (e.g. Nozzle using an AccessNozzle symbol).
                     const modelCat    = typeCategory(normModelType);
-                    const symCatMatch = allowedTypes.some(at => typeCategory(at) === modelCat);
+                    const symCatMatch = dexpiUsages.some(at => typeCategory(at) === modelCat);
 
                     if (profileHasSymbolsForType && !symCatMatch) {
                         const sev = resolveSeverity("PRF-E04", severityConfig);
@@ -1361,7 +1407,7 @@ export function validateSymbolRules(mainXml, profileXml, profileName, severityCo
                             ruleId:      "PRF-E04",
                             severity:    sev.level,
                             score:       sev.score,
-                            description: `Symbol '${symName}' (allowed for: ${allowedTypes.join(", ")}) is used to represent ` +
+                            description: `Symbol '${symName}' (allowed for: ${dexpiUsages.join(", ")}) is used to represent ` +
                                          `'${representsId}' of type '${modelType}'. ` +
                                          `Symbols permitted for this type: ${validSymbols || "(none defined)"}.`,
                             location:    representsId ? `//*[@id='${representsId}']` : "/",
@@ -1444,12 +1490,16 @@ export function validateSymbolRules(mainXml, profileXml, profileName, severityCo
 
 // ─── Full Validation Run ──────────────────────────────────────────────────────
 
-export function runFullValidation({ mainXml, flatTree, profiles, severityConfig, externalValidIds = new Set() }) {
+export function runFullValidation({ mainXml, flatTree, profiles, severityConfig, externalValidIds = new Set(), discXml = null, discXmlName = "DiscProfile" }) {
     const allIssues = [];
 
     // Collect all Object types declared in loaded profile XMLs so ERR-E07 skips them
     const profileTypes = new Set();
-    (profiles || []).forEach(p => {
+    const allProfileXmls = [
+        ...(discXml ? [{ xml: discXml, name: discXmlName }] : []),
+        ...(profiles || []),
+    ];
+    allProfileXmls.forEach(p => {
         if (!p.xml) return;
         const parser = new DOMParser();
         const profileDoc = parser.parseFromString(p.xml, "application/xml");
@@ -1477,9 +1527,18 @@ export function runFullValidation({ mainXml, flatTree, profiles, severityConfig,
         allIssues.push(...runProfileValidation(flatTree, mergedConstraints, overrideLog, severityConfig));
         profiles.forEach(p => {
             if (p.xml) allIssues.push(...validateProfileContent(p.xml, p.name, severityConfig));
-            if (p.xml) allIssues.push(...validateProfileContent(p.xml, p.name, severityConfig));
             if (p.xml) allIssues.push(...validateSymbolRules(mainXml, p.xml, p.name, severityConfig));
         });
+    }
+
+    // Run symbol rules against the disc profile (loaded via "DiscProfile.xml" button) if it
+    // was not already included as a "+ Profile" entry. This ensures PRF-E04 fires for symbol
+    // references that are not defined in the companion disc profile file.
+    if (discXml) {
+        const alreadyValidated = (profiles || []).some(p => p.xml === discXml);
+        if (!alreadyValidated) {
+            allIssues.push(...validateSymbolRules(mainXml, discXml, discXmlName, severityConfig));
+        }
     }
 
     return allIssues;
