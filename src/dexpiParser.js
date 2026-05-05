@@ -156,7 +156,7 @@ export function parsePrimitive(objectNode, idx) {
         stroke: aggregatedValue(getData(objectNode, "Stroke")?.firstElementChild) || { color: "#000", width: 0.25 },
         fill: parseFill(objectNode)
     };
-    if (type === "Core/Diagram.Text") return {
+    if (type === "Core/Diagram.Text" || type === "Core/Diagram.LiteralText") return {
         kind: "text", key,
         position: aggregatedValue(getData(objectNode, "Position")?.firstElementChild) || { x: 0, y: 0 },
         value: valueFromData(objectNode, "Value") || valueFromData(objectNode, "Text") || "",
@@ -175,6 +175,16 @@ export function parsePrimitive(objectNode, idx) {
         stroke: aggregatedValue(getData(objectNode, "Stroke")?.firstElementChild) || { color: "#000", width: 0.25 },
         sourceRef: referenceTargets(objectNode, "Source")[0] || null,
         targetRef: referenceTargets(objectNode, "Target")[0] || null
+    };
+    if (type === "Core/Diagram.EllipseArc") return {
+        kind: "ellipseArc", key,
+        center: aggregatedValue(getData(objectNode, "Center")?.firstElementChild) || { x: 0, y: 0 },
+        rx: numberFromData(objectNode, "HorizontalSemiAxis", 1),
+        ry: numberFromData(objectNode, "VerticalSemiAxis", 1),
+        startAngle: numberFromData(objectNode, "StartAngle", 0),
+        endAngle: numberFromData(objectNode, "EndAngle", 360),
+        rotation: numberFromData(objectNode, "Rotation", 0),
+        stroke: aggregatedValue(getData(objectNode, "Stroke")?.firstElementChild) || { color: "#000", width: 0.25 }
     };
     return null;
 }
@@ -212,6 +222,20 @@ function inferBoundsFromPrimitives(primitives) {
         else if (p.kind === "ellipse") { visit({ x: p.center.x - p.rx, y: p.center.y - p.ry }); visit({ x: p.center.x + p.rx, y: p.center.y + p.ry }); }
         else if (p.kind === "rect") { visit({ x: p.center.x - p.width / 2, y: p.center.y - p.height / 2 }); visit({ x: p.center.x + p.width / 2, y: p.center.y + p.height / 2 }); }
         else if (p.kind === "text") visit(p.position);
+        else if (p.kind === "ellipseArc") {
+            const { center: c, rx, ry, startAngle, endAngle, rotation } = p;
+            const toRad = d => d * Math.PI / 180;
+            const phiRad = toRad(rotation);
+            let span = endAngle - startAngle;
+            if (span <= 0) span += 360;
+            const steps = Math.max(8, Math.ceil(span / 10));
+            for (let i = 0; i <= steps; i++) {
+                const a = toRad(startAngle + (span * i) / steps);
+                const ca = Math.cos(a), sa = Math.sin(a);
+                const cp = Math.cos(phiRad), sp = Math.sin(phiRad);
+                visit({ x: c.x + rx * cp * ca - ry * sp * sa, y: c.y + rx * sp * ca + ry * cp * sa });
+            }
+        }
     });
     if (!Number.isFinite(minX)) return { minX: -1, minY: -1, maxX: 1, maxY: 1 };
     return { minX, minY, maxX, maxY };
@@ -315,12 +339,13 @@ export function collectGraphicalElements(mainDoc, symbolMap) {
             || null;
     }
 
-    function pushSymbolUsage(rawRef, el, representedId, key) {
+    // elementRole: "symbol" | "label" | "connector" — used for selective highlight colouring in App.jsx
+    function pushSymbolUsage(rawRef, el, representedId, key, elementRole = "symbol") {
         const symbol = resolveShapeReference(rawRef);
         const variant = symbol?.variants?.[0];
         if (!variant) return;
         drawn.push({
-            kind: "symbolUsage", key, representedId, symbol, variant,
+            kind: "symbolUsage", key, representedId, elementRole, symbol, variant,
             position: aggregatedValue(getData(el, "Position")?.firstElementChild) || { x: 0, y: 0 },
             rotation: numberFromData(el, "Rotation", 0),
             scaleX: numberFromData(el, "ScaleX", 1),
@@ -334,29 +359,29 @@ export function collectGraphicalElements(mainDoc, symbolMap) {
         directComponentsObjects(groupNode, "Elements").forEach((el, i) => {
             const type = el.getAttribute("type") || "";
             if (type === "Profile/SymbolUsage") {
-                pushSymbolUsage(referenceTargets(el, "Symbol")[0] || null, el, localRepresents, `${keyPrefix}_su_${i}`);
+                pushSymbolUsage(referenceTargets(el, "Symbol")[0] || null, el, localRepresents, `${keyPrefix}_su_${i}`, "symbol");
             } else if (type === "Core/Diagram.ShapeUsage") {
-                pushSymbolUsage(referenceTargets(el, "Shape")[0] || null, el, localRepresents, `${keyPrefix}_shu_${i}`);
+                pushSymbolUsage(referenceTargets(el, "Shape")[0] || null, el, localRepresents, `${keyPrefix}_shu_${i}`, "symbol");
             } else if (type === "Core/Diagram.Label") {
                 const labelRepresents = resolveRepresentedId(el, localRepresents);
                 directComponentsObjects(el, "Elements").forEach((lel, li) => {
                     const lt = lel.getAttribute("type") || "";
-                    if (lt === "Core/Diagram.Text") {
+                    if (lt === "Core/Diagram.Text" || lt === "Core/Diagram.LiteralText" || lt === "Core/Diagram.AttributeRepresentation") {
                         const prim = parsePrimitive(lel, li);
-                        if (prim) drawn.push({ kind: "primitive", primitive: prim, representedId: labelRepresents, key: `${keyPrefix}_lbltxt_${i}_${li}` });
+                        if (prim) drawn.push({ kind: "primitive", primitive: prim, representedId: labelRepresents, elementRole: "label", key: `${keyPrefix}_lbltxt_${i}_${li}` });
                     } else if (lt === "Core/Diagram.ShapeUsage") {
-                        pushSymbolUsage(referenceTargets(lel, "Shape")[0] || null, lel, labelRepresents, `${keyPrefix}_lblshape_${i}_${li}`);
+                        pushSymbolUsage(referenceTargets(lel, "Shape")[0] || null, lel, labelRepresents, `${keyPrefix}_lblshape_${i}_${li}`, "label");
                     } else if (lt === "Profile/SymbolUsage") {
-                        pushSymbolUsage(referenceTargets(lel, "Symbol")[0] || null, lel, labelRepresents, `${keyPrefix}_lblsym_${i}_${li}`);
+                        pushSymbolUsage(referenceTargets(lel, "Symbol")[0] || null, lel, labelRepresents, `${keyPrefix}_lblsym_${i}_${li}`, "label");
                     }
                 });
             } else {
                 const prim = parsePrimitive(el, i);
                 if (!prim) return;
                 if (prim.kind === "connectorLine") {
-                    drawn.push({ kind: "connectorLine", primitive: prim, representedId: localRepresents, key: `${keyPrefix}_cl_${i}` });
+                    drawn.push({ kind: "connectorLine", primitive: prim, representedId: localRepresents, elementRole: "connector", key: `${keyPrefix}_cl_${i}` });
                 } else {
-                    drawn.push({ kind: "primitive", primitive: prim, representedId: localRepresents, key: `${keyPrefix}_p_${i}` });
+                    drawn.push({ kind: "primitive", primitive: prim, representedId: localRepresents, elementRole: "symbol", key: `${keyPrefix}_p_${i}` });
                 }
             }
         });
@@ -398,8 +423,8 @@ export function parseDexpiPackage(mainXml, discProfileXml) {
     const parser = new DOMParser();
     const mainDoc = parser.parseFromString(mainXml, "application/xml");
     const discDoc = discProfileXml ? parser.parseFromString(discProfileXml, "application/xml") : null;
-    if (mainDoc.querySelector("parseerror")) throw new Error("Main XML is not well-formed.");
-    if (discDoc && discDoc.querySelector("parseerror")) throw new Error("DiscProfile XML is not well-formed.");
+    if (mainDoc.querySelector("parsererror")) throw new Error("Main XML is not well-formed.");
+    if (discDoc && discDoc.querySelector("parsererror")) throw new Error("DiscProfile XML is not well-formed.");
     const conceptualRoot = mainDoc.querySelector('Object[type="Core/EngineeringModel"] > Components[property="ConceptualModel"] > Object');
     if (!conceptualRoot) throw new Error("Could not find ConceptualModel in the DEXPI file.");
     const tree = parseTreeFromConceptual(conceptualRoot);
@@ -449,6 +474,40 @@ export function boundsFromElements(graphics) {
     return { minX: minX - margin, minY: minY - margin, maxX: maxX + margin, maxY: maxY + margin };
 }
 
+/**
+ * Parse a DEXPI profile/model XML (e.g. DiscProfile.xml) and collect all valid
+ * named-object reference IDs in the form "ModelName/PackagePath.ObjectName".
+ * These are used in cross-file References/@objects attributes and must NOT be
+ * flagged as broken references during VAL-005 checking.
+ */
+export function collectModelValidIds(modelXml) {
+    if (!modelXml) return new Set();
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(modelXml, "application/xml");
+    if (doc.querySelector("parsererror")) return new Set();
+    const validIds = new Set();
+    const modelName = doc.documentElement.getAttribute("name") || "";
+
+    function walk(node, packagePath) {
+        Array.from(node.children).forEach(child => {
+            const tag = child.tagName;
+            const name = child.getAttribute("name") || "";
+            if (tag === "Package" && name) {
+                walk(child, packagePath ? `${packagePath}.${name}` : name);
+            } else if (tag === "Object" && name) {
+                validIds.add(packagePath ? `${modelName}/${packagePath}.${name}` : `${modelName}/${name}`);
+            } else if (tag === "EnumerationValue" && name && packagePath) {
+                validIds.add(`${modelName}/${packagePath}.${name}`);
+            } else {
+                walk(child, packagePath);
+            }
+        });
+    }
+
+    walk(doc.documentElement, "");
+    return validIds;
+}
+
 export function clampViewBox(next, bounds) {
     const margin = 200;
     const w = Math.max(50, Math.min(next.w, (bounds.maxX - bounds.minX + margin * 2) * 4));
@@ -457,4 +516,3 @@ export function clampViewBox(next, bounds) {
     const y = Math.max(bounds.minY - margin, Math.min(next.y, bounds.maxY + margin - h));
     return { x, y, w, h };
 }
-

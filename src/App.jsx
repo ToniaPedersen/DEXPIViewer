@@ -3,7 +3,7 @@ import { parseProfileConstraints, runFullValidation, downloadCSV, resolveSeverit
 import {
     parseDexpiPackage, boundsFromElements, clampViewBox,
     findAncestors, collectDescendantObjectIds, flattenTree,
-    parseColor,
+    parseColor, collectModelValidIds,
 } from "./dexpiParser.js";
 
 // ---------- Data value formatting --------------------------------------------
@@ -66,6 +66,33 @@ const S = {
     sevColor: { Error: "#cf222e", Warning: "#9a6700", Info: "#0969da" },
 };
 
+// ---------- EllipseArc SVG helper --------------------------------------------
+
+/**
+ * Convert a DEXPI EllipseArc to an SVG path string.
+ * DEXPI angles are CCW in standard math (Y-up). In SVG (Y-down) this becomes
+ * CW visually, so we use sweep-flag=1.
+ */
+function ellipseArcToPath(cx, cy, rx, ry, startDeg, endDeg, rotation) {
+    const toRad = d => d * Math.PI / 180;
+    const phiRad = toRad(rotation);
+    const pt = (deg) => {
+        const a = toRad(deg);
+        const ca = Math.cos(a), sa = Math.sin(a);
+        const cp = Math.cos(phiRad), sp = Math.sin(phiRad);
+        return { x: cx + rx * cp * ca - ry * sp * sa, y: cy + rx * sp * ca + ry * cp * sa };
+    };
+    let span = endDeg - startDeg;
+    if (span <= 0) span += 360;
+    if (span >= 359.9) {
+        const p1 = pt(startDeg), pmid = pt(startDeg + 180);
+        return `M ${p1.x} ${p1.y} A ${rx} ${ry} ${rotation} 0 1 ${pmid.x} ${pmid.y} A ${rx} ${ry} ${rotation} 0 1 ${p1.x} ${p1.y}`;
+    }
+    const p1 = pt(startDeg), p2 = pt(endDeg);
+    const largeArc = span > 180 ? 1 : 0;
+    return `M ${p1.x} ${p1.y} A ${rx} ${ry} ${rotation} ${largeArc} 1 ${p2.x} ${p2.y}`;
+}
+
 // ---------- SVG Rendering ----------------------------------------------------
 
 function renderPrimitive(primitive, key) {
@@ -80,6 +107,10 @@ function renderPrimitive(primitive, key) {
         const baseline = primitive.style.vertical.toLowerCase().includes("bottom") ? "baseline" : primitive.style.vertical.toLowerCase().includes("top") ? "hanging" : "middle";
         return <text key={key} x={primitive.position.x} y={primitive.position.y} fontFamily={primitive.style.font} fontSize={primitive.style.size} fill={parseColor(primitive.style.color)} textAnchor={anchor} dominantBaseline={baseline} transform={`rotate(${primitive.rotation} ${primitive.position.x} ${primitive.position.y})`}>{primitive.value}</text>;
     }
+    if (primitive.kind === "ellipseArc") {
+        const d = ellipseArcToPath(primitive.center.x, primitive.center.y, primitive.rx, primitive.ry, primitive.startAngle, primitive.endAngle, primitive.rotation);
+        return <path key={key} d={d} fill="none" stroke={primitive.stroke.color} strokeWidth={primitive.stroke.width} strokeDasharray={primitive.stroke.dashArray || undefined} vectorEffect="non-scaling-stroke" />;
+    }
     return null;
 }
 
@@ -90,6 +121,10 @@ function highlightPrimitive(p, key, color) {
     if (p.kind === "circle") return <circle key={key} cx={p.center.x} cy={p.center.y} r={p.radius} fill="none" stroke={color} strokeWidth={sw} vectorEffect="non-scaling-stroke" opacity="0.85" />;
     if (p.kind === "ellipse") return <ellipse key={key} cx={p.center.x} cy={p.center.y} rx={p.rx} ry={p.ry} fill="none" stroke={color} strokeWidth={sw} vectorEffect="non-scaling-stroke" opacity="0.85" />;
     if (p.kind === "rect") return <rect key={key} x={p.center.x - p.width / 2} y={p.center.y - p.height / 2} width={p.width} height={p.height} fill="none" stroke={color} strokeWidth={sw} vectorEffect="non-scaling-stroke" opacity="0.85" />;
+    if (p.kind === "ellipseArc") {
+        const d = ellipseArcToPath(p.center.x, p.center.y, p.rx, p.ry, p.startAngle, p.endAngle, p.rotation);
+        return <path key={key} d={d} fill="none" stroke={color} strokeWidth={sw} vectorEffect="non-scaling-stroke" opacity="0.85" />;
+    }
     return null;
 }
 
@@ -121,6 +156,13 @@ function ConnectorLineSvg({ el, nodePosMap, selected, connColor }) {
     );
 }
 
+// Colour used when a graphical element is selected:
+//   label elements  → orange  (they are annotation overlays, not primary symbols)
+//   all other types → red
+function selectionColor(elementRole) {
+    return elementRole === "label" ? "#e06c00" : "#d1242f";
+}
+
 function SymbolGraphic({ el, selected, connHighlight, onSelect }) {
     const mirror = el.isMirrored ? -1 : 1;
     const transform = `translate(${el.position.x} ${el.position.y}) rotate(${el.rotation}) scale(${el.scaleX * mirror} ${el.scaleY})`;
@@ -129,12 +171,21 @@ function SymbolGraphic({ el, selected, connHighlight, onSelect }) {
     const hitY = Math.min(el.variant.minY, el.variant.maxY) - hitPad;
     const hitW = Math.abs(el.variant.maxX - el.variant.minX) + hitPad * 2;
     const hitH = Math.abs(el.variant.maxY - el.variant.minY) + hitPad * 2;
-    const hlColor = selected ? "#d1242f" : connHighlight || null;
+    // When selected AND in connectivity, use the tint colour; role-aware colour when no connectivity tint
+    const hlColor = selected ? (connHighlight || selectionColor(el.elementRole)) : connHighlight || null;
+    // Tint background only when element is in the connectivity highlight
+    const connTintFill = connHighlight === "#0969da" ? "#dbeafe"
+                       : connHighlight === "#1a7f37" ? "#dcfce7"
+                       : connHighlight === "#8250df" ? "#f3e8ff"
+                       : null;
     return (
         <g onClick={e => { e.stopPropagation(); if (el.representedId) onSelect(el.representedId); }} style={{ cursor: el.representedId ? "pointer" : "default" }}>
             <g transform={transform}>
                 <rect x={hitX} y={hitY} width={hitW} height={hitH} fill="transparent" stroke="none" pointerEvents="all" />
             </g>
+            {connTintFill && <g transform={transform} pointerEvents="none">
+                <rect x={el.variant.minX - 1} y={el.variant.minY - 1} width={(el.variant.maxX - el.variant.minX) + 2} height={(el.variant.maxY - el.variant.minY) + 2} fill={connTintFill} stroke={selected ? "#d1242f" : connHighlight} strokeWidth={selected ? 0.8 : 0.5} opacity={0.55} vectorEffect="non-scaling-stroke" />
+            </g>}
             {hlColor && <g transform={transform} pointerEvents="none">{el.variant.primitives.map((p, i) => highlightPrimitive(p, `hl_${el.key}_${i}`, hlColor))}</g>}
             <g transform={transform} pointerEvents="none">
                 {el.variant.primitives.map((p, i) => renderPrimitive(p, `${el.key}_${i}`))}
@@ -146,7 +197,7 @@ function SymbolGraphic({ el, selected, connHighlight, onSelect }) {
 
 function PrimitiveGraphic({ el, selected, connHighlight, onSelect, nodePosMap }) {
     const hitPad = 2.0;
-    const hlColor = selected ? "#d1242f" : connHighlight || null;
+    const hlColor = selected ? (connHighlight || selectionColor(el.elementRole)) : connHighlight || null;
     const prim = el.primitive;
     return (
         <g onClick={e => { e.stopPropagation(); if (el.representedId) onSelect(el.representedId); }} style={{ cursor: el.representedId ? "pointer" : "default" }}>
@@ -189,7 +240,7 @@ function TreeNode({ node, selectedId, onSelect, expanded, setExpanded, level, is
                 {hasError && <span title="Has validation errors" style={{ color: "#cf222e", fontSize: 10, flexShrink: 0 }}>{"●"}</span>}
                 {hasWarn && <span title="Has validation warnings" style={{ color: "#9a6700", fontSize: 10, flexShrink: 0 }}>{"●"}</span>}
                 <span style={{ fontWeight: isSelected ? 700 : 400, fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{node.label}</span>
-                <span style={{ fontSize: 10, color: "#aaa", flexShrink: 0, marginLeft: "auto" }}>{node.type.split(".").pop()}</span>
+                {(() => { const s = node.type.split(".").pop(); const tc = node.type.includes("FlowIn") ? "#0969da" : node.type.includes("FlowOut") ? "#1a7f37" : null; return <span style={{ fontSize: 10, color: tc || "#aaa", fontWeight: tc ? 600 : 400, flexShrink: 0, marginLeft: "auto" }}>{s}</span>; })()}
             </div>
             {isOpen && node.children.map(child => (
                 <TreeNode key={child.id} node={child} selectedId={selectedId} onSelect={onSelect} expanded={expanded} setExpanded={setExpanded} level={level + 1} issueMap={issueMap} />
@@ -236,6 +287,7 @@ export default function App() {
     const [leftTab, setLeftTab] = useState("topology");
     const [rightTab, setRightTab] = useState("details");
     const [mainXmlText, setMainXmlText] = useState("");
+    const [mainFileName, setMainFileName] = useState("validation-report");
     const [loadMode, setLoadMode] = useState("with-profile");
     const [discXmlText, setDiscXmlText] = useState("");
     const [parsed, setParsed] = useState(null);
@@ -261,6 +313,7 @@ export default function App() {
     const discInputRef = useRef(null);
     const profileInputRef = useRef(null);
     const bgInputRef = useRef(null);
+    const issueCardRefs = useRef(new Map()); // index → DOM element for validation list scroll
     const svgViewportRef = useRef(null);
 
     const issueMap = useMemo(() => {
@@ -268,16 +321,34 @@ export default function App() {
         validationIssues.forEach(issue => {
             const id = issue.objectId;
             if (!id || id.startsWith("(")) return;
-            if (!m.has(id)) m.set(id, []);
-            m.get(id).push(issue);
+            // Split compound IDs (e.g. ERR-E11 "GateValve1, BallValve1, …")
+            const ids = id.split(",").map(s => s.trim()).filter(s => s && !s.startsWith("(") && !s.endsWith("…"));
+            ids.forEach(singleId => {
+                if (!m.has(singleId)) m.set(singleId, []);
+                if (!m.get(singleId).includes(issue)) m.get(singleId).push(issue);
+            });
         });
         return m;
     }, [validationIssues]);
 
+    // Helper: find the best navigable objectId from an issue
+    const getNavigableId = (issue) => {
+        if (!parsed?.treeMap) return null;
+        const id = issue?.objectId;
+        if (id && !id.startsWith("(")) {
+            if (parsed.treeMap.has(id)) return id;
+            const first = id.split(",")[0].trim();
+            if (first && !first.startsWith("(") && parsed.treeMap.has(first)) return first;
+        }
+        // Fall back to visual context (nearest represented ancestor)
+        if (issue?.visualContextId && parsed.treeMap.has(issue.visualContextId)) return issue.visualContextId;
+        return null;
+    };
+
     const connectivityHighlight = useMemo(() => {
-        if (!showConnectivity || !selectedId || !parsed?.connectivityMap) return { upstream: new Set(), downstream: new Set(), group: new Set() };
+        if ((!showConnectivity && rightTab !== "connectivity") || !selectedId || !parsed?.connectivityMap) return { upstream: new Set(), downstream: new Set(), group: new Set() };
         return parsed.connectivityMap.get(selectedId) || { upstream: new Set(), downstream: new Set(), group: new Set() };
-    }, [showConnectivity, selectedId, parsed]);
+    }, [showConnectivity, rightTab, selectedId, parsed]);
 
     function rebuild(nextMain, nextDisc, mode) {
         if (!nextMain) return;
@@ -298,6 +369,8 @@ export default function App() {
     async function handleMainFile(e) {
         const file = e.target.files?.[0]; if (!file) return;
         const txt = await file.text(); setMainXmlText(txt);
+        // Strip extension for CSV filename
+        setMainFileName(file.name.replace(/\.[^.]+$/, ""));
         rebuild(txt, discXmlText, loadMode);
     }
     async function handleDiscFile(e) {
@@ -323,8 +396,15 @@ export default function App() {
 
     function runValidation() {
         if (!parsed) return;
-        const allIssues = runFullValidation({ mainXml: mainXmlText, flatTree: parsed.flatTree, profiles, severityConfig });
-        // Drop rules the user has set to Ignore
+        // Collect valid cross-file reference IDs from DiscProfile and any loaded profiles
+        const externalValidIds = collectModelValidIds(discXmlText);
+        profiles.forEach(p => {
+            collectModelValidIds(p.xml).forEach(id => externalValidIds.add(id));
+        });
+        const allIssues = runFullValidation({
+            mainXml: mainXmlText, flatTree: parsed.flatTree,
+            profiles, severityConfig, externalValidIds,
+        });
         const issues = allIssues.filter(i => resolveSeverity(i.ruleId, severityConfig).level !== "Ignore");
         setValidationIssues(issues);
         setValidationDone(true);
@@ -345,7 +425,15 @@ export default function App() {
     }, [parsed, search]);
 
     const selectedNode = useMemo(() => parsed?.treeMap?.get(selectedId) || null, [parsed, selectedId]);
-    const selectedRepresentedIds = useMemo(() => selectedNode ? collectDescendantObjectIds(selectedNode) : new Set(), [selectedNode]);
+    const selectedRepresentedIds = useMemo(() => {
+        if (!selectedNode) return new Set();
+        const ids = collectDescendantObjectIds(selectedNode);
+        // Also include objects directly referenced by the selected node so that
+        // Components like TransmissionSystem (which reference a Motor via Driver
+        // but have no direct graphical element) are highlighted in the SVG view.
+        selectedNode.refs.forEach(ref => ref.objects.forEach(id => { if (id) ids.add(id); }));
+        return ids;
+    }, [selectedNode]);
 
     const handleSelect = useCallback((id) => {
         if (!id) return;
@@ -449,7 +537,7 @@ export default function App() {
                                 <span style={{ ...S.badge("#cf222e"), cursor: "pointer" }} onClick={() => { setValidationFilter("Error"); setLeftTab("validation"); }}>{issueCounts.Error} Errors</span>
                                 <span style={{ ...S.badge("#9a6700"), cursor: "pointer" }} onClick={() => { setValidationFilter("Warning"); setLeftTab("validation"); }}>{issueCounts.Warning} Warn</span>
                                 <span style={{ ...S.badge("#0969da"), cursor: "pointer" }} onClick={() => { setValidationFilter("Info"); setLeftTab("validation"); }}>{issueCounts.Info} Info</span>
-                                <button style={S.btnSmall} onClick={() => downloadCSV(validationIssues)}>CSV</button>
+                                <button style={S.btnSmall} onClick={() => downloadCSV(validationIssues, `${mainFileName}.csv`)}>CSV</button>
                             </div>
                         )}
                     </div>
@@ -496,20 +584,72 @@ export default function App() {
                                                 {f}{f !== "All" ? ` (${issueCounts[f]})` : ` (${validationIssues.length})`}
                                             </button>
                                         ))}
-                                        <button style={{ ...S.btnSmall, marginLeft: "auto" }} onClick={() => downloadCSV(validationIssues)}>CSV</button>
+                                        <button style={{ ...S.btnSmall, marginLeft: "auto" }} onClick={() => downloadCSV(validationIssues, `${mainFileName}.csv`)}>CSV</button>
                                     </div>
-                                    {filteredIssues.map((issue, i) => (
-                                        <div key={i} style={{ padding: "8px 10px", borderBottom: "1px solid #eef2f6", cursor: parsed?.treeMap?.has(issue.objectId) ? "pointer" : "default" }} onClick={() => { if (parsed?.treeMap?.has(issue.objectId)) handleSelect(issue.objectId); }}>
-                                            <div style={{ display: "flex", gap: 5, alignItems: "center", marginBottom: 3 }}>
-                                                <span style={{ ...S.badge(S.sevColor[issue.severity]) }}>{issue.severity}</span>
-                                                <span style={{ fontSize: 11, fontFamily: "monospace", color: "#555" }}>{issue.ruleId}</span>
-                                                <span style={{ fontSize: 10, color: "#888", marginLeft: "auto" }}>{issue.profileSource}</span>
+                                    {filteredIssues.map((issue, i) => {
+                                        const navId = getNavigableId(issue);
+                                        const isNavable = !!navId;
+                                        const isActive = navId && navId === selectedId;
+                                        const scrollToParent = (parent) => {
+                                            const parentIdx = filteredIssues.findIndex(iss => iss.ruleId === parent.ruleId && iss.objectId === parent.objectId);
+                                            if (parentIdx >= 0) {
+                                                const el = issueCardRefs.current.get(parentIdx);
+                                                if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+                                            }
+                                            if (parent.objectId && !parent.objectId.startsWith("(")) {
+                                                const pid = parsed?.treeMap?.has(parent.objectId) ? parent.objectId : null;
+                                                if (pid) { handleSelect(pid); setRightTab("issues"); }
+                                            }
+                                        };
+                                        return (
+                                            <div key={i}
+                                                ref={el => { if (el) issueCardRefs.current.set(i, el); else issueCardRefs.current.delete(i); }}
+                                                onClick={() => { if (navId) { handleSelect(navId); setRightTab("issues"); } }}
+                                                style={{ padding: "8px 10px", borderBottom: "1px solid #eef2f6", cursor: isNavable ? "pointer" : "default", borderLeft: isActive ? "3px solid #0969da" : "3px solid transparent", background: isActive ? "#f0f7ff" : "transparent", transition: "background 0.1s" }}
+                                            >
+                                                <div style={{ display: "flex", gap: 5, alignItems: "center", marginBottom: 3 }}>
+                                                    <span style={{ ...S.badge(S.sevColor[issue.severity]) }}>{issue.severity}</span>
+                                                    <span style={{ fontSize: 11, fontFamily: "monospace", color: "#555" }}>{issue.ruleId}</span>
+                                                    {isNavable && <span title="Click to highlight element" style={{ fontSize: 10, color: "#0969da", marginLeft: 2 }}>⊕</span>}
+                                                    <span style={{ fontSize: 10, color: "#888", marginLeft: "auto" }}>{issue.profileSource}</span>
+                                                </div>
+                                                <div style={{ fontSize: 12, color: "#333", marginBottom: 2 }}>{issue.description}</div>
+                                                {issue.objectId && !issue.objectId.startsWith("(") && (
+                                                    <div style={{ fontSize: 11, color: isNavable ? "#0969da" : "#57606a", fontFamily: "monospace" }}>
+                                                        {isNavable && !issue.visualContextId ? "↳ " : ""}{issue.objectId}
+                                                        {!isNavable && <span style={{ color: "#cf222e", marginLeft: 4 }} title="No graphical representation found">⚠ no symbol</span>}
+                                                    </div>
+                                                )}
+                                                {issue.visualContextId && (
+                                                    <div
+                                                        onClick={e => { e.stopPropagation(); handleSelect(issue.visualContextId); setRightTab("issues"); }}
+                                                        style={{ fontSize: 11, color: "#0969da", fontFamily: "monospace", marginTop: 2, cursor: "pointer" }}
+                                                        title="Click to highlight nearest graphical ancestor in the drawing"
+                                                    >
+                                                        ↳ nearest symbol: {issue.visualContextId}
+                                                    </div>
+                                                )}
+                                                {issue.causedBy && issue.causedBy.length > 0 && (
+                                                    <div style={{ marginTop: 4, paddingTop: 4, borderTop: "1px dashed #d0d7de" }}>
+                                                        {issue.causedBy.map((parent, pi) => (
+                                                            <div key={pi}
+                                                                onClick={e => { e.stopPropagation(); scrollToParent(parent); }}
+                                                                style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer", color: "#8250df", fontSize: 11 }}
+                                                                title={parent.description}
+                                                            >
+                                                                <span>↑ root cause:</span>
+                                                                <span style={{ fontFamily: "monospace", fontWeight: 600 }}>{parent.ruleId}</span>
+                                                                {parent.objectId && !parent.objectId.startsWith("(") && (
+                                                                    <span style={{ fontFamily: "monospace", color: "#57606a" }}>on {parent.objectId}</span>
+                                                                )}
+                                                            </div>
+                                                        ))}
+                                                    </div>
+                                                )}
+                                                {issue.suggestedCorrection && <div style={{ fontSize: 11, color: "#0969da", marginTop: 2 }}>Suggestion: {issue.suggestedCorrection}</div>}
                                             </div>
-                                            <div style={{ fontSize: 12, color: "#333", marginBottom: 2 }}>{issue.description}</div>
-                                            {issue.objectId && !issue.objectId.startsWith("(") && <div style={{ fontSize: 11, color: "#57606a", fontFamily: "monospace" }}>{issue.objectId}</div>}
-                                            {issue.suggestedCorrection && <div style={{ fontSize: 11, color: "#0969da", marginTop: 2 }}>Suggestion: {issue.suggestedCorrection}</div>}
-                                        </div>
-                                    ))}
+                                        );
+                                    })}
                                     {filteredIssues.length === 0 && <div style={{ padding: 16, color: "#888", fontSize: 13 }}>No {validationFilter !== "All" ? validationFilter.toLowerCase() + " " : ""}issues found.</div>}
                                 </>
                             )}
@@ -637,7 +777,7 @@ export default function App() {
                         </div>
                     </div>
                     <div style={S.tabBar}>
-                        {[["details", "Object"], ["connectivity", "Connections"], ["issues", "Issues"]].map(([t, label]) => (
+                        {[["details", "Object"], ["connectivity", "Connections"], ["issues", `Issues${selectedId && issueMap.has(selectedId) ? ` (${issueMap.get(selectedId).length})` : ""}`]].map(([t, label]) => (
                             <button key={t} style={S.tab(rightTab === t)} onClick={() => setRightTab(t)}>{label}</button>
                         ))}
                     </div>
@@ -699,26 +839,71 @@ export default function App() {
                                         </div>
                                     )) : <div style={{ color: "#888", fontSize: 12 }}>No references.</div>}
                                 </div>
+                                {selectedNode?.children?.length > 0 && (
+                                    <div style={S.section}>
+                                        <div style={{ fontWeight: 600, fontSize: 12, marginBottom: 6 }}>
+                                            Sub-Components ({selectedNode.children.length})
+                                        </div>
+                                        {selectedNode.children.map((child, i) => {
+                                            const childIssues = child.objectId ? (issueMap.get(child.objectId) || []) : [];
+                                            const hasErr = childIssues.some(x => x.severity === "Error");
+                                            const hasWarn = !hasErr && childIssues.some(x => x.severity === "Warning");
+                                            const typeSuffix = child.type.split(".").pop();
+                                            return (
+                                                <div key={i}
+                                                    onClick={() => child.objectId && handleSelect(child.objectId)}
+                                                    style={{ display: "flex", alignItems: "center", gap: 5, padding: "4px 6px", marginBottom: 3, background: "#f9fafb", borderRadius: 4, cursor: child.objectId ? "pointer" : "default", border: "1px solid #eef2f6" }}
+                                                >
+                                                    {hasErr && <span title="Has errors" style={{ color: "#cf222e", fontSize: 10, flexShrink: 0 }}>●</span>}
+                                                    {hasWarn && <span title="Has warnings" style={{ color: "#9a6700", fontSize: 10, flexShrink: 0 }}>●</span>}
+                                                    <span style={{ fontSize: 12, fontWeight: 500, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                                        {child.label || child.objectId || typeSuffix}
+                                                    </span>
+                                                    <span style={{ fontSize: 10, color: "#aaa", flexShrink: 0 }}>{typeSuffix}</span>
+                                                    {child.children.length > 0 && (
+                                                        <span style={{ fontSize: 10, color: "#888", flexShrink: 0 }}>+{child.children.length}</span>
+                                                    )}
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+                                )}
                             </>
                         )}
                         {rightTab === "connectivity" && (
                             <div style={S.section}>
                                 {!selectedNode ? <div style={{ color: "#888", fontSize: 12 }}>Select an object.</div> : (() => {
                                     const conn = parsed?.connectivityMap?.get(selectedId) || { upstream: new Set(), downstream: new Set(), group: new Set() };
-                                    const makeList = (ids, color, label) => (
+                                    const makeList = (ids, color, label, bgTint) => (
                                         <div style={{ marginBottom: 12 }}>
                                             <div style={{ fontWeight: 600, fontSize: 12, color, marginBottom: 4 }}>{label} ({ids.size})</div>
                                             {ids.size === 0 ? <div style={{ fontSize: 12, color: "#888" }}>None</div> : [...ids].map(id => {
                                                 const n = parsed?.treeMap?.get(id);
-                                                return <div key={id} style={{ fontSize: 12, padding: "2px 5px", cursor: "pointer", borderRadius: 3, marginBottom: 2, background: "#f6f8fa" }} onClick={() => handleSelect(id)}>{n?.label || id} <span style={{ fontSize: 10, color: "#888" }}>({id})</span></div>;
+                                                const nType = n?.type || "";
+                                                const isFlowIn  = nType.includes("FlowIn");
+                                                const isFlowOut = nType.includes("FlowOut");
+                                                const typeColor = isFlowIn ? "#0969da" : isFlowOut ? "#1a7f37" : null;
+                                                const typeBg    = isFlowIn ? "#dbeafe" : isFlowOut ? "#dcfce7" : bgTint;
+                                                const suffix = nType.split(".").pop();
+                                                return (
+                                                    <div key={id}
+                                                        style={{ fontSize: 12, padding: "3px 6px", cursor: "pointer", borderRadius: 3, marginBottom: 2, background: typeBg, border: `1px solid ${typeColor || "#e1e4e8"}`, display: "flex", alignItems: "center", gap: 5 }}
+                                                        onClick={() => handleSelect(id)}
+                                                    >
+                                                        {typeColor && <span style={{ width: 8, height: 8, borderRadius: "50%", background: typeColor, flexShrink: 0 }} />}
+                                                        <span style={{ flex: 1 }}>{n?.label || id}</span>
+                                                        {typeColor && <span style={{ fontSize: 10, color: typeColor, fontWeight: 600 }}>{suffix}</span>}
+                                                        <span style={{ fontSize: 10, color: "#888" }}>({id})</span>
+                                                    </div>
+                                                );
                                             })}
                                         </div>
                                     );
                                     return (
                                         <div>
-                                            {makeList(conn.upstream, "#0969da", "Upstream")}
-                                            {makeList(conn.downstream, "#1a7f37", "Downstream")}
-                                            {makeList(conn.group, "#8250df", "Group")}
+                                            {makeList(conn.upstream,   "#0969da", "Upstream",   "#f0f7ff")}
+                                            {makeList(conn.downstream, "#1a7f37", "Downstream", "#f0fff4")}
+                                            {makeList(conn.group,      "#8250df", "Group",      "#fbf0ff")}
                                         </div>
                                     );
                                 })()}
