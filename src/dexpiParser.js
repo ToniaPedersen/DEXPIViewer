@@ -1,4 +1,4 @@
-﻿// DEXPI XML parser utilities â€“ shared between App.jsx and validation engine
+﻿// DEXPI XML parser utilities â€" shared between App.jsx and validation engine
 
 export function qsa(node, selector) { return Array.from(node.querySelectorAll(selector)); }
 
@@ -196,19 +196,49 @@ export function referenceTargets(node, property = null) {
         .flatMap(r => (r.getAttribute("objects") || "").split(/\s+/).filter(Boolean).map(v => v.startsWith("#") ? v.slice(1) : v));
 }
 
+// Parse a SymbolVariant Condition string like "ValvePosition = 'NC'" or "PlugState='Open'"
+// Returns { attributeName, value } or null for unconditional (default) variants.
+function parseVariantCondition(condStr) {
+    if (!condStr || typeof condStr !== "string") return null;
+    const m = condStr.trim().match(/^([A-Za-z][A-Za-z0-9_/]*)[\s]*=[\s]*'([^']*)'$/);
+    if (!m) return null;
+    return { attributeName: m[1], value: m[2] };
+}
+
 export function parseSymbolCatalogue(discDoc) {
     if (!discDoc) return new Map();
     const map = new Map();
     qsa(discDoc, 'Object[type="Profile/Symbol"]').forEach(obj => {
         const name = obj.getAttribute("name") || obj.getAttribute("id") || "";
         const symbolKey = `DiscProfile/${name}`;
-        const variants = directComponentsObjects(obj, "Variants").map((variant, i) => ({
-            key: `${symbolKey}_${i}`, name: variant.getAttribute("name") || `${name}_${i}`,
-            minX: numberFromData(variant, "MinX", 0), minY: numberFromData(variant, "MinY", 0),
-            maxX: numberFromData(variant, "MaxX", 0), maxY: numberFromData(variant, "MaxY", 0),
-            primitives: directComponentsObjects(variant, "Primitives").map(parsePrimitive).filter(Boolean),
-        }));
+        const variants = directComponentsObjects(obj, "Variants").map((variant, i) => {
+            const condRaw = valueFromData(variant, "Condition");
+            return {
+                key: `${symbolKey}_${i}`, name: variant.getAttribute("name") || `${name}_${i}`,
+                minX: numberFromData(variant, "MinX", 0), minY: numberFromData(variant, "MinY", 0),
+                maxX: numberFromData(variant, "MaxX", 0), maxY: numberFromData(variant, "MaxY", 0),
+                primitives: directComponentsObjects(variant, "Primitives").map(parsePrimitive).filter(Boolean),
+                variantNumber: intFromData(variant, "VariantNumber", i),
+                condition: typeof condRaw === "string" ? parseVariantCondition(condRaw) : null,
+            };
+        });
         map.set(symbolKey, { key: symbolKey, name, variants });
+    });
+    return map;
+}
+
+// Build a map from EnumerationLiteral name → MetaData/symbol short-code.
+// Used when evaluating SymbolVariant conditions against DataReference property values.
+// e.g. "NormallyClose" → "NC", "NormallyOpen" → "NO", "Open" → "Open"
+export function parseEnumLiteralSymbols(discDoc) {
+    const map = new Map();
+    if (!discDoc) return map;
+    qsa(discDoc, "EnumerationLiteral").forEach(el => {
+        const name = el.getAttribute("name");
+        if (!name) return;
+        const sym = valueFromData(el, "MetaData/symbol");
+        if (typeof sym === "string" && sym) map.set(name, sym);
+        else map.set(name, name); // fall back to literal name itself
     });
     return map;
 }
@@ -325,9 +355,66 @@ export function collectDescendantObjectIds(node, out = new Set()) {
     return out;
 }
 
-export function collectGraphicalElements(mainDoc, symbolMap) {
+export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
     const nodePosMap = parseNodePositionsById(mainDoc);
     const drawn = [];
+
+    // Build enum literal → short-symbol map for condition evaluation
+    // e.g. "NormallyClose" → "NC"
+    const enumLiteralSymbols = parseEnumLiteralSymbols(discDoc);
+
+    // Build objectId → Map<propertyName, rawDataValue> for condition evaluation.
+    // Only indexed objects (those with an id attribute) are relevant.
+    const objectDataMap = new Map();
+    qsa(mainDoc, "Object[id]").forEach(el => {
+        const id = el.getAttribute("id");
+        const props = new Map();
+        directChildrenByTag(el, "Data").forEach(d => {
+            const prop = d.getAttribute("property");
+            if (prop) props.set(prop, dataValue(d));
+        });
+        if (props.size) objectDataMap.set(id, props);
+    });
+
+    // Resolve a raw property value (string or DataReference) to the short symbol code
+    // used in variant Condition strings.
+    function conditionValue(rawVal) {
+        if (rawVal === null || rawVal === undefined) return null;
+        if (typeof rawVal === "string") return rawVal;
+        if (rawVal?.kind === "DataReference") {
+            // Extract the last segment: "DiscProfile/InformationModel.ValvePosition.NormallyClose"
+            // → literalName "NormallyClose" → symbol "NC"
+            const literalName = rawVal.value.split(".").pop().split("/").pop();
+            return enumLiteralSymbols.get(literalName) ?? literalName;
+        }
+        return String(rawVal);
+    }
+
+    // Select the best matching SymbolVariant for the given conceptual object.
+    // Evaluates each conditional variant's condition against the object's properties.
+    // Falls back to the unconditional variant (variantNumber 0 / no condition) if none match.
+    function pickVariant(symbol, representedId) {
+        if (!symbol?.variants?.length) return null;
+        if (symbol.variants.length === 1) return symbol.variants[0];
+
+        const props = representedId ? (objectDataMap.get(representedId) || new Map()) : new Map();
+
+        // Try conditional variants first (those with a parsed condition)
+        for (const variant of symbol.variants) {
+            if (!variant.condition) continue;
+            const { attributeName, value: expectedValue } = variant.condition;
+            // Try common property-name prefixes: DiscProfile/, bare name, or plant-prefixed
+            const rawVal = props.get(`DiscProfile/${attributeName}`)
+                ?? props.get(attributeName)
+                ?? props.get(`Plant/Piping.${attributeName}`)
+                ?? null;
+            if (rawVal === null) continue;
+            if (conditionValue(rawVal) === expectedValue) return variant;
+        }
+
+        // No condition matched — return the default (unconditional) variant, or first as fallback
+        return symbol.variants.find(v => !v.condition) ?? symbol.variants[0];
+    }
 
     function resolveRepresentedId(node, fallback = null) { return referenceTargets(node, "Represents")[0] || fallback; }
 
@@ -339,10 +426,10 @@ export function collectGraphicalElements(mainDoc, symbolMap) {
             || null;
     }
 
-    // elementRole: "symbol" | "label" | "connector" â€” used for selective highlight colouring in App.jsx
+    // elementRole: "symbol" | "label" | "connector" — used for selective highlight colouring in App.jsx
     function pushSymbolUsage(rawRef, el, representedId, key, elementRole = "symbol") {
         const symbol = resolveShapeReference(rawRef);
-        const variant = symbol?.variants?.[0];
+        const variant = pickVariant(symbol, representedId);
         if (!variant) return;
         drawn.push({
             kind: "symbolUsage", key, representedId, elementRole, symbol, variant,
@@ -369,7 +456,7 @@ export function collectGraphicalElements(mainDoc, symbolMap) {
             } else if (type === "Core/Diagram.ShapeUsage") {
                 pushSymbolUsage(referenceTargets(el, "Shape")[0] || null, el, localRepresents, `${keyPrefix}_shu_${i}`, isLabelGroup ? "label" : "symbol");
             } else if (type === "Core/Diagram.Label") {
-                // Label as a direct Element child (less common â€” most files put Labels in Groups)
+                // Label as a direct Element child (less common â€" most files put Labels in Groups)
                 const labelRepresents = resolveRepresentedId(el, localRepresents);
                 directComponentsObjects(el, "Elements").forEach((lel, li) => {
                     const lt = lel.getAttribute("type") || "";
@@ -397,6 +484,121 @@ export function collectGraphicalElements(mainDoc, symbolMap) {
 
     qsa(mainDoc, 'Object[type="Core/Diagram.RepresentationGroup"]').forEach((g, i) => traverseGroup(g, null, `rg_${i}`));
     return { elements: drawn, nodePosMap };
+}
+
+/**
+ * Walk the conceptual model tree and build a map of object IDs that require
+ * heat-tracing visual overlays. Only called when a DISC profile is loaded.
+ *
+ * Return value: Map<objectId, "piping" | "inline" | "pif" | "nozzle">
+ *   "piping"  – Pipe / DirectPipingConnection (connector-line element)
+ *   "inline"  – PipingComponent / valve / fitting in a segment's Items list
+ *   "pif"     – ProcessInstrumentationFunction
+ *   "nozzle"  – Nozzle
+ *
+ * Inheritance: element HTR -> parent PipingNetworkSegment HTR -> parent
+ *              PipingNetworkSystem HTR (first non-null wins).
+ * PIF and Nozzle use only their own direct HTR (no segment/system inheritance).
+ */
+export function buildHeatTraceSet(tree) {
+    const result = new Map();
+
+    // Extract the HeatTracingType from a node's data array.
+    // Returns:
+    //   undefined  – attribute not present on this node (caller should inherit from parent)
+    //   null       – attribute explicitly set to NoHeatTracingSystem (no heat trace)
+    //   string     – any other value (e.g. "ActiveHeatTracing") → heat trace active
+    function getHT(node) {
+        if (!node || !Array.isArray(node.data)) return undefined;
+        const entry = node.data.find(d =>
+            d.property === "DiscProfile/HeatTracingType" ||
+            d.property === "HeatTracingType"
+        );
+        if (!entry) return undefined;
+        const v = entry.value;
+        if (v === null || v === undefined) return undefined;
+        let last;
+        if (typeof v === "string") {
+            last = v;
+        } else if (v && v.kind === "DataReference") {
+            last = v.value.split(".").pop().split("/").pop();
+        } else {
+            return undefined;
+        }
+        if (!last || last === "NoHeatTracingSystem") return null;
+        return last; // e.g. "ActiveHeatTracing", "SteamTracing", …
+    }
+
+    // Resolve effective HeatTracingType with inheritance: own value takes precedence,
+    // falling back to segHT then sysHT. undefined means "not set" (inherit); null means "none".
+    function resolveHT(node, segHT, sysHT) {
+        const own = getHT(node);
+        return own !== undefined ? own : (segHT !== undefined ? segHT : sysHT);
+    }
+
+    function isActive(ht) { return ht !== null && ht !== undefined; }
+
+    function walk(node, segHT, sysHT) {
+        if (!node) return;
+        const type = node.type || "";
+
+        // ---- PipingNetworkSystem ------------------------------------------------
+        if (type.includes("PipingNetworkSystem")) {
+            const h = getHT(node);
+            node.children.forEach(child => walk(child, undefined, h));
+            return;
+        }
+
+        // ---- PipingNetworkSegment -----------------------------------------------
+        if (type.includes("PipingNetworkSegment")) {
+            const h = getHT(node);
+            for (const child of node.children) {
+                if (child.edgeLabel === "Connections") {
+                    // Only concrete class "Pipe" carries HeatTracingType.
+                    // DirectPipingConnection and other connection types are excluded.
+                    const shortType = (child.type || "").split(/[./]/).pop();
+                    if (shortType === "Pipe") {
+                        const effective = resolveHT(child, h, sysHT);
+                        if (isActive(effective) && child.objectId) result.set(child.objectId, "piping");
+                    }
+                    // Recurse regardless – sub-children may include Nozzles
+                    child.children.forEach(gc => walk(gc, h, sysHT));
+                } else if (child.edgeLabel === "Items") {
+                    // Items: PipingComponent subclasses (valves, fittings, …).
+                    // Excluded: PropertyBreak (no HeatTracingType).
+                    const shortType2 = (child.type || "").split(/[./]/).pop();
+                    if (shortType2 !== "PropertyBreak") {
+                        const effective = resolveHT(child, h, sysHT);
+                        if (isActive(effective) && child.objectId) result.set(child.objectId, "inline");
+                    }
+                    child.children.forEach(gc => walk(gc, h, sysHT));
+                } else {
+                    walk(child, h, sysHT);
+                }
+            }
+            return;
+        }
+
+        // ---- ProcessInstrumentationFunction – direct HeatTracingType only -------
+        if (type.includes("ProcessInstrumentationFunction")) {
+            if (isActive(getHT(node)) && node.objectId) result.set(node.objectId, "pif");
+            node.children.forEach(child => walk(child, undefined, undefined));
+            return;
+        }
+
+        // ---- Nozzle – direct HeatTracingType only -------------------------------
+        if (type.includes("Nozzle")) {
+            if (isActive(getHT(node)) && node.objectId) result.set(node.objectId, "nozzle");
+            node.children.forEach(child => walk(child, undefined, undefined));
+            return;
+        }
+
+        // ---- Generic recursion --------------------------------------------------
+        node.children.forEach(child => walk(child, segHT, sysHT));
+    }
+
+    walk(tree, undefined, undefined);
+    return result;
 }
 
 export function buildConnectivityMap(flatTree) {
@@ -440,7 +642,7 @@ export function parseDexpiPackage(mainXml, discProfileXml) {
     const externalSymbolMap = parseSymbolCatalogue(discDoc);
     const internalShapeMap = parseInternalShapeCatalogue(mainDoc);
     const symbolMap = new Map([...internalShapeMap, ...externalSymbolMap]);
-    const graphics = collectGraphicalElements(mainDoc, symbolMap);
+    const graphics = collectGraphicalElements(mainDoc, symbolMap, discDoc);
     const metaNode = mainDoc.querySelector('Components[property="MetaData"] > Object');
     const meta = metaNode ? {
         drawingName: valueFromData(metaNode, "DrawingName") || "",
@@ -450,7 +652,24 @@ export function parseDexpiPackage(mainXml, discProfileXml) {
         creatorName: valueFromData(metaNode, "CreatorName") || ""
     } : {};
     const connectivityMap = buildConnectivityMap(flatTree);
-    return { mainDoc, discDoc, tree, flatTree, treeMap, symbolMap, graphics, meta, connectivityMap };
+    // Build heat-trace set; for "inline" entries keep only objects that are
+    // actually placed as a symbolUsage in the drawing. The Profile/SymbolUsage
+    // reference in DEXPI goes FROM the graphical model TO the conceptual object
+    // (via "Represents"), not the other way, so we check the rendered graphics.
+    const heatTraceSet = (() => {
+        if (!discDoc) return new Map();
+        const raw = buildHeatTraceSet(tree);
+        const symbolUsageIds = new Set(
+            graphics.elements
+                .filter(el => el.kind === "symbolUsage" && el.representedId)
+                .map(el => el.representedId)
+        );
+        for (const [id, type] of [...raw]) {
+            if (type === "inline" && !symbolUsageIds.has(id)) raw.delete(id);
+        }
+        return raw;
+    })();
+    return { mainDoc, discDoc, tree, flatTree, treeMap, symbolMap, graphics, meta, connectivityMap, heatTraceSet };
 }
 
 export function boundsFromElements(graphics) {

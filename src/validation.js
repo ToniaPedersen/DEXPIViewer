@@ -1,5 +1,5 @@
 // DEXPI Verificator – Validation Engine
-// Implements: VAL-001..005, VAX-001..005, VAE-001..006, PRF-001..007, ERR-001..010, RPT-001..004
+// Implements: VAL-001..005, VAX-001..005, VAE-001..006, PRF-001..007, ERR-E01..E19, RPT-001..004
 
 import { DEXPI_ALL_TYPES, DEXPI_STD_PREFIXES as _DEXPI_STD_PREFIXES } from "./dexpiTypes.js";
 
@@ -30,6 +30,8 @@ export const DEFAULT_SEVERITIES = {
     "VAE-006": { level: "Warning", score: 2 },
     "PRF":     { level: "Warning", score: 2 },
     "ERR-E01": { level: "Error",   score: 3 },
+    "ERR-E18": { level: "Error",   score: 3 },
+    "ERR-E19": { level: "Error",   score: 3 },
     "ERR":     { level: "Error",   score: 3 },
     "PRF-E01": { level: "Error",   score: 3 },
     "PRF-E02": { level: "Error",   score: 3 },
@@ -968,6 +970,225 @@ export function runEngineeringValidation(flatTree, severityConfig) {
     return issues;
 }
 
+// ─── Built-in DEXPI 2.0 Model Attribute Validation (ERR-E18, ERR-E19) ───────
+//
+// Validates attribute usage against the DEXPI 2.0 Plant/Core metamodel.
+// These rules come from the DEXPI model itself (Plant.xml / Core.xml), not from
+// loaded profile files. They cover cases where:
+//   ERR-E18 – an attribute is used on an element class that the DEXPI model
+//              does not associate with that attribute (wrong class).
+//   ERR-E19 – an attribute appears more times than the metamodel cardinality
+//              permits on a given element.
+//
+// Rules are keyed by the LOCAL property name (strip "DiscProfile/" etc. prefixes)
+// so they match regardless of how the namespace is encoded in the file.
+//
+// allowedPackages: the node type must start with one of these package prefixes
+//                  (e.g. "Plant/Piping" matches "Plant/Piping.PipingNetworkSegment").
+// allowedSuffixes: the node type's last segment must be one of these class names.
+// maxCount:        maximum occurrences on a single element (null = unlimited).
+
+const DEXPI_BUILT_IN_ATTRIBUTE_RULES = {
+    // HeatTracingType is a PipingNetworkSystem / PipingNetworkSegment extension.
+    // It is NOT defined for instrumentation types such as ProcessInstrumentationFunction.
+    "HeatTracingType": {
+        allowedPackages: ["Plant/Piping"],
+        maxCount: null,
+    },
+    // PlantMetaData attributes are [0..1] per the DEXPI 2.0 Diagram model.
+    "CreatorName": {
+        allowedSuffixes: ["PlantMetaData"],
+        maxCount: 1,
+    },
+    "DrawingName": {
+        allowedSuffixes: ["PlantMetaData"],
+        maxCount: 1,
+    },
+    "DrawingNumber": {
+        allowedSuffixes: ["PlantMetaData"],
+        maxCount: 1,
+    },
+};
+
+export function runBuiltInAttributeValidation(flatTree, severityConfig) {
+    const issues = [];
+
+    // Does nodeType satisfy the rule's allowed-class constraint?
+    function typeAllowed(nodeType, rule) {
+        if (!nodeType) return false;
+        if (rule.allowedPackages) {
+            for (const pkg of rule.allowedPackages) {
+                if (nodeType.startsWith(pkg + ".") ||
+                    nodeType.startsWith(pkg + "/") ||
+                    nodeType === pkg) return true;
+            }
+        }
+        if (rule.allowedSuffixes) {
+            const suffix = nodeType.split(/[./]/).pop();
+            if (rule.allowedSuffixes.includes(suffix)) return true;
+        }
+        return false;
+    }
+
+    for (const node of flatTree) {
+        if (!node.type || !node.data || node.data.length === 0) continue;
+
+        // Count occurrences of each property on this node
+        const propCounts = new Map();
+        for (const d of node.data) {
+            const p = d.property;
+            if (p) propCounts.set(p, (propCounts.get(p) || 0) + 1);
+        }
+
+        for (const [prop, count] of propCounts) {
+            // Match by local name so "DiscProfile/HeatTracingType" and "HeatTracingType" both hit the same rule
+            const localProp = prop.split("/").pop().split(".").pop();
+            const rule = DEXPI_BUILT_IN_ATTRIBUTE_RULES[localProp] ?? DEXPI_BUILT_IN_ATTRIBUTE_RULES[prop];
+            if (!rule) continue;
+
+            const loc = node.objectId ? `//*[@id='${node.objectId}']` : `(type: ${node.type})`;
+
+            if (!typeAllowed(node.type, rule)) {
+                // ERR-E18: attribute not allowed on this element class per DEXPI 2.0 model
+                const allowed = [
+                    ...(rule.allowedPackages || []).map(p => `${p}.*`),
+                    ...(rule.allowedSuffixes || []),
+                ].join(", ");
+                const sev = resolveSeverity("ERR-E18", severityConfig);
+                issues.push({
+                    objectId: node.objectId || "(no id)",
+                    objectType: node.type,
+                    ruleId: "ERR-E18",
+                    severity: sev.level, score: sev.score,
+                    description: `Attribute '${prop}' is not defined for class '${node.type}' in the DEXPI 2.0 model. ` +
+                                 `It is only allowed on: ${allowed}.`,
+                    location: loc,
+                    profileSource: "DEXPI 2.0",
+                    suggestedCorrection: `Remove attribute '${prop}' from this element, or verify the element class is correct.`,
+                });
+            } else if (rule.maxCount !== null && count > rule.maxCount) {
+                // ERR-E19: attribute count exceeds metamodel upper cardinality
+                const sev = resolveSeverity("ERR-E19", severityConfig);
+                issues.push({
+                    objectId: node.objectId || "(no id)",
+                    objectType: node.type,
+                    ruleId: "ERR-E19",
+                    severity: sev.level, score: sev.score,
+                    description: `Attribute '${prop}' appears ${count} time(s) on '${node.type}' ` +
+                                 `but the DEXPI 2.0 model allows at most ${rule.maxCount}.`,
+                    location: loc,
+                    profileSource: "DEXPI 2.0",
+                    suggestedCorrection: `Reduce '${prop}' occurrences to at most ${rule.maxCount} on this element.`,
+                });
+            }
+        }
+    }
+
+    return issues;
+}
+
+// ─── Attribute Constraint Validation (ERR-E18, ERR-E19) ─────────────────────
+//
+// ERR-E18: A Data property appears on an element whose class does not allow it
+//          according to any loaded profile's PropertyConstraint definitions.
+//          Only fires for properties that ARE constrained somewhere in a profile
+//          (to avoid false positives on standard DEXPI properties with no explicit
+//          constraint).
+//
+// ERR-E19: A Data property appears more times than the upper cardinality allows
+//          on a given element type, per the profile PropertyConstraint.
+
+export function runAttributeConstraintValidation(flatTree, allConstraints, severityConfig) {
+    const issues = [];
+    if (!allConstraints || allConstraints.length === 0) return issues;
+
+    // Normalise a property string to its local name for loose matching.
+    // "DiscProfile/HeatTracingType" → "HeatTracingType"
+    // "Plant.Piping.HeatTracingType" → "HeatTracingType"
+    const localName = p => p.split("/").pop().split(".").pop();
+
+    // Build lookup: localName(property) → [{ constrainedType, upper, profileName, property }]
+    const byLocal = new Map();
+    for (const c of allConstraints) {
+        const loc = localName(c.property);
+        if (!byLocal.has(loc)) byLocal.set(loc, []);
+        byLocal.get(loc).push(c);
+    }
+
+    // Does a node type match a constrainedType?
+    // Supports: exact match, slash→dot normalisation, or bare suffix match.
+    function typeMatches(nodeType, constrainedType) {
+        if (!nodeType || !constrainedType) return false;
+        if (nodeType === constrainedType) return true;
+        // Normalise separators: "Plant/Piping.Pipe" ↔ "Plant.Piping.Pipe"
+        const norm = s => s.replace("/", ".");
+        if (norm(nodeType) === norm(constrainedType)) return true;
+        // Suffix match: catches "Pipe" matching "Plant.Piping.Pipe"
+        const nSuffix = nodeType.split(/[./]/).pop();
+        const cSuffix = constrainedType.split(/[./]/).pop();
+        return nSuffix === cSuffix;
+    }
+
+    for (const node of flatTree) {
+        if (!node.type || !node.data || node.data.length === 0) continue;
+
+        // Count occurrences of each property on this node
+        const propCounts = new Map();
+        for (const d of node.data) {
+            const p = d.property;
+            if (p) propCounts.set(p, (propCounts.get(p) || 0) + 1);
+        }
+
+        for (const [prop, count] of propCounts) {
+            const loc = localName(prop);
+            const entries = byLocal.get(loc);
+            if (!entries || entries.length === 0) continue; // not constrained by any profile
+
+            // Constraints that match this node's type
+            const forType = entries.filter(c => typeMatches(node.type, c.constrainedType));
+            const loc2 = node.objectId ? `//*[@id='${node.objectId}']` : `(type: ${node.type})`;
+
+            if (forType.length === 0) {
+                // ERR-E18: property is profile-constrained but not for this element type
+                const profileName = entries[0].profileName;
+                const allowed = [...new Set(entries.map(e => e.constrainedType))].join(", ");
+                const sev = resolveSeverity("ERR-E18", severityConfig);
+                issues.push({
+                    objectId: node.objectId || "(no id)",
+                    objectType: node.type,
+                    ruleId: "ERR-E18",
+                    severity: sev.level, score: sev.score,
+                    description: `Attribute '${prop}' is not defined for class '${node.type}' (profile: '${profileName}'). ` +
+                                 `It is only allowed on: ${allowed}.`,
+                    location: loc2,
+                    profileSource: profileName,
+                    suggestedCorrection: `Remove attribute '${prop}' from this element, or verify the element class is correct.`
+                });
+            } else {
+                // ERR-E19: property present more times than upper cardinality allows
+                const upper = Math.min(...forType.map(c => c.upper));
+                if (isFinite(upper) && count > upper) {
+                    const mc = forType[0];
+                    const sev = resolveSeverity("ERR-E19", severityConfig);
+                    issues.push({
+                        objectId: node.objectId || "(no id)",
+                        objectType: node.type,
+                        ruleId: "ERR-E19",
+                        severity: sev.level, score: sev.score,
+                        description: `Attribute '${prop}' appears ${count} time(s) on '${node.type}' ` +
+                                     `but the maximum allowed is ${upper} (profile: '${mc.profileName}').`,
+                        location: loc2,
+                        profileSource: mc.profileName,
+                        suggestedCorrection: `Reduce '${prop}' occurrences to at most ${upper} on this element.`
+                    });
+                }
+            }
+        }
+    }
+
+    return issues;
+}
+
 // ─── Profile Parsing ──────────────────────────────────────────────────────────
 
 export function parseProfileConstraints(profileXml, profileName) {
@@ -1520,6 +1741,8 @@ export function runFullValidation({ mainXml, flatTree, profiles, severityConfig,
     allIssues.push(...runXmlSchemaValidation(mainXml, flatTree, severityConfig, externalValidIds, profileTypes));
     allIssues.push(...runStructuralValidation(flatTree, severityConfig));
     allIssues.push(...runEngineeringValidation(flatTree, severityConfig));
+    // ERR-E18 / ERR-E19 from the DEXPI 2.0 metamodel — runs without any profile loaded
+    allIssues.push(...runBuiltInAttributeValidation(flatTree, severityConfig));
 
     if (profiles.length > 0) {
         const profileSets = profiles.map(p => ({ name: p.name, constraints: p.constraints }));
@@ -1538,6 +1761,21 @@ export function runFullValidation({ mainXml, flatTree, profiles, severityConfig,
         const alreadyValidated = (profiles || []).some(p => p.xml === discXml);
         if (!alreadyValidated) {
             allIssues.push(...validateSymbolRules(mainXml, discXml, discXmlName, severityConfig));
+        }
+    }
+
+    // ERR-E18 / ERR-E19: attribute-class and cardinality checks.
+    // Collect ALL PropertyConstraints: from the DISC profile plus any manually added profiles.
+    // This gives a complete picture of which attributes are allowed on which element classes.
+    {
+        const allConstraints = [
+            ...(profiles.flatMap(p => p.constraints || [])),
+        ];
+        if (discXml) {
+            allConstraints.push(...parseProfileConstraints(discXml, discXmlName));
+        }
+        if (allConstraints.length > 0) {
+            allIssues.push(...runAttributeConstraintValidation(flatTree, allConstraints, severityConfig));
         }
     }
 

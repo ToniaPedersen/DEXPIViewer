@@ -131,22 +131,21 @@ function highlightPrimitive(p, key, color) {
     return null;
 }
 
-function ConnectorLineSvg({ el, nodePosMap, selected, connColor }) {
+function ConnectorLineSvg({ el, nodePosMap, selected, connColor, strokeAdjust }) {
     const { primitive: prim } = el;
     const src = prim.sourceRef ? nodePosMap.get(prim.sourceRef) : null;
     const tgt = prim.targetRef ? nodePosMap.get(prim.targetRef) : null;
     const pts = [src, ...prim.innerPoints, tgt].filter(Boolean);
     if (pts.length < 2) return null;
     const color = connColor || (selected ? "#d1242f" : prim.stroke.color);
-    // Signal/instrument connector lines often have sub-pixel stroke widths (e.g. 0.09–0.35 SVG units)
-    // in a diagram that spans ~800 SVG units on a ~900px panel (≈1.1 px/unit). Enforce a minimum
-    // of 1.0 SVG unit so the line renders as at least 1 CSS pixel at default zoom. When we bump
-    // the stroke width, scale the dash pattern proportionally so dashes remain clearly visible.
-    const minWidth = 1.0;
+    // When stroke adjustment is on, enforce a minimum of 0.5 SVG units so thin
+    // signal/instrument lines remain visible at default zoom. The dash pattern is
+    // scaled proportionally so dashes stay readable when the width is boosted.
+    const minWidth = 0.5;
     const baseWidth = prim.stroke.width;
     const sw = selected
         ? Math.max(baseWidth * 2, baseWidth + 0.4)
-        : Math.max(baseWidth, minWidth);
+        : (strokeAdjust ? Math.max(baseWidth, minWidth) : baseWidth);
     const rawDash = prim.stroke.dashArray || "";
     const scaledDash = (!selected && rawDash && baseWidth > 0 && sw > baseWidth)
         ? rawDash.split(/\s+/).map(v => (parseFloat(v) * (sw / baseWidth)).toFixed(3)).join(" ")
@@ -178,6 +177,169 @@ function ConnectorLineSvg({ el, nodePosMap, selected, connColor }) {
 //   all other types → red
 function selectionColor(elementRole) {
     return elementRole === "label" ? "#e06c00" : "#d1242f";
+}
+
+// ---------------------------------------------------------------------------
+// Heat-trace overlay helpers
+// ---------------------------------------------------------------------------
+const HT_COLOR  = "#e06000";
+const HT_DASH   = "6 2 6 2";  // dash-dash pattern
+const HT_SW     = 0.6;         // stroke width (SVG units)
+const HT_OFF    = 1.5;         // offset distance (~1 pt) from pipe / symbol edge
+const HT_THRESH = 0.15;        // |sin| or |cos| threshold for axis-alignment (~8.6 deg)
+
+/**
+ * Heat trace dashed line for a connector-line pipe element.
+ * Each segment between consecutive points (source → innerPoint[0] → … → target)
+ * is evaluated independently:
+ *   - Horizontal segment (within ~9 deg): line drawn 1 pt below
+ *   - Vertical   segment (within ~9 deg): line drawn 1 pt to the right
+ *   - Diagonal   segment:                 not drawn (skipped)
+ * This correctly handles pipes that change direction at inner points.
+ */
+function HeatTraceConnectorLine({ el, nodePosMap }) {
+    const prim = el.primitive;
+    const src = prim.sourceRef ? nodePosMap.get(prim.sourceRef) : null;
+    const tgt = prim.targetRef ? nodePosMap.get(prim.targetRef) : null;
+    const raw = [src, ...prim.innerPoints, tgt].filter(Boolean);
+    if (raw.length < 2) return null;
+
+    const segs = [];
+    for (let i = 0; i < raw.length - 1; i++) {
+        const p1 = raw[i], p2 = raw[i + 1];
+        const dx = p2.x - p1.x, dy = p2.y - p1.y;
+        const len = Math.sqrt(dx * dx + dy * dy);
+        if (len < 0.001) continue;
+        if (Math.abs(dy / len) < HT_THRESH) {
+            // horizontal segment → offset below
+            segs.push({ x1: p1.x, y1: p1.y + HT_OFF, x2: p2.x, y2: p2.y + HT_OFF });
+        } else if (Math.abs(dx / len) < HT_THRESH) {
+            // vertical segment → offset to the right
+            segs.push({ x1: p1.x + HT_OFF, y1: p1.y, x2: p2.x + HT_OFF, y2: p2.y });
+        }
+        // diagonal → skip
+    }
+    if (segs.length === 0) return null;
+    return (
+        <g pointerEvents="none">
+            {segs.map((s, i) => (
+                <line key={i} x1={s.x1} y1={s.y1} x2={s.x2} y2={s.y2}
+                    stroke={HT_COLOR} strokeWidth={HT_SW}
+                    strokeDasharray={HT_DASH} vectorEffect="non-scaling-stroke" />
+            ))}
+        </g>
+    );
+}
+
+/**
+ * Compute the axis-aligned bounding box of a symbol in diagram (world) space
+ * by transforming all four local corners through the full placement transform.
+ */
+function symbolDiagramBBox(el) {
+    const mirror = el.isMirrored ? -1 : 1;
+    const rad = (el.rotation || 0) * Math.PI / 180;
+    const cosR = Math.cos(rad), sinR = Math.sin(rad);
+    const { minX, maxX, minY, maxY } = el.variant;
+    const corners = [[minX, minY], [maxX, minY], [maxX, maxY], [minX, maxY]].map(([lx, ly]) => {
+        const sx = lx * el.scaleX * mirror;
+        const sy = ly * el.scaleY;
+        return { x: el.position.x + sx * cosR - sy * sinR,
+                 y: el.position.y + sx * sinR + sy * cosR };
+    });
+    return {
+        minX: Math.min(...corners.map(c => c.x)),
+        maxX: Math.max(...corners.map(c => c.x)),
+        minY: Math.min(...corners.map(c => c.y)),
+        maxY: Math.max(...corners.map(c => c.y)),
+    };
+}
+
+/**
+ * Heat trace dashed line for an inline symbol (valve, fitting, nozzle).
+ * Orientation is determined from el.rotation:
+ *   ~0 / ~180 deg  (horizontal pipe) -> line 1 pt below  the symbol in diagram space
+ *   ~90 / ~270 deg (vertical pipe)   -> line 1 pt right of the symbol in diagram space
+ *   other (corner / diagonal)        -> line 1 pt below  (default)
+ * The bounding box is computed in diagram space so the result is correct for all
+ * rotations without relying on local-coordinate tricks.
+ */
+function HeatTraceSymbol({ el }) {
+    const normRot = ((el.rotation || 0) % 360 + 360) % 360;
+    const isVertical = (normRot > 75 && normRot < 105) || (normRot > 255 && normRot < 285);
+    const bb = symbolDiagramBBox(el);
+    if (isVertical) {
+        const x = bb.maxX + HT_OFF;
+        return <line x1={x} y1={bb.minY} x2={x} y2={bb.maxY}
+            stroke={HT_COLOR} strokeWidth={HT_SW} strokeDasharray={HT_DASH}
+            vectorEffect="non-scaling-stroke" pointerEvents="none" />;
+    } else {
+        const y = bb.maxY + HT_OFF;
+        return <line x1={bb.minX} y1={y} x2={bb.maxX} y2={y}
+            stroke={HT_COLOR} strokeWidth={HT_SW} strokeDasharray={HT_DASH}
+            vectorEffect="non-scaling-stroke" pointerEvents="none" />;
+    }
+}
+
+/**
+ * Heat trace dashed rectangle drawn 1 pt outside a PIF symbol bounding box,
+ * in local symbol coordinates so it rotates with the symbol.
+ */
+/**
+ * Heat trace overlay for ProcessInstrumentationFunction.
+ * Traces the actual outer boundary primitives of the symbol (circle, ellipse,
+ * polygon) expanded 1 pt outward, so it follows the real symbol shape rather
+ * than a bounding-box rectangle.  Internal detail polylines are skipped.
+ * Falls back to a bounding-box rect when no boundary primitive is found.
+ */
+function HeatTracePIF({ el }) {
+    const mirror = el.isMirrored ? -1 : 1;
+    const transform = `translate(${el.position.x} ${el.position.y}) rotate(${el.rotation}) scale(${el.scaleX * mirror} ${el.scaleY})`;
+    const pad = 1.5;
+
+    const overlays = [];
+    (el.variant.primitives || []).forEach((p, i) => {
+        const key = `htpif_${i}`;
+        if (p.kind === "circle") {
+            overlays.push(
+                <circle key={key} cx={p.center.x} cy={p.center.y} r={p.radius + pad}
+                    fill="none" stroke={HT_COLOR} strokeWidth={HT_SW}
+                    strokeDasharray={HT_DASH} vectorEffect="non-scaling-stroke" />
+            );
+        } else if (p.kind === "ellipse") {
+            overlays.push(
+                <ellipse key={key} cx={p.center.x} cy={p.center.y}
+                    rx={p.rx + pad} ry={p.ry + pad}
+                    transform={p.rotation ? `rotate(${p.rotation} ${p.center.x} ${p.center.y})` : undefined}
+                    fill="none" stroke={HT_COLOR} strokeWidth={HT_SW}
+                    strokeDasharray={HT_DASH} vectorEffect="non-scaling-stroke" />
+            );
+        } else if (p.kind === "polygon") {
+            // Polygon: keep the same points but use a wide dashed stroke so the
+            // overlay visually sits outside the filled shape.
+            const outsetSW = (p.stroke?.width || 0.25) + pad * 2;
+            overlays.push(
+                <polygon key={key} points={p.points.map(pt => `${pt.x},${pt.y}`).join(" ")}
+                    fill="none" stroke={HT_COLOR} strokeWidth={outsetSW}
+                    strokeDasharray={HT_DASH} vectorEffect="non-scaling-stroke" />
+            );
+        }
+        // polylines / text / rects are internal symbol details — not traced
+    });
+
+    if (overlays.length === 0) {
+        // Fallback: simple rect 1 pt outside bounding box
+        const x = Math.min(el.variant.minX, el.variant.maxX) - pad;
+        const y = Math.min(el.variant.minY, el.variant.maxY) - pad;
+        const w = Math.abs(el.variant.maxX - el.variant.minX) + pad * 2;
+        const h = Math.abs(el.variant.maxY - el.variant.minY) + pad * 2;
+        overlays.push(
+            <rect key="htpif_fb" x={x} y={y} width={w} height={h}
+                fill="none" stroke={HT_COLOR} strokeWidth={HT_SW}
+                strokeDasharray={HT_DASH} vectorEffect="non-scaling-stroke" />
+        );
+    }
+
+    return <g transform={transform} pointerEvents="none">{overlays}</g>;
 }
 
 function SymbolGraphic({ el, selected, connHighlight, onSelect }) {
@@ -212,7 +374,7 @@ function SymbolGraphic({ el, selected, connHighlight, onSelect }) {
     );
 }
 
-function PrimitiveGraphic({ el, selected, connHighlight, onSelect, nodePosMap }) {
+function PrimitiveGraphic({ el, selected, connHighlight, onSelect, nodePosMap, strokeAdjust }) {
     const hitPad = 2.0;
     const hlColor = selected ? (connHighlight || selectionColor(el.elementRole)) : connHighlight || null;
     const prim = el.primitive;
@@ -231,7 +393,7 @@ function PrimitiveGraphic({ el, selected, connHighlight, onSelect, nodePosMap })
             })()}
             {hlColor && el.kind !== "connectorLine" && prim?.kind !== "text" && highlightPrimitive(prim, `hl_${el.key}`, hlColor)}
             {el.kind === "connectorLine"
-                ? <ConnectorLineSvg el={el} nodePosMap={nodePosMap} selected={selected} connColor={connHighlight} />
+                ? <ConnectorLineSvg el={el} nodePosMap={nodePosMap} selected={selected} connColor={connHighlight} strokeAdjust={strokeAdjust} />
                 : renderPrimitive(prim, el.key, prim?.kind === "text" ? hlColor : null)}
         </g>
     );
@@ -326,6 +488,7 @@ export default function App() {
     const [validationFilter, setValidationFilter] = useState("All");
     const [severityConfig, setSeverityConfig] = useState({});
     const [showConnectivity, setShowConnectivity] = useState(false);
+    const [strokeAdjust, setStrokeAdjust] = useState(true);
     const [spaceDown, setSpaceDown] = useState(false);
 
     const mainInputRef = useRef(null);
@@ -714,6 +877,7 @@ export default function App() {
                     <div style={{ display: "flex", gap: 5, flexWrap: "wrap", alignItems: "center" }}>
                         <button style={S.btn} onClick={() => { if (!parsed) return; const b = boundsFromElements(parsed.graphics); setFullBounds(b); setViewBox({ x: b.minX, y: b.minY, w: b.maxX - b.minX, h: b.maxY - b.minY }); }} title="Fit drawing to window">Fit</button>
                         <button style={{ ...S.btn, background: showConnectivity ? "#eaf2ff" : "white" }} onClick={() => setShowConnectivity(p => !p)} title="Connectivity mode: highlights the upstream (blue), downstream (green), and group (purple) connections of the selected object. Directional arrows appear on connector lines.">Connectivity</button>
+                        <button style={{ ...S.btn, background: strokeAdjust ? "#eaf2ff" : "white" }} onClick={() => setStrokeAdjust(p => !p)} title="Stroke adjustment: boosts very thin connector lines to a minimum visible width. Turn off to render lines at their exact drawn weight.">Line weight</button>
                         <button style={S.btn} onClick={() => bgInputRef.current?.click()} title="Overlay an image or PDF behind the drawing">BG Image</button>
                         {bgImage && <button style={{ ...S.btn, background: showBgControls ? "#eaf2ff" : "white" }} onClick={() => setShowBgControls(p => !p)}>BG Controls</button>}
                         <input ref={bgInputRef} type="file" accept="image/*,.pdf" style={{ display: "none" }} onChange={handleBgFile} />
@@ -771,7 +935,21 @@ export default function App() {
                             const ch = connectivityHighlight;
                             const connColor = el.representedId ? (ch.upstream.has(el.representedId) ? "#0969da" : ch.downstream.has(el.representedId) ? "#1a7f37" : ch.group.has(el.representedId) ? "#8250df" : null) : null;
                             if (el.kind === "symbolUsage") return <SymbolGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} />;
-                            return <PrimitiveGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} nodePosMap={parsed.graphics.nodePosMap} />;
+                            return <PrimitiveGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} nodePosMap={parsed.graphics.nodePosMap} strokeAdjust={strokeAdjust} />;
+                        })}
+                        {/* Heat-trace overlays – rendered on top, only when a DISC profile is loaded */}
+                        {parsed?.heatTraceSet?.size > 0 && parsed.graphics.elements.map(el => {
+                            // Never draw heat-trace overlays on label or annotation elements
+                            if (el.elementRole === "label") return null;
+                            const htType = el.representedId ? parsed.heatTraceSet.get(el.representedId) : null;
+                            if (!htType) return null;
+                            if (htType === "piping" && el.kind === "connectorLine")
+                                return <HeatTraceConnectorLine key={`ht_${el.key}`} el={el} nodePosMap={parsed.graphics.nodePosMap} />;
+                            if ((htType === "inline" || htType === "nozzle") && el.kind === "symbolUsage")
+                                return <HeatTraceSymbol key={`ht_${el.key}`} el={el} />;
+                            if (htType === "pif" && el.kind === "symbolUsage")
+                                return <HeatTracePIF key={`ht_${el.key}`} el={el} />;
+                            return null;
                         })}
                     </svg>
                     {showConnectivity && selectedId && (

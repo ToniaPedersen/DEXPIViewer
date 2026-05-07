@@ -242,6 +242,9 @@
             <Data property="CreatorName">
               <String>pnb</String>
             </Data>
+            <Data property="CreatorName">
+              <String>draga</String>
+            </Data>			
             <Data property="DrawingName">
               <String>PIPING AND INSTRUMENT DIAGRAM</String>
             </Data>
@@ -775,9 +778,9 @@
             </Data>
           </Object>
           <Object id="PipingNetworkSystem6" type="Plant/Piping.PipingNetworkSystem">
-            <Data property="DiscProfile/HeatTraceRequired">
-              <DataReference data="DiscProfile/InformationModel.HeatTraceRequired.No"/>
-            </Data>
+                <Data property="HeatTracingType">
+                  <DataReference data="Plant/Enumerations.HeatTracingTypeClassification.HeatTracingSystem"/>
+                </Data>
             <Data property="DiscProfile/ItemTag">
               <String>D-20L00003A</String>
             </Data>
@@ -831,7 +834,7 @@
                   </Object>
                 </Components>
                 <Data property="HeatTracingType">
-                  <DataReference data="Plant/Enumerations.HeatTracingTypeClassification.NoHeatTracingSystem"/>
+                  <DataReference data="Plant/Enumerations.HeatTracingTypeClassification.HeatTracingSystem"/>
                 </Data>
                 <Components property="Items">
                   <Object id="Flange6" type="Plant/Piping.Flange">
@@ -943,7 +946,7 @@
                   </Object>
                 </Components>
                 <Data property="HeatTracingType">
-                  <DataReference data="Plant/Enumerations.HeatTracingTypeClassification.NoHeatTracingSystem"/>
+                  <DataReference data="Plant/Enumerations.HeatTracingTypeClassification.HeatTracingSystem"/>
                 </Data>
                 <Components property="Items">
                   <Object id="Flange7" type="Plant/Piping.Flange">
@@ -990,7 +993,7 @@
                   </Object>
                 </Components>
                 <Data property="HeatTracingType">
-                  <DataReference data="Plant/Enumerations.HeatTracingTypeClassification.NoHeatTracingSystem"/>
+                  <DataReference data="Plant/Enumerations.HeatTracingTypeClassification.HeatTracingSystem"/>
                 </Data>
                 <Components property="Items">
                   <Object id="PipeTee2" type="Plant/Piping.PipeTee">
@@ -1117,7 +1120,7 @@
             </Components>
             <Data property="DiscProfile/TagType">
               <String>L</String>
-            </Data>
+            </Data>		
           </Object>
           <Object id="PipingNetworkSystem7" type="Plant/Piping.PipingNetworkSystem">
             <Data property="DiscProfile/HeatTraceRequired">
@@ -4347,6 +4350,9 @@ AD750</String>
             <Data property="DiscProfile/ProcessInstrumentationFunctionType">
               <String>Discrete</String>
             </Data>
+                <Data property="HeatTracingType">
+                  <DataReference data="Plant/Enumerations.HeatTracingTypeClassification.HeatTracingSystem"/>
+                </Data>
             <Components property="ProcessSignalGeneratingFunctions">
               <Object id="ProcessSignalGeneratingFunction4" type="Plant/Instrumentation.ProcessSignalGeneratingFunction">
                 <References objects="#GateValve4" property="SensingLocation"/>
