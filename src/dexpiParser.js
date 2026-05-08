@@ -491,28 +491,137 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
  * heat-tracing visual overlays. Only called when a DISC profile is loaded.
  *
  * Return value: Map<objectId, "piping" | "inline" | "pif" | "nozzle">
- *   "piping"  – Pipe / DirectPipingConnection (connector-line element)
+ *   "piping"  – Pipe connector-line element
  *   "inline"  – PipingComponent / valve / fitting in a segment's Items list
  *   "pif"     – ProcessInstrumentationFunction
  *   "nozzle"  – Nozzle
  *
- * Inheritance: element HTR -> parent PipingNetworkSegment HTR -> parent
- *              PipingNetworkSystem HTR (first non-null wins).
- * PIF and Nozzle use only their own direct HTR (no segment/system inheritance).
+ * Eligibility is data-driven: only element types whose DEXPI/DISC class
+ * has HeatTracingType defined (directly or through class inheritance) are
+ * included.  The base set is derived from Plant.xml + DiscProfile.xml;
+ * it is extended at runtime from the loaded DISC profile's ConcreteClass
+ * definitions and Profile/PropertyConstraint entries.
  */
-export function buildHeatTraceSet(tree) {
-    const result = new Map();
 
-    // Extract the HeatTracingType from a node's data array.
-    // Returns:
-    //   undefined  – attribute not present on this node (caller should inherit from parent)
-    //   null       – attribute explicitly set to NoHeatTracingSystem (no heat trace)
-    //   string     – any other value (e.g. "ActiveHeatTracing") → heat trace active
+// ---------------------------------------------------------------------------
+// Type suffixes (last dot-segment of the DEXPI class name) that are known to
+// have HeatTracingType in the base DEXPI 2.0 model (Plant.xml) or the
+// standard DISC profile (DiscProfile.xml), derived from their class hierarchy.
+// Custom / third-party profile classes that are subclasses of these types are
+// resolved at runtime from the loaded discDoc.
+// ---------------------------------------------------------------------------
+const DEXPI_BUILTIN_HT_ELIGIBLE = new Set([
+    // Plant.xml direct owners
+    "PipingNetworkSystem", "PipingNetworkSegment", "PipingComponent", "OfflineMeasuringElement",
+    // Plant.xml – Pipe (PipingConnection subclass, carries inherited HeatTracingType from its segment)
+    "Pipe",
+    // Plant.xml – concrete subclasses of PipingComponent / InlineMeasuringElement
+    "AngleBallValve","AngleGlobeValve","AnglePlugValve","AngleValve","BallValve",
+    "BlindFlange","BreatherValve","ButterflyValve","CheckValve","ClampedFlangeCoupling",
+    "Compensator","ConicalStrainer","ElectromagneticFlowMeter","FlameArrestor","Flange",
+    "FlangedConnection","FlowMeasuringElement","FlowNozzle","Funnel","GateValve",
+    "GlobeCheckValve","GlobeValve","Hose","IlluminatedSightGlass","InLineMixer",
+    "InlineMeasuringElement","LineBlind","MassFlowMeasuringElement","NeedleValve",
+    "OperatedValve","Penetration","PipeCoupling","PipeFitting","PipeFlangeSpacer",
+    "PipeFlangeSpade","PipeReducer","PipeTee","PlugValve","PositiveDisplacementFlowMeter",
+    "RestrictionOrifice","RuptureDisc","SafetyValveOrFitting","Sensorwell","SightGlass",
+    "Silencer","SpringLoadedAngleGlobeSafetyValve","SpringLoadedGlobeSafetyValve",
+    "SteamTrap","StraightwayValve","Strainer","SwingCheckValve","TurbineFlowMeter",
+    "VariableAreaFlowMeter","VentLine","VenturiTube","VolumeFlowMeasuringElement",
+    // DiscProfile.xml – concrete subclasses of the above (standard DISC profile)
+    "AcousticNoiseReducer","AirReleaseTrap","AveragingPitotTubeFlowMeter","AxialValve",
+    "BirdScreen","BlockAndBleedValve","ChokeValve","ClampConnector","ClampOn",
+    "CoriolisMassFlowMeter","DiaphragmSeal","DiaphragmValve","Diffuser","DiverterValve",
+    "DoubleBlockAndBleedAndCheckValve","DoubleBlockAndBleedValve","DoubleIsolationBallValve1",
+    "DoubleIsolationBallValve2","DrainBox","DrainerTrap","DuplexStrainer","ExpansionJoint",
+    "FlexibleHoseFlanged","FloatValve","FlowControlAndCheckValve","FlowIndicator",
+    "FlowMeter","FlowNozzleMeter","FlowStraighteningVane","FourWayValve","GullyDrain",
+    "HoseConnector","LevelBridle","LevelMeasuringInstrumentNuclear","LevelSensor",
+    "LevelWell","MinimumFlowAndCheckValve","MixedOrBarredTee","MixingOrBarredTee",
+    "MonoflangeValve","OpenDrainSystem","OrificePlate","PilotOperatedReliefValve",
+    "PinchValve","PipeCap","PipeUnion","Plug","QuickChangeOrificePlate","ReducingFlange",
+    "RotaryValve","RotatingDrumStrainer","SelfActuatedPressureControlValve","SlideGateValve",
+    "SpecialItemPipingComponent","SpectacleBlind","StrainerTTemporary","SwivelJoint",
+    "TStrainer","Thermowell","ThreadedPipeCap","ThreeWayValve","Trap","UltrasonicFlowMeter",
+    "VacuumReliefValve","VariableAreaFlowIndicator","VentBirdScreen","VentTip",
+    "VentToSafe","VenturiTubeFlowMeter","VirtualPipingConnector","VortexFlowMeter",
+    "WaterSealWithVent","WedgeGateValve","YStrainer",
+]);
+
+/**
+ * Build an eligibility predicate for HeatTracingType from the loaded DISC
+ * profile document (may be null when no profile is loaded).
+ *
+ * The predicate returns true for any DEXPI element type whose class has
+ * HeatTracingType defined, either from the built-in set above or because:
+ *   (a) the profile defines a ConcreteClass that is a subclass of an eligible
+ *       type (handles custom / vendor profile extensions); or
+ *   (b) the profile has a Profile/PropertyConstraint whose Property contains
+ *       "HeatTracingType" pointing at a ConstrainedType not in the built-in set.
+ *
+ * Non-eligible types break the instance-level inheritance chain: a
+ * PipingNetworkSegment's HeatTracingType does NOT propagate to (e.g.) an
+ * OffPageConnector that is also listed as a segment item, because
+ * PipeOffPageConnector is NOT a subclass of PipingComponent.
+ */
+function buildHtEligibility(discDoc) {
+    const eligible = new Set(DEXPI_BUILTIN_HT_ELIGIBLE);
+
+    if (discDoc) {
+        // (a) Extend with ConcreteClass subclasses of already-eligible types.
+        // Iterate to fixpoint to handle multi-level inheritance chains.
+        const classes = Array.from(discDoc.querySelectorAll("ConcreteClass"));
+        let changed = true;
+        while (changed) {
+            changed = false;
+            for (const cls of classes) {
+                const name = cls.getAttribute("name");
+                if (!name || eligible.has(name)) continue;
+                const supers = (cls.getAttribute("superTypes") || "").split(/\s+/);
+                const superSuffixes = supers.map(s => s.split(/[./]/).pop());
+                if (superSuffixes.some(s => eligible.has(s))) {
+                    eligible.add(name);
+                    changed = true;
+                }
+            }
+        }
+
+        // (b) Honour explicit PropertyConstraint entries for HeatTracingType.
+        discDoc.querySelectorAll('Object[type="Profile/PropertyConstraint"]').forEach(obj => {
+            let prop = null, constrainedType = null;
+            Array.from(obj.querySelectorAll(":scope > Data")).forEach(d => {
+                const p = d.getAttribute("property");
+                const s = d.querySelector("String")?.textContent?.trim();
+                if (p === "Property")        prop = s;
+                if (p === "ConstrainedType") constrainedType = s;
+            });
+            if (prop?.includes("HeatTracingType") && constrainedType) {
+                const suffix = constrainedType.split(/[./]/).pop();
+                if (suffix) eligible.add(suffix);
+            }
+        });
+    }
+
+    return (type) => {
+        if (!type) return false;
+        const suffix = type.split(/[./]/).pop();
+        return eligible.has(suffix);
+    };
+}
+
+export function buildHeatTraceSet(tree, discDoc = null) {
+    const result = new Map();
+    const isEligibleType = buildHtEligibility(discDoc);
+
+    // Extract HeatTracingType from a node's own data.
+    //   undefined → attribute absent on this node  (use parent's value)
+    //   null      → explicitly NoHeatTracingSystem  (no heat trace)
+    //   string    → any other active value, e.g. "HeatTracingSystem"
     function getHT(node) {
         if (!node || !Array.isArray(node.data)) return undefined;
         const entry = node.data.find(d =>
-            d.property === "DiscProfile/HeatTracingType" ||
-            d.property === "HeatTracingType"
+            d.property === "HeatTracingType" ||
+            d.property === "DiscProfile/HeatTracingType"
         );
         if (!entry) return undefined;
         const v = entry.value;
@@ -520,84 +629,54 @@ export function buildHeatTraceSet(tree) {
         let last;
         if (typeof v === "string") {
             last = v;
-        } else if (v && v.kind === "DataReference") {
+        } else if (v?.kind === "DataReference") {
             last = v.value.split(".").pop().split("/").pop();
         } else {
             return undefined;
         }
-        if (!last || last === "NoHeatTracingSystem") return null;
-        return last; // e.g. "ActiveHeatTracing", "SteamTracing", …
-    }
-
-    // Resolve effective HeatTracingType with inheritance: own value takes precedence,
-    // falling back to segHT then sysHT. undefined means "not set" (inherit); null means "none".
-    function resolveHT(node, segHT, sysHT) {
-        const own = getHT(node);
-        return own !== undefined ? own : (segHT !== undefined ? segHT : sysHT);
+        return (!last || last === "NoHeatTracingSystem") ? null : last;
     }
 
     function isActive(ht) { return ht !== null && ht !== undefined; }
 
-    function walk(node, segHT, sysHT) {
+    // Map the element's DEXPI class to the heat-trace overlay render mode.
+    function overlayType(type) {
+        if (!type) return "inline";
+        if (type.includes("ProcessInstrumentationFunction") ||
+            type.includes("ProcessSafetyFunction")) return "pif";
+        const suffix = type.split(/[./]/).pop();
+        if (suffix === "Nozzle") return "nozzle";
+        if (suffix === "Pipe")   return "piping";
+        return "inline";
+    }
+
+    // Walk the conceptual tree, propagating the inherited HeatTracingType value.
+    //
+    // Eligible types participate in HT inheritance and may appear in the result.
+    // Non-eligible types (e.g. OffPageConnector, ProcessInstrumentationFunction,
+    // structural containers) break the inheritance chain: their children start
+    // with inheritedHT = undefined so they cannot inherit from an ancestor.
+    function walk(node, inheritedHT) {
         if (!node) return;
         const type = node.type || "";
 
-        // ---- PipingNetworkSystem ------------------------------------------------
-        if (type.includes("PipingNetworkSystem")) {
-            const h = getHT(node);
-            node.children.forEach(child => walk(child, undefined, h));
+        if (!isEligibleType(type)) {
+            // Not eligible — don't include, and reset chain for children
+            node.children.forEach(child => walk(child, undefined));
             return;
         }
 
-        // ---- PipingNetworkSegment -----------------------------------------------
-        if (type.includes("PipingNetworkSegment")) {
-            const h = getHT(node);
-            for (const child of node.children) {
-                if (child.edgeLabel === "Connections") {
-                    // Only concrete class "Pipe" carries HeatTracingType.
-                    // DirectPipingConnection and other connection types are excluded.
-                    const shortType = (child.type || "").split(/[./]/).pop();
-                    if (shortType === "Pipe") {
-                        const effective = resolveHT(child, h, sysHT);
-                        if (isActive(effective) && child.objectId) result.set(child.objectId, "piping");
-                    }
-                    // Recurse regardless – sub-children may include Nozzles
-                    child.children.forEach(gc => walk(gc, h, sysHT));
-                } else if (child.edgeLabel === "Items") {
-                    // Items: PipingComponent subclasses (valves, fittings, …).
-                    // Excluded: PropertyBreak (no HeatTracingType).
-                    const shortType2 = (child.type || "").split(/[./]/).pop();
-                    if (shortType2 !== "PropertyBreak") {
-                        const effective = resolveHT(child, h, sysHT);
-                        if (isActive(effective) && child.objectId) result.set(child.objectId, "inline");
-                    }
-                    child.children.forEach(gc => walk(gc, h, sysHT));
-                } else {
-                    walk(child, h, sysHT);
-                }
-            }
-            return;
+        const ownHT = getHT(node);
+        const effectiveHT = ownHT !== undefined ? ownHT : inheritedHT;
+
+        if (isActive(effectiveHT) && node.objectId) {
+            result.set(node.objectId, overlayType(type));
         }
 
-        // ---- ProcessInstrumentationFunction – direct HeatTracingType only -------
-        if (type.includes("ProcessInstrumentationFunction")) {
-            if (isActive(getHT(node)) && node.objectId) result.set(node.objectId, "pif");
-            node.children.forEach(child => walk(child, undefined, undefined));
-            return;
-        }
-
-        // ---- Nozzle – direct HeatTracingType only -------------------------------
-        if (type.includes("Nozzle")) {
-            if (isActive(getHT(node)) && node.objectId) result.set(node.objectId, "nozzle");
-            node.children.forEach(child => walk(child, undefined, undefined));
-            return;
-        }
-
-        // ---- Generic recursion --------------------------------------------------
-        node.children.forEach(child => walk(child, segHT, sysHT));
+        node.children.forEach(child => walk(child, effectiveHT));
     }
 
-    walk(tree, undefined, undefined);
+    walk(tree, undefined);
     return result;
 }
 
@@ -657,8 +736,7 @@ export function parseDexpiPackage(mainXml, discProfileXml) {
     // reference in DEXPI goes FROM the graphical model TO the conceptual object
     // (via "Represents"), not the other way, so we check the rendered graphics.
     const heatTraceSet = (() => {
-        if (!discDoc) return new Map();
-        const raw = buildHeatTraceSet(tree);
+        const raw = buildHeatTraceSet(tree, discDoc);
         const symbolUsageIds = new Set(
             graphics.elements
                 .filter(el => el.kind === "symbolUsage" && el.representedId)
