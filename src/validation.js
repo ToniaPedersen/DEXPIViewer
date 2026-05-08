@@ -2,9 +2,9 @@
 // Implements: VAL-001..005, VAX-001..005, VAE-001..006, PRF-001..007, ERR-E01..E19, RPT-001..004
 
 import { DEXPI_ALL_TYPES, DEXPI_STD_PREFIXES as _DEXPI_STD_PREFIXES } from "./dexpiTypes.js";
-// Plant.xml bundled as raw text so buildProfileAttributeMap has the full
-// Plant-model class hierarchy (ButterflyValve → OperatedValve, etc.)
-import plantXmlRaw from "../DEXPI Standard and Profile/Plant.xml?raw";
+// Compact Plant.xml class hierarchy (auto-generated, 14 KB vs 695 KB raw).
+// Regenerate with: node scripts/genPlantHierarchy.mjs
+import { PLANT_CLASS_SUPERTYPES } from "./plantHierarchy.js";
 
 // ─── Connection-point margin (fraction of drawing bounding-box per axis) ──────
 // The NodePosition in the drawing must be within this fraction of the drawing
@@ -1107,6 +1107,14 @@ function buildProfileAttributeMap(profileXmlList) {
     // classSuffix → Set<attr locals declared directly on it>
     const classAttrs  = new Map();
 
+    // Seed the hierarchy from the pre-built Plant.xml class table so that
+    // Plant-model types (e.g. ButterflyValve → OperatedValve) are known
+    // without bundling the full 695 KB Plant.xml at runtime.
+    for (const [cls, sup] of PLANT_CLASS_SUPERTYPES) {
+        if (!hierarchy.has(cls)) hierarchy.set(cls, new Set());
+        hierarchy.get(cls).add(sup);
+    }
+
     const parser = new DOMParser();
     for (const profileXml of profileXmlList) {
         if (!profileXml) continue;
@@ -1460,15 +1468,21 @@ export function runProfileValidation(flatTree, mergedConstraints, overrideLog, s
 
         if (lower >= 1) {
             matching.forEach(node => {
-                // shortProp: local name after the last "." separator.
-                // e.g. "Core/Diagram.MetaData.DrawingNumber" → "DrawingNumber"
-                const shortProp = property.split(".").pop() || property;
+                // shortProp: local name after the last "." or "/" separator.
+                // e.g. "Core/Diagram.MetaData.DrawingNumber"                          → "DrawingNumber"
+                //      "DiscProfile/InformationModel.NozzleExtension.IsVirtualMount"  → "IsVirtualMount"
+                const shortProp = property.split(/[.\/]/).pop() || property;
+                // dpLocal: same normalisation applied to the actual stored property name.
+                // DEXPI files use several forms:
+                //   "DrawingNumber"                            (bare)
+                //   "DiscProfile/ProcessInstrumentationFunctionLocation"  (slash-prefixed)
+                //   "Core/Diagram.MetaData.DrawingNumber"     (fully-qualified)
+                const dpLocal = dp => (dp || "").split(/[.\/]/).pop();
                 const hasProperty = node.data.some(d => {
                     const dp = d.property || "";
-                    // Match fully-qualified, bare local name, or dotted-suffix form.
-                    // DEXPI files commonly store bare property names (e.g. "DrawingNumber")
-                    // while the profile constraint uses the fully-qualified form.
-                    return dp === property || dp === shortProp || dp.endsWith("." + shortProp);
+                    return dp === property            // exact fully-qualified match
+                        || dpLocal(dp) === shortProp; // local-name match (handles bare,
+                                                      // slash-prefixed, and dotted forms)
                 });
                 if (!hasProperty) {
                     const ruleId = `PRF-${profileName}-${shortProp}`;
@@ -1921,10 +1935,9 @@ export function runFullValidation({ mainXml, flatTree, profiles, severityConfig,
         if (allConstraints.length > 0) {
             // Build class-model attribute map from all loaded profile XMLs so that
             // ERR-E18 doesn't fire for attributes granted by DataProperty inheritance.
-            // Include Plant.xml so the full Plant-model type hierarchy
-            // (e.g. ButterflyValve → OperatedValve) is available for
-            // inheritance propagation in buildProfileAttributeMap.
-            const profileAttrMap = buildProfileAttributeMap([...allProfileXmlStrings, plantXmlRaw]);
+            // Plant.xml hierarchy is pre-seeded inside buildProfileAttributeMap
+            // via PLANT_CLASS_SUPERTYPES — no need to pass Plant.xml raw text.
+            const profileAttrMap = buildProfileAttributeMap(allProfileXmlStrings);
             allIssues.push(...runAttributeConstraintValidation(flatTree, allConstraints, severityConfig, profileAttrMap));
         }
     }
