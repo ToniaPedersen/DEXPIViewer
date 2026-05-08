@@ -2,6 +2,9 @@
 // Implements: VAL-001..005, VAX-001..005, VAE-001..006, PRF-001..007, ERR-E01..E19, RPT-001..004
 
 import { DEXPI_ALL_TYPES, DEXPI_STD_PREFIXES as _DEXPI_STD_PREFIXES } from "./dexpiTypes.js";
+// Plant.xml bundled as raw text so buildProfileAttributeMap has the full
+// Plant-model class hierarchy (ButterflyValve → OperatedValve, etc.)
+import plantXmlRaw from "../DEXPI Standard and Profile/Plant.xml?raw";
 
 // ─── Connection-point margin (fraction of drawing bounding-box per axis) ──────
 // The NodePosition in the drawing must be within this fraction of the drawing
@@ -1087,6 +1090,112 @@ export function runBuiltInAttributeValidation(flatTree, severityConfig) {
     return issues;
 }
 
+// ─── Profile Class-Model Attribute Map ───────────────────────────────────────
+//
+// Parses one or more profile XMLs to build a map of:
+//   localAttributeName → Set<classTypeSuffix>
+// derived from DataProperty declarations on ConcreteClass / ClassExtension /
+// AbstractClass nodes (the DEXPI class model, distinct from PropertyConstraint).
+// Used by ERR-E18 to allow attributes that the class model grants via inheritance
+// even when no PropertyConstraint entry covers the combination.
+//
+function buildProfileAttributeMap(profileXmlList) {
+    // attrLocal → Set<type suffix>
+    const attrToTypes = new Map();
+    // classSuffix → Set<superType suffixes>
+    const hierarchy   = new Map();
+    // classSuffix → Set<attr locals declared directly on it>
+    const classAttrs  = new Map();
+
+    const parser = new DOMParser();
+    for (const profileXml of profileXmlList) {
+        if (!profileXml) continue;
+        const doc = parser.parseFromString(profileXml, "application/xml");
+        if (doc.querySelector("parsererror")) continue;
+
+        // Collect class definitions: ConcreteClass, AbstractClass, ClassExtension
+        //
+        // ClassExtension is special: its `name` is the extension's own identifier
+        // (e.g. "InlineMeasuringElementExtension") but its DataProperty entries extend
+        // the class named by `baseType` (e.g. "Plant/Piping.InlineMeasuringElement").
+        // Key ClassExtension entries on the baseType suffix so subclasses that list
+        // the base type in superTypes correctly inherit the extended attributes.
+
+        // ConcreteClass / AbstractClass
+        ["ConcreteClass", "AbstractClass"].forEach(tag => {
+            doc.querySelectorAll(tag).forEach(cls => {
+                const rawName = cls.getAttribute("name") || "";
+                if (!rawName) return;
+                const suffix = rawName.split(/[.\/]/).pop();
+
+                // Supertype hierarchy
+                const supers = (cls.getAttribute("superTypes") || "").trim();
+                if (supers) {
+                    if (!hierarchy.has(suffix)) hierarchy.set(suffix, new Set());
+                    supers.split(/\s+/).forEach(s => {
+                        const ss = s.split(/[.\/]/).pop();
+                        if (ss) hierarchy.get(suffix).add(ss);
+                    });
+                }
+
+                // DataProperty entries declared directly on this class
+                cls.querySelectorAll("DataProperty").forEach(dp => {
+                    const propName = dp.getAttribute("name") || "";
+                    const loc = propName.split(/[.\/]/).pop();
+                    if (!loc) return;
+                    if (!classAttrs.has(suffix)) classAttrs.set(suffix, new Set());
+                    classAttrs.get(suffix).add(loc);
+                });
+            });
+        });
+
+        // ClassExtension — key on the baseType suffix (the class being extended),
+        // not on the extension's own name, so inheritance propagation works correctly.
+        doc.querySelectorAll("ClassExtension").forEach(cls => {
+            const baseType = cls.getAttribute("baseType") || "";
+            if (!baseType) return;
+            const suffix = baseType.split(/[.\/]/).pop(); // e.g. "InlineMeasuringElement"
+
+            cls.querySelectorAll("DataProperty").forEach(dp => {
+                const propName = dp.getAttribute("name") || "";
+                const loc = propName.split(/[.\/]/).pop();
+                if (!loc) return;
+                if (!classAttrs.has(suffix)) classAttrs.set(suffix, new Set());
+                classAttrs.get(suffix).add(loc);
+            });
+        });
+    }
+
+    // Propagate: subclass inherits all attrs from supertypes (fixpoint)
+    let changed = true;
+    while (changed) {
+        changed = false;
+        for (const [cls, supers] of hierarchy) {
+            for (const sup of supers) {
+                const supAttrs = classAttrs.get(sup);
+                if (!supAttrs) continue;
+                if (!classAttrs.has(cls)) classAttrs.set(cls, new Set());
+                for (const a of supAttrs) {
+                    if (!classAttrs.get(cls).has(a)) {
+                        classAttrs.get(cls).add(a);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Invert: attrLocal → Set<classSuffix>
+    for (const [cls, attrs] of classAttrs) {
+        for (const attr of attrs) {
+            if (!attrToTypes.has(attr)) attrToTypes.set(attr, new Set());
+            attrToTypes.get(attr).add(cls);
+        }
+    }
+
+    return attrToTypes; // Map<attrLocal, Set<typeSuffix>>
+}
+
 // ─── Attribute Constraint Validation (ERR-E18, ERR-E19) ─────────────────────
 //
 // ERR-E18: A Data property appears on an element whose class does not allow it
@@ -1098,7 +1207,7 @@ export function runBuiltInAttributeValidation(flatTree, severityConfig) {
 // ERR-E19: A Data property appears more times than the upper cardinality allows
 //          on a given element type, per the profile PropertyConstraint.
 
-export function runAttributeConstraintValidation(flatTree, allConstraints, severityConfig) {
+export function runAttributeConstraintValidation(flatTree, allConstraints, severityConfig, profileAttrMap = new Map()) {
     const issues = [];
     if (!allConstraints || allConstraints.length === 0) return issues;
 
@@ -1149,21 +1258,29 @@ export function runAttributeConstraintValidation(flatTree, allConstraints, sever
             const loc2 = node.objectId ? `//*[@id='${node.objectId}']` : `(type: ${node.type})`;
 
             if (forType.length === 0) {
-                // ERR-E18: property is profile-constrained but not for this element type
-                const profileName = entries[0].profileName;
-                const allowed = [...new Set(entries.map(e => e.constrainedType))].join(", ");
-                const sev = resolveSeverity("ERR-E18", severityConfig);
-                issues.push({
-                    objectId: node.objectId || "(no id)",
-                    objectType: node.type,
-                    ruleId: "ERR-E18",
-                    severity: sev.level, score: sev.score,
-                    description: `Attribute '${prop}' is not defined for class '${node.type}' (profile: '${profileName}'). ` +
-                                 `It is only allowed on: ${allowed}.`,
-                    location: loc2,
-                    profileSource: profileName,
-                    suggestedCorrection: `Remove attribute '${prop}' from this element, or verify the element class is correct.`
-                });
+                // ERR-E18: property is profile-constrained but not for this element type.
+                // Before raising, check if the class model (DataProperty declarations on
+                // ConcreteClass / ClassExtension / AbstractClass) grants the attribute to
+                // this element's type via direct declaration or inheritance.
+                const nodeSuffix = (node.type || "").split(/[.\/]/).pop();
+                const classModelAllows =
+                    profileAttrMap.has(loc) && profileAttrMap.get(loc).has(nodeSuffix);
+                if (!classModelAllows) {
+                    const profileName = entries[0].profileName;
+                    const allowed = [...new Set(entries.map(e => e.constrainedType))].join(", ");
+                    const sev = resolveSeverity("ERR-E18", severityConfig);
+                    issues.push({
+                        objectId: node.objectId || "(no id)",
+                        objectType: node.type,
+                        ruleId: "ERR-E18",
+                        severity: sev.level, score: sev.score,
+                        description: `Attribute '${prop}' is not defined for class '${node.type}' (profile: '${profileName}'). ` +
+                                     `It is only allowed on: ${allowed}.`,
+                        location: loc2,
+                        profileSource: profileName,
+                        suggestedCorrection: `Remove attribute '${prop}' from this element, or verify the element class is correct.`
+                    });
+                }
             } else {
                 // ERR-E19: property present more times than upper cardinality allows
                 const upper = Math.min(...forType.map(c => c.upper));
@@ -1215,7 +1332,9 @@ export function parseProfileConstraints(profileXml, profileName) {
 
 // ─── Profile Content Validation (PRF-E01, PRF-E02) ───────────────────────────
 
-const KNOWN_PLANT_MM_PREFIXES = ["Core/","Plant/","Profile/"];
+// DiscProfile/ covers types defined in the DISC profile model itself
+// (e.g. DiscProfile/InformationModel.LogicalBreak, TieInPoint, …)
+const KNOWN_PLANT_MM_PREFIXES = ["Core/","Plant/","Profile/","DiscProfile/"];
 
 export function validateProfileContent(profileXml, profileName, severityConfig) {
     const issues = [];
@@ -1280,9 +1399,9 @@ export function validateProfileContent(profileXml, profileName, severityConfig) 
             issues.push({
                 objectId: "(profile constraint)", objectType: "Profile/PropertyConstraint", ruleId: "PRF-E02",
                 severity: sev.level, score: sev.score,
-                description: `Profile '${profileName}': ConstrainedType='${ctVal}' is not from a known DEXPI 2.0 namespace (Core/, Plant/, Profile/).`,
+                description: `Profile '${profileName}': ConstrainedType='${ctVal}' is not from a known DEXPI 2.0 namespace (Core/, Plant/, Profile/, DiscProfile/).`,
                 location: "//Object[@type='Profile/PropertyConstraint']", profileSource: profileName,
-                suggestedCorrection: "ConstrainedType must reference a class in the DEXPI 2.0 Plant Meta Model."
+                suggestedCorrection: "ConstrainedType must reference a class in the DEXPI 2.0 Plant Meta Model or DISC profile model (DiscProfile/)."
             });
         }
     });
@@ -1341,10 +1460,15 @@ export function runProfileValidation(flatTree, mergedConstraints, overrideLog, s
 
         if (lower >= 1) {
             matching.forEach(node => {
+                // shortProp: local name after the last "." separator.
+                // e.g. "Core/Diagram.MetaData.DrawingNumber" → "DrawingNumber"
                 const shortProp = property.split(".").pop() || property;
                 const hasProperty = node.data.some(d => {
                     const dp = d.property || "";
-                    return dp === property || dp.endsWith("." + shortProp);
+                    // Match fully-qualified, bare local name, or dotted-suffix form.
+                    // DEXPI files commonly store bare property names (e.g. "DrawingNumber")
+                    // while the profile constraint uses the fully-qualified form.
+                    return dp === property || dp === shortProp || dp.endsWith("." + shortProp);
                 });
                 if (!hasProperty) {
                     const ruleId = `PRF-${profileName}-${shortProp}`;
@@ -1464,11 +1588,22 @@ function typeCategory(normType) {
     return parts.length >= 2 ? parts.slice(0, 2).join(".") : normType;
 }
 
-export function validateSymbolRules(mainXml, profileXml, profileName, severityConfig) {
+export function validateSymbolRules(mainXml, profileXml, profileName, severityConfig, allProfileXmlStrings = []) {
     const issues = [];
     if (!mainXml || !profileXml) return issues;
 
     const { symbolUsage, symbolNodes, typeToSymbols } = parseProfileSymbols(profileXml);
+
+    // Combined symbol set across all loaded profiles — used by PRF-E04 to avoid
+    // false positives when a SymbolUsage references a symbol defined in a different
+    // profile in the stack (e.g. "DiscProfile/PP003A" referenced while validating
+    // "DiscProfile_FL0", but PP003A is declared in the base DiscProfile model).
+    const allKnownSymbols = new Set(symbolUsage.keys());
+    for (const xml of allProfileXmlStrings) {
+        if (!xml || xml === profileXml) continue;
+        const { symbolUsage: otherSymbols } = parseProfileSymbols(xml);
+        for (const name of otherSymbols.keys()) allKnownSymbols.add(name);
+    }
     const parser = new DOMParser();
     const doc = parser.parseFromString(mainXml, "application/xml");
     if (doc.querySelector("parsererror")) return issues;
@@ -1547,7 +1682,7 @@ export function validateSymbolRules(mainXml, profileXml, profileName, severityCo
         // ── PRF-E04 Sub-rule A: symbol must exist in the profile ─────────────
         // Checked here — before any RepresentationGroup navigation — so that
         // deeply-nested or non-standard group structures never bypass it.
-        if (symName && !symbolUsage.has(symName)) {
+        if (symName && !allKnownSymbols.has(symName)) {
             // Walk up to find context (best-effort; may be null for orphaned usages)
             const { representsId: qId } = findRepresentsAncestor(su);
             const qType = qId ? (objectTypes.get(qId) || "") : "";
@@ -1744,23 +1879,32 @@ export function runFullValidation({ mainXml, flatTree, profiles, severityConfig,
     // ERR-E18 / ERR-E19 from the DEXPI 2.0 metamodel — runs without any profile loaded
     allIssues.push(...runBuiltInAttributeValidation(flatTree, severityConfig));
 
+    // Build full XML string list for cross-profile symbol lookup in PRF-E04.
+    // Profiles build on one another in load order; a symbol declared in the base
+    // DiscProfile model is referenced by prefix "DiscProfile/" regardless of which
+    // additional profile is being validated.
+    const allProfileXmlStrings = [
+        ...(profiles.map(p => p.xml).filter(Boolean)),
+        ...(discXml && !profiles.some(p => p.xml === discXml) ? [discXml] : []),
+    ];
+
     if (profiles.length > 0) {
         const profileSets = profiles.map(p => ({ name: p.name, constraints: p.constraints }));
         const { mergedConstraints, overrideLog } = mergeProfileConstraints(profileSets);
         allIssues.push(...runProfileValidation(flatTree, mergedConstraints, overrideLog, severityConfig));
         profiles.forEach(p => {
             if (p.xml) allIssues.push(...validateProfileContent(p.xml, p.name, severityConfig));
-            if (p.xml) allIssues.push(...validateSymbolRules(mainXml, p.xml, p.name, severityConfig));
+            if (p.xml) allIssues.push(...validateSymbolRules(mainXml, p.xml, p.name, severityConfig, allProfileXmlStrings));
         });
     }
 
     // Run symbol rules against the disc profile (loaded via "DiscProfile.xml" button) if it
     // was not already included as a "+ Profile" entry. This ensures PRF-E04 fires for symbol
-    // references that are not defined in the companion disc profile file.
+    // references that are not defined in any profile in the stack.
     if (discXml) {
         const alreadyValidated = (profiles || []).some(p => p.xml === discXml);
         if (!alreadyValidated) {
-            allIssues.push(...validateSymbolRules(mainXml, discXml, discXmlName, severityConfig));
+            allIssues.push(...validateSymbolRules(mainXml, discXml, discXmlName, severityConfig, allProfileXmlStrings));
         }
     }
 
@@ -1775,7 +1919,13 @@ export function runFullValidation({ mainXml, flatTree, profiles, severityConfig,
             allConstraints.push(...parseProfileConstraints(discXml, discXmlName));
         }
         if (allConstraints.length > 0) {
-            allIssues.push(...runAttributeConstraintValidation(flatTree, allConstraints, severityConfig));
+            // Build class-model attribute map from all loaded profile XMLs so that
+            // ERR-E18 doesn't fire for attributes granted by DataProperty inheritance.
+            // Include Plant.xml so the full Plant-model type hierarchy
+            // (e.g. ButterflyValve → OperatedValve) is available for
+            // inheritance propagation in buildProfileAttributeMap.
+            const profileAttrMap = buildProfileAttributeMap([...allProfileXmlStrings, plantXmlRaw]);
+            allIssues.push(...runAttributeConstraintValidation(flatTree, allConstraints, severityConfig, profileAttrMap));
         }
     }
 
