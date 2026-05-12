@@ -25,7 +25,7 @@
 import { DOMParser } from "@xmldom/xmldom";
 import { readFileSync, writeFileSync, readdirSync, statSync, mkdirSync } from "fs";
 import { join, basename, extname, dirname } from "path";
-import { parseDexpiPackage } from "./src/dexpiParser.js";
+import { parseDexpiPackage, collectModelValidIds } from "./src/dexpiParser.js";
 import { parseProfileConstraints, runFullValidation, exportCSV } from "./src/validation.js";
 
 // ── Polyfill DOMParser globally so src/ modules can call `new DOMParser()` ───
@@ -188,6 +188,16 @@ if (profiles.length > 0) {
     console.log(`Loaded ${profiles.length} profile(s): ${profiles.map(p => p.name).join(", ")}`);
 }
 
+// ── Build external valid IDs from all loaded profiles ─────────────────────────
+// The web UI does this via collectModelValidIds() so that references to objects
+// defined in profile files (e.g. TypeCode enum values like
+// "DiscProfile/InformationModel.ControlledActuatorTypeCodes.Motor") are not
+// flagged as broken references by ERR-E09.  The CLI must do the same.
+const externalValidIds = new Set();
+for (const p of profiles) {
+    collectModelValidIds(p.xml).forEach(id => externalValidIds.add(id));
+}
+
 // ── Validate each file ────────────────────────────────────────────────────────
 let anyErrors = false;
 const summaryRows = [];
@@ -201,6 +211,7 @@ for (const xmlFile of xmlFiles) {
         const result = parseDexpiPackage(xml, null);
         const issues = runFullValidation({
             mainXml: xml, flatTree: result.flatTree, profiles, severityConfig: {},
+            externalValidIds,
         });
 
         const errors   = issues.filter(i => i.severity === "Error").length;
@@ -236,17 +247,6 @@ if (xmlFiles.length > 1 || summaryOnly) {
     console.log(line);
     for (const r of summaryRows) {
         const name = r.file.length > W - 1 ? r.file.slice(0, W - 4) + "..." : r.file;
-        console.log(`${name.padEnd(W)} ${String(r.errors).padStart(7)} ${String(r.warnings).padStart(9)} ${String(r.infos).padStart(5)}`);
-    }
-    console.log(line);
-    const totE = summaryRows.reduce((s, r) => s + r.errors,   0);
-    const totW = summaryRows.reduce((s, r) => s + r.warnings, 0);
-    const totI = summaryRows.reduce((s, r) => s + r.infos,    0);
-    console.log(`${"TOTAL".padEnd(W)} ${String(totE).padStart(7)} ${String(totW).padStart(9)} ${String(totI).padStart(5)}`);
-}
-
-process.exit(anyErrors ? 1 : 0);
-gth > W - 1 ? r.file.slice(0, W - 4) + "..." : r.file;
         console.log(`${name.padEnd(W)} ${String(r.errors).padStart(7)} ${String(r.warnings).padStart(9)} ${String(r.infos).padStart(5)}`);
     }
     console.log(line);

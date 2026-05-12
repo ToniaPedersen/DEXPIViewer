@@ -23,6 +23,8 @@ dist-ssr
 *.sln
 *.sw?
 
+*.timestamp-*.mjs
+
 .vs/
 bin/
 obj/
@@ -35,3 +37,5 @@ ValidationErrTestFiles/
 
 LICENSE
 NOTICE
+DEXPI Test/
+DISC Test/

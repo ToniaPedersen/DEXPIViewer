@@ -2,9 +2,9 @@
 // Implements: VAL-001..005, VAX-001..005, VAE-001..006, PRF-001..007, ERR-E01..E19, RPT-001..004
 
 import { DEXPI_ALL_TYPES, DEXPI_STD_PREFIXES as _DEXPI_STD_PREFIXES } from "./dexpiTypes.js";
-// Compact Plant.xml class hierarchy (auto-generated, 14 KB vs 695 KB raw).
-// Regenerate with: node scripts/genPlantHierarchy.mjs
-import { PLANT_CLASS_SUPERTYPES } from "./plantHierarchy.js";
+// Auto-generated meta-model data for Plant (P&ID) and Process (PFD/PBD).
+// Regenerate: python3 scripts/genMetaModel.py
+import { PLANT_HIERARCHY, PLANT_PROPS, PROCESS_HIERARCHY, PROCESS_PROPS } from "./metaModel.js";
 
 // ─── Connection-point margin (fraction of drawing bounding-box per axis) ──────
 // The NodePosition in the drawing must be within this fraction of the drawing
@@ -18,7 +18,7 @@ export const CONNECTION_MARGIN_Y_PCT = 0.005;
 
 export const DEFAULT_SEVERITIES = {
     "VAL-001": { level: "Error",   score: 3 },
-    "VAL-004": { level: "Warning", score: 2 },
+    "VAL-004": { level: "Info",    score: 1 },
     "VAL-005": { level: "Error",   score: 3 },
     "VAX-001": { level: "Warning", score: 2 },
     "VAX-002": { level: "Warning", score: 2 },
@@ -39,7 +39,7 @@ export const DEFAULT_SEVERITIES = {
     "PRF-E01": { level: "Error",   score: 3 },
     "PRF-E02": { level: "Error",   score: 3 },
     "PRF-E04": { level: "Error",   score: 3 },
-    "PRF-E05": { level: "Error",   score: 3 },
+    "PRF-E05": { level: "Warning", score: 2 },
 };
 
 export function resolveSeverity(ruleId, severityConfig) {
@@ -66,6 +66,117 @@ function getDataText(obj, property) {
     if (!data) return null;
     const child = data.firstElementChild;
     return child ? child.textContent.trim() : null;
+}
+
+// ─── Meta-Model Validator ───────────────────────────────────────────────────────────────────
+//
+// Builds runtime lookup from the compact metaModel.js tables.
+// classPropMap: classSuffix → {
+//   d:  Set<propName>,            // allowed Data property names
+//   c:  Set<propName>,            // allowed Components property names
+//   r:  Set<propName>,            // allowed References property names
+//   dm: Map<propName,{lo,up}>,    // multiplicity for Data props
+//   cm: Map<propName,{lo,up}>,    // multiplicity for Components props
+//   rm: Map<propName,{lo,up}>,    // multiplicity for References props
+// }
+// lo = lower bound (int), up = upper bound (int) or null (unbounded).
+// Inheritance is computed once via fixpoint and cached.
+
+function buildMetaModelLookup(hierarchyPairs, propRows) {
+    // Parse "name:L:U" entries from a pipe-separated CSV string.
+    // Returns { set: Set<name>, mul: Map<name,{lo,up}> }
+    function parsePropCsv(csv) {
+        const set = new Set();
+        const mul = new Map();
+        if (!csv) return { set, mul };
+        for (const entry of csv.split("|")) {
+            if (!entry) continue;
+            const parts = entry.split(":");
+            const name = parts[0];
+            if (!name) continue;
+            const lo = parts.length > 1 && parts[1] !== "" ? parseInt(parts[1], 10) : 0;
+            const up = parts.length > 2 ? (parts[2] === "" ? null : parseInt(parts[2], 10)) : null;
+            set.add(name);
+            mul.set(name, { lo, up });
+        }
+        return { set, mul };
+    }
+
+    const hier = new Map();
+    for (const [cls, sup] of hierarchyPairs) {
+        if (!hier.has(cls)) hier.set(cls, new Set());
+        hier.get(cls).add(sup);
+    }
+
+    const direct = new Map();
+    for (const [cls, dcsv, ccsv, rcsv] of propRows) {
+        const dp = parsePropCsv(dcsv);
+        const cp = parsePropCsv(ccsv);
+        const rp = parsePropCsv(rcsv);
+        direct.set(cls, {
+            d: dp.set, dm: dp.mul,
+            c: cp.set, cm: cp.mul,
+            r: rp.set, rm: rp.mul,
+        });
+    }
+
+    // Fixpoint: propagate parent props (names + multiplicity) to subclasses.
+    // Child's own declaration takes precedence over inherited one.
+    let changed = true;
+    while (changed) {
+        changed = false;
+        for (const [cls, supers] of hier) {
+            if (!direct.has(cls)) {
+                direct.set(cls, {
+                    d: new Set(), dm: new Map(),
+                    c: new Set(), cm: new Map(),
+                    r: new Set(), rm: new Map(),
+                });
+            }
+            const entry = direct.get(cls);
+            for (const sup of supers) {
+                const supEntry = direct.get(sup);
+                if (!supEntry) continue;
+                for (const [k, mk] of [["d","dm"], ["c","cm"], ["r","rm"]]) {
+                    for (const [prop, mul] of supEntry[mk]) {
+                        if (!entry[k].has(prop)) {
+                            entry[k].add(prop);
+                            entry[mk].set(prop, mul);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return { classPropMap: direct, hierarchy: hier };
+}
+
+// Detect document meta-model from Import elements.
+// Returns "Plant" (P&ID), "Process" (PFD/PBD), or "Unknown".
+function detectMetaModel(doc) {
+    for (const imp of doc.querySelectorAll("Import")) {
+        const src = imp.getAttribute("source") || "";
+        if (src.includes("Plant.xml"))   return "Plant";
+        if (src.includes("Process.xml")) return "Process";
+    }
+    if (doc.querySelector('Object[type^="Plant/"]'))   return "Plant";
+    if (doc.querySelector('Object[type^="Process/"]')) return "Process";
+    return "Unknown";
+}
+
+// Module-level cache — built once per session
+let _plantLookup = null, _processLookup = null;
+function getMetaModelLookup(modelName) {
+    if (modelName === "Plant") {
+        if (!_plantLookup)   _plantLookup   = buildMetaModelLookup(PLANT_HIERARCHY,   PLANT_PROPS);
+        return _plantLookup;
+    }
+    if (modelName === "Process") {
+        if (!_processLookup) _processLookup = buildMetaModelLookup(PROCESS_HIERARCHY, PROCESS_PROPS);
+        return _processLookup;
+    }
+    return null;
 }
 
 // ─── Base Validation (VAL) ────────────────────────────────────────────────────
@@ -206,7 +317,7 @@ const EQUIPMENT_TYPES_FOR_E17 = [
     "FlowInSignalOffPageConnector","FlowOutSignalOffPageConnector","Note",
 ];
 
-export function runXmlSchemaValidation(mainXml, flatTree, severityConfig, externalValidIds = new Set(), profileTypes = new Set()) {
+export function runXmlSchemaValidation(mainXml, flatTree, severityConfig, externalValidIds = new Set(), profileTypes = new Set(), profileExtProps = new Set()) {
     const issues = [];
     const parser = new DOMParser();
     const doc = parser.parseFromString(mainXml, "application/xml");
@@ -393,10 +504,10 @@ export function runXmlSchemaValidation(mainXml, flatTree, severityConfig, extern
                 suggestedCorrection: "Declare a matching Import element or use a type from the DEXPI 2.0 Plant Meta Model."
             });
         } else if (DEXPI_STD_PREFIXES.has(typePrefix) && !KNOWN_DEXPI_TYPES.has(t)) {
-            // Standard DEXPI prefix but class not in registry — always Warning (registry may be incomplete)
+            // Standard DEXPI prefix but class not in registry
             issues.push({
                 objectId: objId, objectType: t, ruleId: "ERR-E07",
-                severity: "Warning", score: 2,
+                severity: sev.level, score: sev.score,
                 description: `Object type '${t}' has a standard DEXPI prefix but is not in the type registry. It may be a valid DEXPI 2.0 type — add it to dexpiTypes.js to suppress this warning.`,
                 location: objId !== "(no id)" ? `//*[@id='${objId}']` : `//Object[@type='${t}']`,
                 profileSource: "Base",
@@ -405,6 +516,133 @@ export function runXmlSchemaValidation(mainXml, flatTree, severityConfig, extern
         }
         // else: non-standard prefix declared as import (profile type) — prefix check is sufficient
     });
+
+    // ERR-E07 (expanded): validate Data / Components / References property names
+    // against the DEXPI 2.0 meta model for this document’s model type.
+    // Only bare property names are checked (unprefixed). Prefixed properties
+    // (e.g. "DiscProfile/TagType") come from profiles/extensions and are allowed.
+    {
+        const modelName  = detectMetaModel(doc);
+        const mmLookup   = getMetaModelLookup(modelName);
+        if (mmLookup) {
+            const { classPropMap } = mmLookup;
+            const localProp = p => (p || "").split(/[\.\//]/).pop();
+
+            doc.querySelectorAll("Object[type]").forEach(obj => {
+                const t = obj.getAttribute("type") || "";
+                if (!t) return;
+                if (profileTypes.has(t)) return; // profile-defined type: skip
+                const typeSuffix = t.split(/[\.\//]/).pop();
+                const allowed = classPropMap.get(typeSuffix);
+                if (!allowed) return; // unknown class: already handled by type-check above
+
+                const objId = obj.getAttribute("id") || "(no id)";
+                const loc   = objId !== "(no id)" ? `//*[@id='${objId}']` : `//Object[@type='${t}']`;
+
+                for (const child of obj.children) {
+                    const prop  = child.getAttribute("property") || "";
+                    const local = localProp(prop);
+                    if (!local) continue;
+                    // Prefixed properties (containing "/" or ".") come from profiles
+                    // or meta-data conventions — skip.
+                    if (prop.includes("/") || prop.includes(".")) continue;
+                    // Allow bare properties added by any loaded profile's ClassExtension.
+                    if (profileExtProps.has(local)) continue;
+
+                    let kind = null, set = null;
+                    if (child.tagName === "Data")       { kind = "Data";       set = allowed.d; }
+                    else if (child.tagName === "Components") { kind = "Components"; set = allowed.c; }
+                    else if (child.tagName === "References") { kind = "References"; set = allowed.r; }
+                    if (!set || set.has(local)) continue;
+
+                    const propSev = resolveSeverity("ERR-E07", severityConfig);
+                    issues.push({
+                        objectId: objId, objectType: t, ruleId: "ERR-E07",
+                        severity: propSev.level, score: propSev.score,
+                        description: `${kind} property '${prop}' is not defined for class '${t}' in the DEXPI 2.0 ${modelName} Meta Model (including inherited properties). ` +
+                                     `If this is a profile extension, use a namespaced form (e.g. 'DiscProfile/${prop}').`,
+                        location: loc,
+                        profileSource: "Base",
+                        suggestedCorrection: `Check the property name against the DEXPI 2.0 ${modelName} Meta Model, or prefix it with the profile namespace.`
+                    });
+                }
+            });
+
+            // ── ERR-E07 multiplicity sub-checks ──────────────────────────────
+            // For every Object whose type is known to the meta-model, verify:
+            //   (a) required properties (lo >= 1) are present
+            //   (b) bounded properties (up = 1) do not appear more than once
+            // Only bare (unprefixed) property names are examined; prefixed ones
+            // come from profiles/extensions and are out of scope here.
+            doc.querySelectorAll("Object[type]").forEach(obj => {
+                const t = obj.getAttribute("type") || "";
+                if (!t || profileTypes.has(t)) return;
+
+                // Skip diagram/graphical representation objects entirely.
+                // Types in */Diagram.* packages (e.g. Core/Diagram.PolyLine,
+                // Plant/Diagram.PipingNodePosition) are structural/geometric elements
+                // whose meta-model multiplicity (e.g. PolyLine.Points lower=2) counts
+                // entries *within* an AggregatedDataValue array, not the number of
+                // sibling Data elements.  Our element-count approach cannot handle array
+                // semantics, so these objects would generate false positives.
+                if (t.includes("/Diagram.")) return;
+
+                const typeSuffix = t.split(/[\.\//]/).pop();
+                const allowed = classPropMap.get(typeSuffix);
+                if (!allowed) return;
+
+                const objId = obj.getAttribute("id") || "(no id)";
+                const loc   = objId !== "(no id)" ? `//*[@id='${objId}']` : `//Object[@type='${t}']`;
+                const sev   = resolveSeverity("ERR-E07", severityConfig);
+
+                // Count bare occurrences of each (tagName, propName) pair
+                const propCounts = new Map(); // key: "Data:Name" | "Components:Name" | "References:Name"
+                for (const child of obj.children) {
+                    const tag = child.tagName;
+                    if (tag !== "Data" && tag !== "Components" && tag !== "References") continue;
+                    const prop  = child.getAttribute("property") || "";
+                    if (prop.includes("/") || prop.includes(".")) continue; // prefixed → skip
+                    const local = localProp(prop);
+                    if (!local) continue;
+                    const key = `${tag}:${local}`;
+                    propCounts.set(key, (propCounts.get(key) || 0) + 1);
+                }
+
+                for (const [mk, tagName] of [["dm","Data"], ["cm","Components"], ["rm","References"]]) {
+                    const mulMap = allowed[mk];
+                    if (!mulMap) continue;
+                    for (const [propName, mul] of mulMap) {
+                        if (profileExtProps.has(propName)) continue;
+                        const count = propCounts.get(`${tagName}:${propName}`) || 0;
+
+                        // (a) Required but absent
+                        if (mul.lo >= 1 && count < mul.lo) {
+                            issues.push({
+                                objectId: objId, objectType: t, ruleId: "ERR-E07",
+                                severity: sev.level, score: sev.score,
+                                description: `Required ${tagName} property '${propName}' is missing on '${t}' ` +
+                                    `(lower bound = ${mul.lo} per the DEXPI 2.0 ${modelName} Meta Model).`,
+                                location: loc, profileSource: "Base",
+                                suggestedCorrection: `Add ${tagName} property '${propName}' with at least ${mul.lo} value(s).`
+                            });
+                        }
+
+                        // (b) Bounded but duplicated (up = 1, count > 1)
+                        if (mul.up !== null && count > mul.up) {
+                            issues.push({
+                                objectId: objId, objectType: t, ruleId: "ERR-E07",
+                                severity: sev.level, score: sev.score,
+                                description: `${tagName} property '${propName}' on '${t}' appears ${count} time(s) ` +
+                                    `but the DEXPI 2.0 ${modelName} Meta Model allows at most ${mul.up}.`,
+                                location: loc, profileSource: "Base",
+                                suggestedCorrection: `Remove the duplicate ${tagName} '${propName}' entry, keeping only one.`
+                            });
+                        }
+                    }
+                }
+            });
+        }
+    }
 
     // ERR-E08: Object placed under incompatible parent Components property
     doc.querySelectorAll("Components").forEach(comp => {
@@ -1107,10 +1345,10 @@ function buildProfileAttributeMap(profileXmlList) {
     // classSuffix → Set<attr locals declared directly on it>
     const classAttrs  = new Map();
 
-    // Seed the hierarchy from the pre-built Plant.xml class table so that
-    // Plant-model types (e.g. ButterflyValve → OperatedValve) are known
-    // without bundling the full 695 KB Plant.xml at runtime.
-    for (const [cls, sup] of PLANT_CLASS_SUPERTYPES) {
+    // Seed hierarchy from the Plant meta-model so Plant-model types
+    // (e.g. ButterflyValve → OperatedValve) are available for ERR-E18
+    // attribute inheritance without bundling the full Plant.xml.
+    for (const [cls, sup] of PLANT_HIERARCHY) {
         if (!hierarchy.has(cls)) hierarchy.set(cls, new Set());
         hierarchy.get(cls).add(sup);
     }
@@ -1514,9 +1752,13 @@ export function runProfileValidation(flatTree, mergedConstraints, overrideLog, s
 function parseProfileSymbols(profileXml) {
     const symbolUsage = new Map();
     const symbolNodes = new Map();
+    // Auxiliary NodePositions (Type = Profile/NodePositionType.Auxiliary) represent
+    // actuator/valve-operator connection points. A PipingNodePosition in the drawing
+    // must NOT align with these — pipes cannot attach to actuator ports.
+    const auxiliaryNodes = new Map();
     const parser = new DOMParser();
     const doc = parser.parseFromString(profileXml, "application/xml");
-    if (doc.querySelector("parsererror")) return { symbolUsage, symbolNodes, typeToSymbols: new Map() };
+    if (doc.querySelector("parsererror")) return { symbolUsage, symbolNodes, auxiliaryNodes, typeToSymbols: new Map() };
 
     doc.querySelectorAll('Object[type="Profile/Symbol"]').forEach(sym => {
         const name = sym.getAttribute("name");
@@ -1537,6 +1779,7 @@ function parseProfileSymbols(profileXml) {
 
         // NodePositions are inside Profile/SymbolVariant children
         const nodes = [];
+        const auxNodes = [];
         sym.querySelectorAll('Object[type="Profile/SymbolVariant"]').forEach(variant => {
             variant.querySelectorAll('Object[type="Profile/NodePosition"]').forEach(np => {
                 let x = null, y = null, dir = null, npType = null;
@@ -1561,14 +1804,21 @@ function parseProfileSymbols(profileXml) {
                         if (dr) npType = dr.getAttribute("data") || null;
                     }
                 }
-                // Only store Piping-type NodePositions — Label and Instrumentation types
-                // represent label anchors / instrument loop connections that are not
-                // checked against PipingNodePositions in the drawing.
-                const isPiping = npType === null || npType === "Profile/NodePositionType.Piping";
-                if (x !== null && y !== null && isPiping) nodes.push({ x, y, dir: dir ?? 0 });
+                if (x === null || y === null) return;
+                const isPiping    = npType === null || npType === "Profile/NodePositionType.Piping";
+                const isAuxiliary = npType === "Profile/NodePositionType.Auxiliary";
+                // Piping-type NodePositions: the legal pipe-connection points.
+                if (isPiping)    nodes.push({ x, y, dir: dir ?? 0 });
+                // Auxiliary NodePositions: actuator/operator ports — piping must NOT connect here.
+                // Store separately so the validator can issue a targeted PRF-E05 sub-message.
+                if (isAuxiliary) auxNodes.push({ x, y, dir: dir ?? 0 });
+                // Label / Instrumentation types are intentionally skipped — instrument
+                // balloon nodes can be spatially far from the symbol body, making
+                // distance checks meaningless for them.
             });
         });
-        if (nodes.length) symbolNodes.set(name, nodes);
+        if (nodes.length)    symbolNodes.set(name, nodes);
+        if (auxNodes.length) auxiliaryNodes.set(name, auxNodes);
     });
 
     // Build reverse map: dexpi-type → Set<symbolName> (non-decorator symbols only)
@@ -1581,7 +1831,7 @@ function parseProfileSymbols(profileXml) {
         });
     });
 
-    return { symbolUsage, symbolNodes, typeToSymbols };
+    return { symbolUsage, symbolNodes, auxiliaryNodes, typeToSymbols };
 }
 
 /**
@@ -1606,7 +1856,7 @@ export function validateSymbolRules(mainXml, profileXml, profileName, severityCo
     const issues = [];
     if (!mainXml || !profileXml) return issues;
 
-    const { symbolUsage, symbolNodes, typeToSymbols } = parseProfileSymbols(profileXml);
+    const { symbolUsage, symbolNodes, auxiliaryNodes, typeToSymbols } = parseProfileSymbols(profileXml);
 
     // Combined symbol set across all loaded profiles — used by PRF-E04 to avoid
     // false positives when a SymbolUsage references a symbol defined in a different
@@ -1615,7 +1865,7 @@ export function validateSymbolRules(mainXml, profileXml, profileName, severityCo
     const allKnownSymbols = new Set(symbolUsage.keys());
     for (const xml of allProfileXmlStrings) {
         if (!xml || xml === profileXml) continue;
-        const { symbolUsage: otherSymbols } = parseProfileSymbols(xml);
+        const { symbolUsage: otherSymbols } = parseProfileSymbols(xml); // auxiliaryNodes not needed for cross-profile symbol lookup
         for (const name of otherSymbols.keys()) allKnownSymbols.add(name);
     }
     const parser = new DOMParser();
@@ -1630,7 +1880,7 @@ export function validateSymbolRules(mainXml, profileXml, profileName, severityCo
 
     // Compute drawing bounding box from all Position elements
     let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-    doc.querySelectorAll('Data[property="Position"] AggregatedDataValue').forEach(agv => {
+    doc.querySelectorAll('Data[property="Position"] > AggregatedDataValue').forEach(agv => {
         for (const d of agv.children) {
             const v = d.querySelector("Double");
             if (!v) continue;
@@ -1791,25 +2041,34 @@ export function validateSymbolRules(mainXml, profileXml, profileName, severityCo
 
         // ── PRF-E05: NodePositions must align with profile connection points ─────
         const profileNodeList = symbolNodes.get(symName);
-        if (!profileNodeList || profileNodeList.length === 0) return;
+        const profileAuxList  = auxiliaryNodes.get(symName) || [];
+        // A symbol with no piping connection points at all cannot be checked.
+        if ((!profileNodeList || profileNodeList.length === 0) && profileAuxList.length === 0) return;
 
-        // Transform profile NodePositions from symbol-local to world coordinates
-        // (symbol-local, Y-up math convention) to drawing world coordinates (Y-down SVG convention).
-        // Because the drawing Y axis is inverted relative to the profile's local Y axis,
-        // the Y component of the rotation uses negated signs:
+        // Transform both piping and auxiliary NodePositions from symbol-local to world
+        // coordinates (Y-down SVG convention):
         //   world.x = posX + lx·cos − ly·sin  (unchanged)
-        //   world.y = posY − lx·sin − ly·cos  (Y-axis negated)
+        //   world.y = posY − lx·sin − ly·cos  (Y-axis negated relative to symbol-local)
         const rad = (rotation * Math.PI) / 180;
         const cos = Math.cos(rad), sin = Math.sin(rad);
-        const worldNodes = profileNodeList.map(np => {
+        const toWorld = np => {
             let lx = np.x * scaleX;
             let ly = np.y * scaleY;
             if (isMirrored) lx = -lx;
-            return {
-                x: posX + lx * cos - ly * sin,
-                y: posY - lx * sin - ly * cos,   // Y-down: negate both sin and cos terms
-            };
-        });
+            return { x: posX + lx * cos - ly * sin, y: posY - lx * sin - ly * cos };
+        };
+        // Deduplicate world-coordinate lists (multiple identical variants in the profile
+        // can produce repeated entries for the same physical connection point).
+        const dedupWorld = arr => {
+            const seen = new Set();
+            return arr.filter(w => {
+                const key = `${w.x.toFixed(4)},${w.y.toFixed(4)}`;
+                if (seen.has(key)) return false;
+                seen.add(key); return true;
+            });
+        };
+        const worldNodes    = dedupWorld((profileNodeList || []).map(toWorld));
+        const worldAuxNodes = dedupWorld(profileAuxList.map(toWorld));
 
         // Check only Piping-type NodePositions in direct sub-RepresentationGroups.
         // Instrumentation and Label NodePositions are intentionally excluded: instrument
@@ -1831,12 +2090,36 @@ export function validateSymbolRules(mainXml, profileXml, profileName, severityCo
                 const { px: npX, py: npY } = getPos(npObj);
                 if (npX === null || npY === null) continue;
 
-                const nearEnough = worldNodes.some(
-                    wn => Math.abs(npX - wn.x) <= marginX && Math.abs(npY - wn.y) <= marginY
-                );
-                if (!nearEnough) {
-                    const sev = resolveSeverity("PRF-E05", severityConfig);
-                    const expected = worldNodes.map(w => `(${w.x.toFixed(2)}, ${w.y.toFixed(2)})`).join(", ");
+                const withinMargin = (wn) => Math.abs(npX - wn.x) <= marginX && Math.abs(npY - wn.y) <= marginY;
+                const nearPiping   = worldNodes.some(withinMargin);
+                if (nearPiping) continue; // ✓ correctly connected to a piping port
+
+                const nearAuxiliary = worldAuxNodes.some(withinMargin);
+                const sev = resolveSeverity("PRF-E05", severityConfig);
+
+                if (nearAuxiliary) {
+                    // PRF-E05 sub-type: pipe is connected to an Auxiliary (actuator) port.
+                    // Auxiliary ports are intended for valve-operator connections only;
+                    // piping must not be routed to them.
+                    const pipingExpected = worldNodes.map(w => `(${w.x.toFixed(2)}, ${w.y.toFixed(2)})`).join(", ");
+                    issues.push({
+                        objectId:    representsId || "(unknown)",
+                        objectType:  modelType,
+                        ruleId:      "PRF-E05",
+                        severity:    sev.level,
+                        score:       sev.score,
+                        description: `NodePosition '${npId}' at (${npX}, ${npY}) is connected to an Auxiliary ` +
+                                     `(actuator/operator) port of symbol '${symName}'. ` +
+                                     `Auxiliary ports are reserved for valve-operator connections; ` +
+                                     `piping connections must use the designated piping ports. ` +
+                                     `Expected piping ports: ${pipingExpected}.`,
+                        location:    `//*[@id='${npId}']`,
+                        profileSource: profileName,
+                        suggestedCorrection: `Move NodePosition '${npId}' to one of the designated piping ports: ${pipingExpected}.`,
+                    });
+                } else {
+                    // PRF-E05: PipingNodePosition is not near any profile connection point at all.
+                    const allExpected = [...worldNodes, ...worldAuxNodes].map(w => `(${w.x.toFixed(2)}, ${w.y.toFixed(2)})`).join(", ");
                     issues.push({
                         objectId:    representsId || "(unknown)",
                         objectType:  modelType,
@@ -1845,10 +2128,10 @@ export function validateSymbolRules(mainXml, profileXml, profileName, severityCo
                         score:       sev.score,
                         description: `NodePosition '${npId}' at (${npX}, ${npY}) does not align with any ` +
                                      `profile connection point of symbol '${symName}' placed at (${posX}, ${posY}). ` +
-                                     `Expected: ${expected}. Margin: ±(${marginX.toFixed(2)}, ${marginY.toFixed(2)}).`,
+                                     `Expected: ${allExpected}. Margin: ±(${marginX.toFixed(2)}, ${marginY.toFixed(2)}).`,
                         location:    `//*[@id='${npId}']`,
                         profileSource: profileName,
-                        suggestedCorrection: `Move NodePosition '${npId}' to one of: ${expected}.`,
+                        suggestedCorrection: `Move NodePosition '${npId}' to one of: ${allExpected}.`,
                     });
                 }
             }
@@ -1887,7 +2170,27 @@ export function runFullValidation({ mainXml, flatTree, profiles, severityConfig,
     });
 
     allIssues.push(...runBaseValidation(mainXml, flatTree, severityConfig, externalValidIds));
-    allIssues.push(...runXmlSchemaValidation(mainXml, flatTree, severityConfig, externalValidIds, profileTypes));
+    // Collect all bare DataProperty / CompositionProperty / ReferenceProperty names
+    // declared in loaded profile ClassExtensions and ConcreteClasses.
+    // Used by ERR-E07 to avoid flagging valid profile-extended properties.
+    const profileExtProps = new Set();
+    allProfileXmls.forEach(p => {
+        if (!p.xml) return;
+        const parser = new DOMParser();
+        const profileDoc = parser.parseFromString(p.xml, "application/xml");
+        ["ClassExtension","ConcreteClass","AbstractClass"].forEach(tag => {
+            profileDoc.querySelectorAll(tag).forEach(cls => {
+                ["DataProperty","CompositionProperty","ReferenceProperty"].forEach(pt => {
+                    cls.querySelectorAll(pt).forEach(dp => {
+                        const pn = dp.getAttribute("name") || "";
+                        if (pn && !pn.includes("/") && !pn.includes(".")) profileExtProps.add(pn);
+                    });
+                });
+            });
+        });
+    });
+
+    allIssues.push(...runXmlSchemaValidation(mainXml, flatTree, severityConfig, externalValidIds, profileTypes, profileExtProps));
     allIssues.push(...runStructuralValidation(flatTree, severityConfig));
     allIssues.push(...runEngineeringValidation(flatTree, severityConfig));
     // ERR-E18 / ERR-E19 from the DEXPI 2.0 metamodel — runs without any profile loaded
