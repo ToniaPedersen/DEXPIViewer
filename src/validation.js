@@ -227,21 +227,8 @@ export function runBaseValidation(mainXml, flatTree, severityConfig, externalVal
     flatTree.forEach(node => {
         const loc = node.objectId ? `//*[@id='${node.objectId}']` : `(type: ${node.type})`;
 
-        // VAL-004: Missing IDs on model elements
-        const isModelElement = node.type &&
-            !node.type.startsWith("Core/Diagram") &&
-            !node.type.includes("PersistentIdentifier") &&
-            !node.type.includes("Label");
-        if (isModelElement && !node.objectId) {
-            const sev = resolveSeverity("VAL-004", severityConfig);
-            issues.push({
-                objectId: "(no id)", objectType: node.type, ruleId: "VAL-004",
-                severity: sev.level, score: sev.score,
-                description: `Object of type '${node.type}' has no id attribute. Persistent identification is required.`,
-                location: loc, profileSource: "Base",
-                suggestedCorrection: "Add a unique id attribute to this object."
-            });
-        }
+        // VAL-004: Missing id check — moved to runDiscProfileGraphicalValidation.
+        // Only applies when a DISC profile is loaded (this is a DISC-specific rule).
 
         // VAL-005: Referential integrity (skip known cross-file model references)
         node.refs.forEach(ref => {
@@ -2141,6 +2128,173 @@ export function validateSymbolRules(mainXml, profileXml, profileName, severityCo
     return issues;
 }
 
+// ─── DISC Profile: Graphical Representation Check (VAL-004) ──────────────────
+//
+// Builds the complete set of descendant type-suffixes for a list of base types
+// using the Plant meta-model inheritance pairs [[childSuffix, parentSuffix], ...].
+// Returns a Set that includes the base types themselves plus all subtypes.
+function buildDescendantSet(baseTypes, hierarchyPairs) {
+    const descendants = new Set(baseTypes);
+    // Build parent → children map for BFS expansion
+    const childrenOf = new Map();
+    for (const [child, parent] of hierarchyPairs) {
+        if (!childrenOf.has(parent)) childrenOf.set(parent, new Set());
+        childrenOf.get(parent).add(child);
+    }
+    const queue = [...baseTypes];
+    while (queue.length) {
+        const t = queue.shift();
+        for (const c of (childrenOf.get(t) || [])) {
+            if (!descendants.has(c)) { descendants.add(c); queue.push(c); }
+        }
+    }
+    return descendants;
+}
+
+// Lazily-computed Group 1 type set (PlantStructureItem, Note + all subtypes).
+// Used by runDiscProfileGraphicalValidation for both the missing-id check and
+// the graphical representation check (DISC profile only).
+let _val004Group1Cache = null;
+function getVal004Group1() {
+    if (!_val004Group1Cache) {
+        _val004Group1Cache = buildDescendantSet(
+            ["PlantStructureItem", "Note"],
+            PLANT_HIERARCHY
+        );
+    }
+    return _val004Group1Cache;
+}
+
+// VAL-004 — only runs when a DISC Profile is loaded (DISC-specific rule).
+//
+// Performs two checks:
+//   1. Missing id attribute — Group 1 types (PlantStructureItem, Note + subtypes)
+//      must always have a persistent id.
+//   2. Missing graphical representation — Group 1 types must always be drawn;
+//      Group 2 types (equipment, instruments, piping, off-page connectors, etc.)
+//      must be drawn if they have a graphical RepresentationGroup.
+//
+// Returns Info-severity issues for each failing object.
+function runDiscProfileGraphicalValidation(mainXml, flatTree, severityConfig) {
+    const issues = [];
+
+    // Collect all object IDs that are the target of a Represents reference
+    // in the graphical layer.
+    const representedIds = new Set();
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(mainXml, "application/xml");
+    if (doc.querySelector("parsererror")) return issues;
+    doc.querySelectorAll('References[property="Represents"]').forEach(ref => {
+        (ref.getAttribute("objects") || "").split(/\s+/)
+            .filter(t => t.startsWith("#"))
+            .forEach(t => representedIds.add(t.slice(1)));
+    });
+
+    // ── Group 1 type set ──────────────────────────────────────────────────────────────
+    const ALWAYS_REQUIRED = getVal004Group1();
+
+    // ── VAL-004 check 1: Missing id attribute (Group 1 only, DISC profile only) ──────
+    flatTree.forEach(node => {
+        if (!node.objectId && node.type) {
+            const suffix = node.type.split(".").pop();
+            if (ALWAYS_REQUIRED.has(suffix)) {
+                const sev = resolveSeverity("VAL-004", severityConfig);
+                const loc = `(type: ${node.type})`;
+                issues.push({
+                    objectId: "(no id)", objectType: node.type, ruleId: "VAL-004",
+                    severity: sev.level, score: sev.score,
+                    description: `Object of type '${node.type}' has no id attribute. Persistent identification is required.`,
+                    location: loc, profileSource: "DISC",
+                    suggestedCorrection: "Add a unique id attribute to this object."
+                });
+            }
+        }
+    });
+
+    // ── Group 2: require graphical representation; id required only if drawn ────────
+    //
+    // Type-expansion rules (per DISC Profile specification):
+    //   "or subtypes"        → full BFS expansion through PLANT_HIERARCHY
+    //   "or direct subtypes" → only immediate children in the hierarchy (one level)
+    //   (unlabelled)         → exact type suffix match only
+    //
+    // Exact off-page connector types (leaf types in the hierarchy — no subtypes needed)
+    const OFF_PAGE_EXACT = new Set([
+        "FlowInPipeOffPageConnector",
+        "FlowOutPipeOffPageConnector",
+        "FlowInSignalOffPageConnector",
+        "FlowOutSignalOffPageConnector",
+    ]);
+
+    // Types expanded with ALL subtypes (full BFS)
+    // Note: the DEXPI meta-model base class for equipment is "ProcessEquipment",
+    // which covers Pump, Compressor, HeatExchanger, Vessel, Column, etc.
+    const WITH_ALL_SUBTYPES = buildDescendantSet(
+        ["Nozzle", "ProcessColumnComponent", "ProcessEquipment", "ProcessVesselComponent", "PipingComponent"],
+        PLANT_HIERARCHY
+    );
+    ["Nozzle", "ProcessColumnComponent", "ProcessEquipment", "ProcessVesselComponent", "PipingComponent"]
+        .forEach(t => WITH_ALL_SUBTYPES.add(t));
+
+    // Exact types with no subtype expansion.
+    // Rule: where the specification does not say "or subtypes" / "or direct subtypes",
+    // only the named class itself is checked — no descendant expansion.
+    const EXACT_ONLY = new Set([
+        "PipingNetworkSystem",
+        "ControlledActuator",
+        "ProcessInstrumentationFunction",  // exact only — no subtype qualifier given
+        "SignalConveyingFunction",          // exact only — no subtype qualifier given
+        "SignalLineFunction",               // exact only — listed separately by name
+    ]);
+
+    // Combined Group 2
+    const GROUP2 = new Set([...OFF_PAGE_EXACT, ...WITH_ALL_SUBTYPES, ...EXACT_ONLY]);
+
+    flatTree.forEach(node => {
+        if (!node.type) return;
+        const typeSuffix = node.type.split(".").pop();
+
+        // ── Group 1: always-required graphical representation ─────────────────
+        if (ALWAYS_REQUIRED.has(typeSuffix)) {
+            if (!node.objectId) return; // missing-id case handled in check 1 above
+            if (!representedIds.has(node.objectId)) {
+                const sev = resolveSeverity("VAL-004", severityConfig);
+                issues.push({
+                    objectId: node.objectId, objectType: node.type, ruleId: "VAL-004",
+                    severity: sev.level, score: sev.score,
+                    description: `Object '${node.objectId}' of type '${node.type}' has no graphical ` +
+                                 `RepresentationGroup. Per the DISC Profile, objects of this type ` +
+                                 `must be represented graphically on the P&ID.`,
+                    location: `//*[@id='${node.objectId}']`, profileSource: "Base",
+                    suggestedCorrection: `Add a RepresentationGroup with ` +
+                                 `References[@property='Represents'] pointing to '${node.objectId}'.`,
+                });
+            }
+            return;
+        }
+
+        // ── Group 2: graphical representation required; id required only if drawn ─
+        if (!GROUP2.has(typeSuffix) || !node.objectId) return;
+
+        if (!representedIds.has(node.objectId)) {
+            const sev = resolveSeverity("VAL-004", severityConfig);
+            issues.push({
+                objectId: node.objectId, objectType: node.type, ruleId: "VAL-004",
+                severity: sev.level, score: sev.score,
+                description: `Object '${node.objectId}' of type '${node.type}' has no graphical ` +
+                             `RepresentationGroup. Per the DISC Profile, objects of this type ` +
+                             `must be represented graphically on the P&ID.`,
+                location: `//*[@id='${node.objectId}']`, profileSource: "DISC",
+                suggestedCorrection: `Add a RepresentationGroup with ` +
+                             `References[@property='Represents'] pointing to '${node.objectId}'.`,
+            });
+        }
+    });
+
+    return issues;
+}
+
+
 // ─── Full Validation Run ──────────────────────────────────────────────────────
 
 export function runFullValidation({ mainXml, flatTree, profiles, severityConfig, externalValidIds = new Set(), discXml = null, discXmlName = "DiscProfile" }) {
@@ -2213,6 +2367,9 @@ export function runFullValidation({ mainXml, flatTree, profiles, severityConfig,
             if (p.xml) allIssues.push(...validateProfileContent(p.xml, p.name, severityConfig));
             if (p.xml) allIssues.push(...validateSymbolRules(mainXml, p.xml, p.name, severityConfig, allProfileXmlStrings));
         });
+        // VAL-004 (graphical representation): only meaningful when a DISC profile is active,
+        // since it checks that engineering objects required by the profile appear on the diagram.
+        allIssues.push(...runDiscProfileGraphicalValidation(mainXml, flatTree, severityConfig));
     }
 
     // Run symbol rules against the disc profile (loaded via "DiscProfile.xml" button) if it
