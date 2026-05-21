@@ -225,6 +225,9 @@
 </div>
 
 <script>
+  // Disable marked's built-in header id generation so we fully control anchor ids.
+  marked.use({ headerIds: false, mangle: false });
+
   // Fetch the markdown file (same origin — works on GitHub Pages)
   fetch('./UserGuide.md')
     .then(r => {
@@ -235,18 +238,23 @@
       const article = document.getElementById('content');
       article.innerHTML = marked.parse(md);
 
-      // Build TOC from headings inside the article
+      // Assign stable anchor ids to every h1/h2, then build the TOC sidebar.
+      // We do this AFTER rendering so we fully own the ids — marked does not set any.
       const toc = document.getElementById('toc');
-      const headings = article.querySelectorAll('h1, h2');
-      headings.forEach((h, i) => {
-        // Give each heading a stable anchor id
-        if (!h.id) {
-          h.id = 'h-' + i + '-' + h.textContent.trim()
-            .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-        }
+      const seen = {};
+      article.querySelectorAll('h1, h2').forEach(h => {
+        // Generate a slug from the heading text, deduplicated with a counter suffix.
+        const base = h.textContent.trim()
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, '-')
+          .replace(/^-+|-+$/g, '');
+        seen[base] = (seen[base] || 0) + 1;
+        h.id = seen[base] > 1 ? base + '-' + seen[base] : base;
+
         const a = document.createElement('a');
         a.href = '#' + h.id;
-        a.textContent = h.textContent.replace(/^[\d.]+\s+/, ''); // strip leading numbers
+        // Strip leading "N. " or "N.N " numbering from display text
+        a.textContent = h.textContent.replace(/^\d+[\d.]*\s+/, '');
         a.className = h.tagName === 'H2' ? 'l2' : '';
         toc.appendChild(a);
       });
