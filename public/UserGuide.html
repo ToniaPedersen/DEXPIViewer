@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DEXPI Viewer &amp; Verificator — User Guide</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+      font-size: 15px;
+      color: #24292f;
+      background: #f6f8fa;
+    }
+
+    /* ── Header bar ── */
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      background: #1b4f9b;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 10px 24px;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.25);
+    }
+    header h1 {
+      margin: 0;
+      font-size: 17px;
+      font-weight: 600;
+      flex: 1;
+    }
+    header a.back {
+      color: #c8dcf7;
+      font-size: 13px;
+      text-decoration: none;
+    }
+    header a.back:hover { color: #fff; text-decoration: underline; }
+
+    /* ── Layout ── */
+    .layout {
+      display: flex;
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 24px 16px;
+      gap: 28px;
+      align-items: flex-start;
+    }
+
+    /* ── TOC sidebar ── */
+    nav#toc {
+      flex: 0 0 220px;
+      position: sticky;
+      top: 60px;
+      max-height: calc(100vh - 80px);
+      overflow-y: auto;
+      background: #fff;
+      border: 1px solid #d0d7de;
+      border-radius: 8px;
+      padding: 14px 16px;
+      font-size: 13px;
+    }
+    nav#toc p {
+      margin: 0 0 8px;
+      font-weight: 700;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: #57606a;
+    }
+    nav#toc a {
+      display: block;
+      padding: 3px 0;
+      color: #0969da;
+      text-decoration: none;
+      line-height: 1.4;
+    }
+    nav#toc a:hover { text-decoration: underline; }
+    nav#toc a.l2 { padding-left: 12px; font-size: 12px; color: #57606a; }
+    nav#toc a.l2:hover { color: #0969da; }
+
+    /* ── Article ── */
+    article {
+      flex: 1;
+      min-width: 0;
+      background: #fff;
+      border: 1px solid #d0d7de;
+      border-radius: 8px;
+      padding: 32px 40px;
+    }
+
+    /* ── Markdown styles ── */
+    article h1 {
+      font-size: 26px;
+      font-weight: 700;
+      color: #1b4f9b;
+      border-bottom: 2px solid #2e75b6;
+      padding-bottom: 8px;
+      margin: 32px 0 16px;
+    }
+    article h1:first-child { margin-top: 0; }
+
+    article h2 {
+      font-size: 19px;
+      font-weight: 600;
+      color: #2e75b6;
+      margin: 28px 0 10px;
+      border-bottom: 1px solid #e1e4e8;
+      padding-bottom: 4px;
+    }
+
+    article h3 {
+      font-size: 16px;
+      font-weight: 600;
+      color: #24292f;
+      margin: 20px 0 8px;
+    }
+
+    article p { margin: 0 0 14px; line-height: 1.65; }
+
+    article a { color: #0969da; }
+    article a:hover { text-decoration: underline; }
+
+    article ul, article ol {
+      margin: 0 0 14px;
+      padding-left: 28px;
+    }
+    article li { margin-bottom: 4px; line-height: 1.6; }
+
+    article blockquote {
+      margin: 0 0 14px;
+      padding: 8px 14px;
+      border-left: 4px solid #2e75b6;
+      background: #f0f6ff;
+      color: #404040;
+      border-radius: 0 4px 4px 0;
+    }
+    article blockquote p { margin: 0; }
+
+    article code {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 13px;
+      background: #f0f3f6;
+      padding: 1px 5px;
+      border-radius: 4px;
+      color: #b00000;
+    }
+
+    article pre {
+      background: #f6f8fa;
+      border: 1px solid #d0d7de;
+      border-radius: 6px;
+      padding: 14px 18px;
+      overflow-x: auto;
+      margin: 0 0 16px;
+    }
+    article pre code {
+      background: none;
+      padding: 0;
+      color: #24292f;
+      font-size: 13px;
+    }
+
+    article table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 0 0 18px;
+      font-size: 14px;
+    }
+    article th {
+      background: #1b4f9b;
+      color: #fff;
+      padding: 8px 12px;
+      text-align: left;
+      font-weight: 600;
+    }
+    article td {
+      padding: 7px 12px;
+      border-bottom: 1px solid #e1e4e8;
+      vertical-align: top;
+    }
+    article tr:nth-child(even) td { background: #f0f6fa; }
+
+    article hr {
+      border: none;
+      border-top: 1px solid #d0d7de;
+      margin: 28px 0;
+    }
+
+    /* ── Loading state ── */
+    #loading {
+      text-align: center;
+      padding: 60px 0;
+      color: #57606a;
+      font-size: 15px;
+    }
+
+    @media (max-width: 768px) {
+      nav#toc { display: none; }
+      article { padding: 20px; }
+      .layout { padding: 12px; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>DEXPI Viewer &amp; Verificator — User Guide</h1>
+  <a class="back" href="./">← Back to application</a>
+</header>
+
+<div class="layout">
+  <nav id="toc">
+    <p>Contents</p>
+    <!-- populated by JS -->
+  </nav>
+  <article id="content">
+    <div id="loading">Loading guide…</div>
+  </article>
+</div>
+
+<script>
+  // Fetch the markdown file (same origin — works on GitHub Pages)
+  fetch('./UserGuide.md')
+    .then(r => {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.text();
+    })
+    .then(md => {
+      const article = document.getElementById('content');
+      article.innerHTML = marked.parse(md);
+
+      // Build TOC from headings inside the article
+      const toc = document.getElementById('toc');
+      const headings = article.querySelectorAll('h1, h2');
+      headings.forEach((h, i) => {
+        // Give each heading a stable anchor id
+        if (!h.id) {
+          h.id = 'h-' + i + '-' + h.textContent.trim()
+            .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+        }
+        const a = document.createElement('a');
+        a.href = '#' + h.id;
+        a.textContent = h.textContent.replace(/^[\d.]+\s+/, ''); // strip leading numbers
+        a.className = h.tagName === 'H2' ? 'l2' : '';
+        toc.appendChild(a);
+      });
+    })
+    .catch(err => {
+      document.getElementById('content').innerHTML =
+        '<p style="color:#cf222e">Could not load UserGuide.md: ' + err.message + '</p>';
+    });
+</script>
+</body>
+</html>

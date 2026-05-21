@@ -700,7 +700,10 @@ export default function App() {
                     <div style={S.toolbar}>
                         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
                             <div style={{ fontWeight: 700, fontSize: 15 }}>DEXPI Verificator</div>
-                            <button style={S.collapseBtn} onClick={() => setLeftCollapsed(true)}>{"<"}</button>
+                            <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+                                <button style={{ ...S.collapseBtn, fontSize: 14, fontWeight: 700, color: "#0969da", padding: "2px 7px", border: "1px solid #c7ced6", borderRadius: 4 }} title="Open User Guide" onClick={() => window.open("./UserGuide.html", "_blank", "noopener")}>?</button>
+                                <button style={S.collapseBtn} onClick={() => setLeftCollapsed(true)}>{"<"}</button>
+                            </div>
                         </div>
                         <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
                             <button style={{ ...S.btn, background: loadMode === "with-profile" ? "#eaf2ff" : "white" }} onClick={() => setLoadMode("with-profile")}>With profile</button>
