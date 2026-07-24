@@ -169,7 +169,7 @@ A legend is shown in the lower-left corner while connectivity mode is active. Di
 
 ### 5.4 Heat Trace Overlay
 
-When a DISC profile is loaded, heat-traced elements are detected automatically from the `HeatTracingType` data property. The overlay draws coloured dashed highlights on top of the main drawing:
+When a DISC profile is loaded, heat-traced elements are detected automatically from the `HeatTracingType` data property. The overlay only activates when `HeatTracingType` is `ElectricalHeatTracingSystem`, `HeatTracingSystem`, `SteamHeatTracingSystem`, or `TubularHeatTracingSystem`; the overlay draws coloured dashed highlights on top of the main drawing:
 
 - **Piping segments** — dashed overlay on connector lines.
 - **Inline components** (valves, fittings, nozzles) — dashed bounding box around the symbol.

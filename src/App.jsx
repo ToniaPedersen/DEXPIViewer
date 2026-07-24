@@ -3,8 +3,9 @@ import { parseProfileConstraints, runFullValidation, downloadCSV, resolveSeverit
 import {
     parseDexpiPackage, boundsFromElements, clampViewBox,
     findAncestors, collectDescendantObjectIds, flattenTree,
-    parseColor, collectModelValidIds,
+    parseColor, collectModelValidIds, isConnectivityRefProperty,
 } from "./dexpiParser.js";
+import { jsPDF } from "jspdf";
 
 // ---------- Data value formatting --------------------------------------------
 
@@ -59,6 +60,9 @@ const S = {
     btnSmall: { padding: "3px 7px", border: "1px solid #c7ced6", background: "white", borderRadius: 4, cursor: "pointer", fontSize: 12 },
     btnDanger: { padding: "3px 7px", border: "1px solid #cf222e", background: "white", color: "#cf222e", borderRadius: 4, cursor: "pointer", fontSize: 12 },
     input: { width: "100%", padding: "6px 8px", border: "1px solid #c7ced6", borderRadius: 6, boxSizing: "border-box", fontSize: 13 },
+    numBox: { width: 52, padding: "2px 4px", border: "1px solid #c7ced6", borderRadius: 4, boxSizing: "border-box", fontSize: 12 },
+    // Wide enough for an "nnn.nnnn" value (3 integer digits, 4 decimal places) without clipping.
+    numBoxWide: { width: 88, padding: "2px 4px", border: "1px solid #c7ced6", borderRadius: 4, boxSizing: "border-box", fontSize: 12 },
     badge: (color) => ({ display: "inline-block", padding: "2px 7px", borderRadius: 999, fontSize: 11, fontWeight: 600, background: color || "#eef2f6", color: color ? "white" : "#444" }),
     tabBar: { display: "flex", gap: 0, borderBottom: "1px solid #d0d7de", background: "#f6f8fa", flexShrink: 0 },
     tab: (active) => ({ padding: "8px 14px", cursor: "pointer", fontWeight: active ? 700 : 400, fontSize: 13, color: active ? "#0969da" : "#57606a", background: "none", border: "none", borderBottom: active ? "2px solid #0969da" : "2px solid transparent" }),
@@ -95,13 +99,14 @@ function ellipseArcToPath(cx, cy, rx, ry, startDeg, endDeg, rotation) {
 
 // ---------- SVG Rendering ----------------------------------------------------
 
-function renderPrimitive(primitive, key, textColorOverride = null) {
+function renderPrimitive(primitive, key, textColorOverride = null, strokeMult = 1) {
     const fill = v => v?.style === "Transparent" ? "none" : (v?.color || "none");
-    if (primitive.kind === "polyline") return <polyline key={key} points={primitive.points.map(p => `${p.x},${p.y}`).join(" ")} fill="none" stroke={primitive.stroke.color} strokeWidth={primitive.stroke.width} strokeDasharray={primitive.stroke.dashArray || undefined} vectorEffect="non-scaling-stroke" />;
-    if (primitive.kind === "polygon") return <polygon key={key} points={primitive.points.map(p => `${p.x},${p.y}`).join(" ")} fill={fill(primitive.fill)} stroke={primitive.stroke.color} strokeWidth={primitive.stroke.width} vectorEffect="non-scaling-stroke" />;
-    if (primitive.kind === "circle") return <circle key={key} cx={primitive.center.x} cy={primitive.center.y} r={primitive.radius} fill={fill(primitive.fill)} stroke={primitive.stroke.color} strokeWidth={primitive.stroke.width} vectorEffect="non-scaling-stroke" />;
-    if (primitive.kind === "ellipse") return <ellipse key={key} cx={primitive.center.x} cy={primitive.center.y} rx={primitive.rx} ry={primitive.ry} transform={`rotate(${primitive.rotation} ${primitive.center.x} ${primitive.center.y})`} fill={fill(primitive.fill)} stroke={primitive.stroke.color} strokeWidth={primitive.stroke.width} vectorEffect="non-scaling-stroke" />;
-    if (primitive.kind === "rect") return <rect key={key} x={primitive.center.x - primitive.width / 2} y={primitive.center.y - primitive.height / 2} width={primitive.width} height={primitive.height} transform={`rotate(${primitive.rotation} ${primitive.center.x} ${primitive.center.y})`} fill={fill(primitive.fill)} stroke={primitive.stroke.color} strokeWidth={primitive.stroke.width} vectorEffect="non-scaling-stroke" />;
+    const sw = v => v * strokeMult;
+    if (primitive.kind === "polyline") return <polyline key={key} points={primitive.points.map(p => `${p.x},${p.y}`).join(" ")} fill="none" stroke={primitive.stroke.color} strokeWidth={sw(primitive.stroke.width)} strokeDasharray={primitive.stroke.dashArray || undefined} vectorEffect="non-scaling-stroke" />;
+    if (primitive.kind === "polygon") return <polygon key={key} points={primitive.points.map(p => `${p.x},${p.y}`).join(" ")} fill={fill(primitive.fill)} stroke={primitive.stroke.color} strokeWidth={sw(primitive.stroke.width)} vectorEffect="non-scaling-stroke" />;
+    if (primitive.kind === "circle") return <circle key={key} cx={primitive.center.x} cy={primitive.center.y} r={primitive.radius} fill={fill(primitive.fill)} stroke={primitive.stroke.color} strokeWidth={sw(primitive.stroke.width)} vectorEffect="non-scaling-stroke" />;
+    if (primitive.kind === "ellipse") return <ellipse key={key} cx={primitive.center.x} cy={primitive.center.y} rx={primitive.rx} ry={primitive.ry} transform={`rotate(${primitive.rotation} ${primitive.center.x} ${primitive.center.y})`} fill={fill(primitive.fill)} stroke={primitive.stroke.color} strokeWidth={sw(primitive.stroke.width)} vectorEffect="non-scaling-stroke" />;
+    if (primitive.kind === "rect") return <rect key={key} x={primitive.center.x - primitive.width / 2} y={primitive.center.y - primitive.height / 2} width={primitive.width} height={primitive.height} transform={`rotate(${primitive.rotation} ${primitive.center.x} ${primitive.center.y})`} fill={fill(primitive.fill)} stroke={primitive.stroke.color} strokeWidth={sw(primitive.stroke.width)} vectorEffect="non-scaling-stroke" />;
     if (primitive.kind === "text") {
         const anchor = primitive.style.horizontal.toLowerCase().includes("left") ? "start" : primitive.style.horizontal.toLowerCase().includes("right") ? "end" : "middle";
         const baseline = primitive.style.vertical.toLowerCase().includes("bottom") ? "baseline" : primitive.style.vertical.toLowerCase().includes("top") ? "hanging" : "middle";
@@ -112,7 +117,7 @@ function renderPrimitive(primitive, key, textColorOverride = null) {
     }
     if (primitive.kind === "ellipseArc") {
         const d = ellipseArcToPath(primitive.center.x, primitive.center.y, primitive.rx, primitive.ry, primitive.startAngle, primitive.endAngle, primitive.rotation);
-        return <path key={key} d={d} fill="none" stroke={primitive.stroke.color} strokeWidth={primitive.stroke.width} strokeDasharray={primitive.stroke.dashArray || undefined} vectorEffect="non-scaling-stroke" />;
+        return <path key={key} d={d} fill="none" stroke={primitive.stroke.color} strokeWidth={sw(primitive.stroke.width)} strokeDasharray={primitive.stroke.dashArray || undefined} vectorEffect="non-scaling-stroke" />;
     }
     return null;
 }
@@ -131,23 +136,22 @@ function highlightPrimitive(p, key, color) {
     return null;
 }
 
-function ConnectorLineSvg({ el, nodePosMap, selected, connColor, strokeAdjust }) {
+function ConnectorLineSvg({ el, nodePosMap, selected, connColor, boostPct }) {
     const { primitive: prim } = el;
     const src = prim.sourceRef ? nodePosMap.get(prim.sourceRef) : null;
     const tgt = prim.targetRef ? nodePosMap.get(prim.targetRef) : null;
     const pts = [src, ...prim.innerPoints, tgt].filter(Boolean);
     if (pts.length < 2) return null;
     const color = connColor || (selected ? "#d1242f" : prim.stroke.color);
-    // When stroke adjustment is on, enforce a minimum of 0.5 SVG units so thin
-    // signal/instrument lines remain visible at default zoom. The dash pattern is
-    // scaled proportionally so dashes stay readable when the width is boosted.
-    const minWidth = 0.5;
+    // Line Boost: percentage multiplier on connector/centerline stroke width
+    // (100 = unchanged/no-op). The dash pattern is scaled proportionally so
+    // dashes stay readable when the width is boosted.
     const baseWidth = prim.stroke.width;
     const sw = selected
         ? Math.max(baseWidth * 2, baseWidth + 0.4)
-        : (strokeAdjust ? Math.max(baseWidth, minWidth) : baseWidth);
+        : baseWidth * (boostPct / 100);
     const rawDash = prim.stroke.dashArray || "";
-    const scaledDash = (!selected && rawDash && baseWidth > 0 && sw > baseWidth)
+    const scaledDash = (!selected && rawDash && baseWidth > 0 && sw !== baseWidth)
         ? rawDash.split(/\s+/).map(v => (parseFloat(v) * (sw / baseWidth)).toFixed(3)).join(" ")
         : rawDash;
     const mid = Math.floor(pts.length / 2);
@@ -342,7 +346,8 @@ function HeatTracePIF({ el }) {
     return <g transform={transform} pointerEvents="none">{overlays}</g>;
 }
 
-function SymbolGraphic({ el, selected, connHighlight, onSelect }) {
+function SymbolGraphic({ el, selected, connHighlight, onSelect, boostPct, boostSymbolOutlines }) {
+    const symbolStrokeMult = boostSymbolOutlines ? boostPct / 100 : 1;
     const mirror = el.isMirrored ? -1 : 1;
     const transform = `translate(${el.position.x} ${el.position.y}) rotate(${el.rotation}) scale(${el.scaleX * mirror} ${el.scaleY})`;
     const hitPad = 2.5;
@@ -367,14 +372,14 @@ function SymbolGraphic({ el, selected, connHighlight, onSelect }) {
             </g>}
             {hlColor && <g transform={transform} pointerEvents="none">{el.variant.primitives.map((p, i) => highlightPrimitive(p, `hl_${el.key}_${i}`, hlColor))}</g>}
             <g transform={transform} pointerEvents="none">
-                {el.variant.primitives.map((p, i) => renderPrimitive(p, `${el.key}_${i}`))}
+                {el.variant.primitives.map((p, i) => renderPrimitive(p, `${el.key}_${i}`, null, symbolStrokeMult))}
                 {hlColor && <rect x={el.variant.minX - 0.8} y={el.variant.minY - 0.8} width={(el.variant.maxX - el.variant.minX) + 1.6} height={(el.variant.maxY - el.variant.minY) + 1.6} fill="none" stroke={hlColor} strokeWidth={0.6} vectorEffect="non-scaling-stroke" />}
             </g>
         </g>
     );
 }
 
-function PrimitiveGraphic({ el, selected, connHighlight, onSelect, nodePosMap, strokeAdjust }) {
+function PrimitiveGraphic({ el, selected, connHighlight, onSelect, nodePosMap, boostPct, boostSymbolOutlines }) {
     const hitPad = 2.0;
     const hlColor = selected ? (connHighlight || selectionColor(el.elementRole)) : connHighlight || null;
     const prim = el.primitive;
@@ -393,8 +398,8 @@ function PrimitiveGraphic({ el, selected, connHighlight, onSelect, nodePosMap, s
             })()}
             {hlColor && el.kind !== "connectorLine" && prim?.kind !== "text" && highlightPrimitive(prim, `hl_${el.key}`, hlColor)}
             {el.kind === "connectorLine"
-                ? <ConnectorLineSvg el={el} nodePosMap={nodePosMap} selected={selected} connColor={connHighlight} strokeAdjust={strokeAdjust} />
-                : renderPrimitive(prim, el.key, prim?.kind === "text" ? hlColor : null)}
+                ? <ConnectorLineSvg el={el} nodePosMap={nodePosMap} selected={selected} connColor={connHighlight} boostPct={boostPct} />
+                : renderPrimitive(prim, el.key, prim?.kind === "text" ? hlColor : null, (boostSymbolOutlines && el.elementRole === "symbol") ? boostPct / 100 : 1)}
         </g>
     );
 }
@@ -469,6 +474,7 @@ export default function App() {
     const [rightTab, setRightTab] = useState("details");
     const [mainXmlText, setMainXmlText] = useState("");
     const [mainFileName, setMainFileName] = useState("validation-report");
+    const [mainFileFullName, setMainFileFullName] = useState("");
     const [loadMode, setLoadMode] = useState("with-profile");
     const [discXmlText, setDiscXmlText] = useState("");
     const [parsed, setParsed] = useState(null);
@@ -487,9 +493,23 @@ export default function App() {
     const [validationDone, setValidationDone] = useState(false);
     const [validationFilter, setValidationFilter] = useState("All");
     const [severityConfig, setSeverityConfig] = useState({});
+    // Connectivity checkbox: checking it SHOWS the upstream/downstream/group
+    // highlight for the selected object; unchecked (the default) hides it.
+    // See connectivityHighlight below and the legend near the drawing canvas,
+    // both of which gate on this flag alone.
     const [showConnectivity, setShowConnectivity] = useState(false);
-    const [strokeAdjust, setStrokeAdjust] = useState(true);
+    // Whether selecting an object also highlights (red) all of its
+    // sub-components in the drawing, or just the object itself - see
+    // selectedRepresentedIds below. Default false: selecting a large
+    // container (e.g. a PipingNetworkSystem or PipingNetworkSegment) no
+    // longer paints its entire subtree red by default.
+    const [selectHighlightSubComponents, setSelectHighlightSubComponents] = useState(false);
+    // Line Boost: percentage multiplier on connector/centerline stroke width.
+    // 100 = unchanged (no-op), so nothing is boosted until the user raises it.
+    const [lineBoostPct, setLineBoostPct] = useState(100);
+    const [boostSymbolOutlines, setBoostSymbolOutlines] = useState(false);
     const [spaceDown, setSpaceDown] = useState(false);
+    const [exporting, setExporting] = useState(false);
 
     const mainInputRef = useRef(null);
     const discInputRef = useRef(null);
@@ -497,6 +517,7 @@ export default function App() {
     const bgInputRef = useRef(null);
     const issueCardRefs = useRef(new Map()); // index → DOM element for validation list scroll
     const svgViewportRef = useRef(null);
+    const svgElRef = useRef(null);
 
     const issueMap = useMemo(() => {
         const m = new Map();
@@ -528,13 +549,20 @@ export default function App() {
     };
 
     const connectivityHighlight = useMemo(() => {
-        if ((!showConnectivity && rightTab !== "connectivity") || !selectedId || !parsed?.connectivityMap) return { upstream: new Set(), downstream: new Set(), group: new Set() };
+        if (!showConnectivity || !selectedId || !parsed?.connectivityMap) return { upstream: new Set(), downstream: new Set(), group: new Set() };
         return parsed.connectivityMap.get(selectedId) || { upstream: new Set(), downstream: new Set(), group: new Set() };
-    }, [showConnectivity, rightTab, selectedId, parsed]);
+    }, [showConnectivity, selectedId, parsed]);
 
     function rebuild(nextMain, nextDisc, mode) {
         if (!nextMain) return;
-        if ((mode || loadMode) === "with-profile" && !nextDisc) return;
+        if ((mode || loadMode) === "with-profile" && !nextDisc) {
+            // Silently no-op'ing here (the old behavior) left the drawing area stuck on
+            // "No drawing loaded" with no explanation whenever a DEXPI XML file was loaded
+            // before a DiscProfile.xml in "With profile" mode (the default mode). Surface
+            // the reason so the user knows to load a profile or switch to "Internal" mode.
+            setParseError('Load a DiscProfile.xml file to continue in "With profile" mode, or switch to "Internal" mode.');
+            return;
+        }
         try {
             const p = parseDexpiPackage(nextMain, (mode || loadMode) === "with-profile" ? nextDisc : "");
             const b = boundsFromElements(p.graphics);
@@ -553,6 +581,7 @@ export default function App() {
         const txt = await file.text(); setMainXmlText(txt);
         // Strip extension for CSV filename
         setMainFileName(file.name.replace(/\.[^.]+$/, ""));
+        setMainFileFullName(file.name);
         rebuild(txt, discXmlText, loadMode);
     }
     async function handleDiscFile(e) {
@@ -571,9 +600,120 @@ export default function App() {
     async function handleBgFile(e) {
         const file = e.target.files?.[0]; if (!file) return;
         const reader = new FileReader();
-        reader.onload = ev => setBgImage({ src: ev.target.result, opacity: 0.4, scale: 1, offsetX: 0, offsetY: 0, visible: true });
+        reader.onload = ev => {
+            const src = ev.target.result;
+            // Load the raw pixel dimensions so the overlay can be fit into the
+            // drawing's coordinate space (fullBounds) preserving aspect ratio,
+            // instead of guessing a scale in unrelated CSS-pixel units.
+            const probe = new Image();
+            probe.onload = () => {
+                setBgImage({
+                    src, opacity: 0.4, scale: 1, offsetX: 0, offsetY: 0, visible: true,
+                    naturalWidth: probe.naturalWidth, naturalHeight: probe.naturalHeight,
+                });
+            };
+            probe.onerror = () => {
+                setBgImage({ src, opacity: 0.4, scale: 1, offsetX: 0, offsetY: 0, visible: true, naturalWidth: 0, naturalHeight: 0 });
+            };
+            probe.src = src;
+        };
         reader.readAsDataURL(file);
         e.target.value = "";
+    }
+
+    // Export: rasterizes exactly what's currently on screen inside the SVG
+    // viewport - the DEXPI drawing plus the BG image overlay, since the overlay
+    // lives inside the same <svg viewBox=...> tree rather than as a separate
+    // HTML element. Cloning that one <svg> node is therefore enough to capture
+    // both layers together.
+    //
+    // viewBox.w/h are in the drawing's own native coordinate units, which have
+    // no fixed relationship to CSS pixels and can be arbitrarily large or small
+    // depending on the source file - multiplying them directly by a "pixel
+    // scale" could ask the browser for a many-thousand-megapixel canvas and
+    // crash the tab. Instead we target a fixed output resolution (long edge in
+    // px) regardless of the viewBox's native magnitude.
+    const EXPORT_LONG_EDGE_PX = 3000;
+
+    async function renderViewboxToCanvas() {
+        const svgEl = svgElRef.current;
+        if (!svgEl) throw new Error("Drawing is not ready yet.");
+        const clone = svgEl.cloneNode(true);
+        clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+        const aspect = viewBox.w / viewBox.h;
+        const pxW = Math.max(1, Math.round(aspect >= 1 ? EXPORT_LONG_EDGE_PX : EXPORT_LONG_EDGE_PX * aspect));
+        const pxH = Math.max(1, Math.round(aspect >= 1 ? EXPORT_LONG_EDGE_PX / aspect : EXPORT_LONG_EDGE_PX));
+        clone.setAttribute("width", String(pxW));
+        clone.setAttribute("height", String(pxH));
+
+        const svgStr = new XMLSerializer().serializeToString(clone);
+        const url = URL.createObjectURL(new Blob([svgStr], { type: "image/svg+xml;charset=utf-8" }));
+        try {
+            const img = await new Promise((resolve, reject) => {
+                const im = new Image();
+                im.onload = () => resolve(im);
+                im.onerror = () => reject(new Error("Could not rasterize the drawing for export."));
+                im.src = url;
+            });
+            const canvas = document.createElement("canvas");
+            canvas.width = pxW;
+            canvas.height = pxH;
+            const ctx = canvas.getContext("2d");
+            ctx.fillStyle = "#ffffff"; // the viewport's own background - SVG itself is transparent
+            ctx.fillRect(0, 0, pxW, pxH);
+            ctx.drawImage(img, 0, 0, pxW, pxH);
+            return canvas;
+        } finally {
+            URL.revokeObjectURL(url);
+        }
+    }
+
+    function exportFileBaseName() {
+        return (parsed?.meta?.drawingNumber || "dexpi-drawing").replace(/[\\/:*?"<>|]+/g, "_");
+    }
+
+    function downloadBlob(blob, filename) {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = filename;
+        document.body.appendChild(a); a.click(); a.remove();
+        URL.revokeObjectURL(url);
+    }
+
+    async function exportAsPng() {
+        setExporting(true);
+        try {
+            const canvas = await renderViewboxToCanvas();
+            const blob = await new Promise(resolve => canvas.toBlob(resolve, "image/png"));
+            downloadBlob(blob, `${exportFileBaseName()}.png`);
+        } catch (e) {
+            alert(e.message || String(e));
+        } finally {
+            setExporting(false);
+        }
+    }
+
+    async function exportAsPdf() {
+        setExporting(true);
+        try {
+            const canvas = await renderViewboxToCanvas();
+            const jpegData = canvas.toDataURL("image/jpeg", 0.95);
+            // Page is sized to match the exported canvas's aspect ratio (long
+            // edge fixed at 420mm/A3) - DEXPI drawing coordinates aren't
+            // reliably real-world units here, so this is a print-friendly fit
+            // rather than a dimensionally-accurate scale.
+            const aspect = canvas.width / canvas.height;
+            const longEdgeMm = 420;
+            const wMm = aspect >= 1 ? longEdgeMm : longEdgeMm * aspect;
+            const hMm = aspect >= 1 ? longEdgeMm / aspect : longEdgeMm;
+            const pdf = new jsPDF({ orientation: aspect >= 1 ? "landscape" : "portrait", unit: "mm", format: [wMm, hMm] });
+            pdf.addImage(jpegData, "JPEG", 0, 0, wMm, hMm);
+            pdf.save(`${exportFileBaseName()}.pdf`);
+        } catch (e) {
+            alert(e.message || String(e));
+        } finally {
+            setExporting(false);
+        }
     }
 
     function runValidation() {
@@ -610,13 +750,24 @@ export default function App() {
     const selectedNode = useMemo(() => parsed?.treeMap?.get(selectedId) || null, [parsed, selectedId]);
     const selectedRepresentedIds = useMemo(() => {
         if (!selectedNode) return new Set();
+        // Sub-components checkbox (see its state declaration above) is the sole
+        // gate for any red highlighting beyond the selected object itself -
+        // unchecked (the default) means ONLY selectedNode's own id is
+        // highlighted. Checked restores every tree descendant PLUS every
+        // non-connectivity Association/ref target (e.g. a TransmissionSystem's
+        // Driver reference to a Motor with no direct graphical element of its
+        // own) - connectivity refs (upstream/downstream/group) are excluded
+        // since they exist purely to drive the separate connectivity highlight
+        // colors, not to mark their target as "also selected".
+        if (!selectHighlightSubComponents) {
+            return new Set(selectedNode.objectId ? [selectedNode.objectId] : []);
+        }
         const ids = collectDescendantObjectIds(selectedNode);
-        // Also include objects directly referenced by the selected node so that
-        // Components like TransmissionSystem (which reference a Motor via Driver
-        // but have no direct graphical element) are highlighted in the SVG view.
-        selectedNode.refs.forEach(ref => ref.objects.forEach(id => { if (id) ids.add(id); }));
+        selectedNode.refs
+            .filter(ref => !isConnectivityRefProperty(ref.property))
+            .forEach(ref => ref.objects.forEach(id => { if (id) ids.add(id); }));
         return ids;
-    }, [selectedNode]);
+    }, [selectedNode, selectHighlightSubComponents]);
 
     const handleSelect = useCallback((id) => {
         if (!id) return;
@@ -687,7 +838,37 @@ export default function App() {
     const issueCounts = useMemo(() => { const c = { Error: 0, Warning: 0, Info: 0 }; validationIssues.forEach(i => { c[i.severity] = (c[i.severity] || 0) + 1; }); return c; }, [validationIssues]);
     const filteredIssues = useMemo(() => validationFilter === "All" ? validationIssues : validationIssues.filter(i => i.severity === validationFilter), [validationIssues, validationFilter]);
 
-    const bgStyle = bgImage ? { transform: `translate(${bgImage.offsetX}px, ${bgImage.offsetY}px) scale(${bgImage.scale})`, transformOrigin: "top left", opacity: bgImage.opacity, position: "absolute", top: 0, left: 0, width: "100%", height: "100%", pointerEvents: "none", display: bgImage.visible ? "block" : "none" } : {};
+    // The overlay is placed in the *drawing's* coordinate space (fullBounds),
+    // not raw CSS/screen pixels: rendering it as an <image> inside the same
+    // <svg viewBox=...> ties it to the identical transform as the drawing, so
+    // it pans/zooms in lockstep instead of drifting out of alignment as soon
+    // as the view is panned or zoomed (which a plain HTML sibling would do).
+    const boundsW = Math.max(1, fullBounds.maxX - fullBounds.minX);
+    const boundsH = Math.max(1, fullBounds.maxY - fullBounds.minY);
+    const bgPlacement = useMemo(() => {
+        if (!bgImage) return null;
+        let baseW = boundsW, baseH = boundsH, baseX = fullBounds.minX, baseY = fullBounds.minY;
+        if (bgImage.naturalWidth && bgImage.naturalHeight) {
+            // "Contain"-fit the image into fullBounds, centered, so scale=1/offset=0
+            // starts out already aligned to the drawing extents instead of an
+            // arbitrary default.
+            const imgAspect = bgImage.naturalWidth / bgImage.naturalHeight;
+            const boundsAspect = boundsW / boundsH;
+            if (imgAspect > boundsAspect) { baseW = boundsW; baseH = boundsW / imgAspect; }
+            else { baseH = boundsH; baseW = boundsH * imgAspect; }
+            baseX = fullBounds.minX + (boundsW - baseW) / 2;
+            baseY = fullBounds.minY + (boundsH - baseH) / 2;
+        }
+        return {
+            x: baseX + bgImage.offsetX,
+            y: baseY + bgImage.offsetY,
+            width: baseW * bgImage.scale,
+            height: baseH * bgImage.scale,
+        };
+    }, [bgImage, fullBounds, boundsW, boundsH]);
+    // Tints the overlay a mid-dark blue while preserving the image's original
+    // luminance/detail (mix-blend-mode "color" replaces hue+saturation only).
+    const BG_TINT_COLOR = "#1e3a5f";
 
     return (
         <div style={S.app(leftCollapsed, rightCollapsed)}>
@@ -717,6 +898,11 @@ export default function App() {
                         <input ref={mainInputRef} type="file" accept=".xml" style={{ display: "none" }} onChange={handleMainFile} />
                         <input ref={discInputRef} type="file" accept=".xml" style={{ display: "none" }} onChange={handleDiscFile} />
                         <input ref={profileInputRef} type="file" accept=".xml" style={{ display: "none" }} onChange={handleProfileFile} />
+                        {mainFileFullName && (
+                            <div style={{ marginTop: 6, fontSize: 12, color: "#57606a", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={mainFileFullName}>
+                                Loaded: <span style={{ fontWeight: 600, color: "#24292f" }}>{mainFileFullName}</span>
+                            </div>
+                        )}
                         {parsed && <button style={{ ...S.btnPrimary, marginTop: 8, width: "100%" }} onClick={runValidation}>Run Validation</button>}
                         {validationDone && (
                             <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
@@ -879,11 +1065,28 @@ export default function App() {
                     </div>
                     <div style={{ display: "flex", gap: 5, flexWrap: "wrap", alignItems: "center" }}>
                         <button style={S.btn} onClick={() => { if (!parsed) return; const b = boundsFromElements(parsed.graphics); setFullBounds(b); setViewBox({ x: b.minX, y: b.minY, w: b.maxX - b.minX, h: b.maxY - b.minY }); }} title="Fit drawing to window">Fit</button>
-                        <button style={{ ...S.btn, background: showConnectivity ? "#eaf2ff" : "white" }} onClick={() => setShowConnectivity(p => !p)} title="Connectivity mode: highlights the upstream (blue), downstream (green), and group (purple) connections of the selected object. Directional arrows appear on connector lines.">Connectivity</button>
-                        <button style={{ ...S.btn, background: strokeAdjust ? "#eaf2ff" : "white" }} onClick={() => setStrokeAdjust(p => !p)} title="Stroke adjustment: boosts very thin connector lines to a minimum visible width. Turn off to render lines at their exact drawn weight.">Line weight</button>
-                        <button style={S.btn} onClick={() => bgInputRef.current?.click()} title="Overlay an image or PDF behind the drawing">BG Image</button>
+                        <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "#57606a" }} title="Connector/centerline stroke width as a percentage of its original width. 100% = unchanged; raise it to bulk up thin lines to match a BG reference image's line weight.">
+                            Line Boost
+                            <input type="number" min={1} step={1} value={lineBoostPct} onChange={e => { const v = parseFloat(e.target.value); if (!Number.isNaN(v) && v > 0) setLineBoostPct(v); }} style={S.numBox} title="Line width, as a percentage of its original width" />
+                            %
+                        </label>
+                        <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "#57606a", cursor: "pointer" }} title="When checked, symbol outline strokes are boosted by the same Line Boost percentage as connector/centerlines. When unchecked, only connector/centerlines are affected.">
+                            <input type="checkbox" checked={boostSymbolOutlines} onChange={e => setBoostSymbolOutlines(e.target.checked)} />
+                            Include symbol outlines
+                        </label>
+                        <button style={S.btn} disabled={!parsed || exporting} onClick={exportAsPng} title="Save the current view (drawing + BG image, if any) as a PNG">{exporting ? "..." : "Save PNG"}</button>
+                        <button style={S.btn} disabled={!parsed || exporting} onClick={exportAsPdf} title="Save the current view (drawing + BG image, if any) as a PDF">{exporting ? "..." : "Save PDF"}</button>
+                        <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "#57606a", cursor: "pointer" }} title="Connectivity mode: highlights the upstream (blue), downstream (green), and group (purple) connections of the selected object. Hidden by default - check this box to show the highlight.">
+                            <input type="checkbox" checked={showConnectivity} onChange={e => setShowConnectivity(e.target.checked)} />
+                            Connectivity
+                        </label>
+                        <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "#57606a", cursor: "pointer" }} title="When checked, selecting an object also highlights (red) all of its sub-components in the drawing. When unchecked, only the selected object itself is highlighted.">
+                            <input type="checkbox" checked={selectHighlightSubComponents} onChange={e => setSelectHighlightSubComponents(e.target.checked)} />
+                            Sub-components
+                        </label>
+                        <button style={S.btn} onClick={() => bgInputRef.current?.click()} title="Overlay an image behind the drawing">BG Image</button>
                         {bgImage && <button style={{ ...S.btn, background: showBgControls ? "#eaf2ff" : "white" }} onClick={() => setShowBgControls(p => !p)}>BG Controls</button>}
-                        <input ref={bgInputRef} type="file" accept="image/*,.pdf" style={{ display: "none" }} onChange={handleBgFile} />
+                        <input ref={bgInputRef} type="file" accept="image/*" style={{ display: "none" }} onChange={handleBgFile} />
                         <span style={{ fontSize: 11, color: "#888", marginLeft: 4 }}>Scroll to zoom · Space+drag to pan</span>
                     </div>
                 </div>
@@ -896,24 +1099,25 @@ export default function App() {
                         <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
                             Opacity
                             <input type="range" min={0} max={1} step={0.05} value={bgImage.opacity} onChange={e => setBgImage(b => ({ ...b, opacity: parseFloat(e.target.value) }))} style={{ width: 70 }} />
-                            <input type="number" min={0} max={100} step={5} value={Math.round(bgImage.opacity * 100)} onChange={e => setBgImage(b => ({ ...b, opacity: Math.min(1, Math.max(0, parseInt(e.target.value) || 0) / 100) }))} style={{ width: 48, padding: "1px 4px", border: "1px solid #c7ced6", borderRadius: 4, fontSize: 12 }} />%
+                            <input type="number" min={0} max={1} step={0.01} value={bgImage.opacity} onChange={e => { const v = parseFloat(e.target.value); if (!Number.isNaN(v)) setBgImage(b => ({ ...b, opacity: Math.min(1, Math.max(0, v)) })); }} style={S.numBox} title="Opacity (0-1)" />
                         </label>
                         <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
                             Scale
                             <input type="range" min={0.1} max={3} step={0.05} value={bgImage.scale} onChange={e => setBgImage(b => ({ ...b, scale: parseFloat(e.target.value) }))} style={{ width: 70 }} />
-                            <input type="number" min={0.1} max={3} step={0.05} value={bgImage.scale.toFixed(2)} onChange={e => setBgImage(b => ({ ...b, scale: Math.min(3, Math.max(0.1, parseFloat(e.target.value) || 1)) }))} style={{ width: 52, padding: "1px 4px", border: "1px solid #c7ced6", borderRadius: 4, fontSize: 12 }} />x
+                            <input type="number" min={0.01} max={20} step={0.01} value={bgImage.scale} onChange={e => { const v = parseFloat(e.target.value); if (!Number.isNaN(v) && v > 0) setBgImage(b => ({ ...b, scale: v })); }} style={S.numBox} title="Scale factor" />
                         </label>
                         <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
                             X
-                            <input type="range" min={-500} max={500} step={1} value={bgImage.offsetX} onChange={e => setBgImage(b => ({ ...b, offsetX: parseInt(e.target.value) }))} style={{ width: 70 }} />
-                            <input type="number" min={-500} max={500} step={1} value={bgImage.offsetX} onChange={e => setBgImage(b => ({ ...b, offsetX: Math.min(500, Math.max(-500, parseInt(e.target.value) || 0)) }))} style={{ width: 52, padding: "1px 4px", border: "1px solid #c7ced6", borderRadius: 4, fontSize: 12 }} />px
+                            <input type="range" min={-boundsW} max={boundsW} step={Math.max(0.01, boundsW / 500)} value={bgImage.offsetX} onChange={e => setBgImage(b => ({ ...b, offsetX: parseFloat(e.target.value) }))} style={{ width: 70 }} />
+                            <input type="number" step={Math.max(0.01, boundsW / 500)} value={bgImage.offsetX} onChange={e => { const v = parseFloat(e.target.value); if (!Number.isNaN(v)) setBgImage(b => ({ ...b, offsetX: v })); }} style={S.numBoxWide} title="X offset, in drawing units, from the auto-fit position" />
                         </label>
                         <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
                             Y
-                            <input type="range" min={-500} max={500} step={1} value={bgImage.offsetY} onChange={e => setBgImage(b => ({ ...b, offsetY: parseInt(e.target.value) }))} style={{ width: 70 }} />
-                            <input type="number" min={-500} max={500} step={1} value={bgImage.offsetY} onChange={e => setBgImage(b => ({ ...b, offsetY: Math.min(500, Math.max(-500, parseInt(e.target.value) || 0)) }))} style={{ width: 52, padding: "1px 4px", border: "1px solid #c7ced6", borderRadius: 4, fontSize: 12 }} />px
+                            <input type="range" min={-boundsH} max={boundsH} step={Math.max(0.01, boundsH / 500)} value={bgImage.offsetY} onChange={e => setBgImage(b => ({ ...b, offsetY: parseFloat(e.target.value) }))} style={{ width: 70 }} />
+                            <input type="number" step={Math.max(0.01, boundsH / 500)} value={bgImage.offsetY} onChange={e => { const v = parseFloat(e.target.value); if (!Number.isNaN(v)) setBgImage(b => ({ ...b, offsetY: v })); }} style={S.numBoxWide} title="Y offset, in drawing units, from the auto-fit position" />
                         </label>
-                        <button style={S.btnDanger} onClick={() => { setBgImage(null); setShowBgControls(false); }}>Remove</button>
+                        <button style={S.btnSmall} onClick={() => setBgImage(b => ({ ...b, scale: 1, offsetX: 0, offsetY: 0 }))} title="Reset to the auto-fit (centered, aspect-correct) placement">Reset fit</button>
+                        <button style={{ ...S.btnSmall, color: "#cf222e" }} onClick={() => { setBgImage(null); setShowBgControls(false); }}>Remove</button>
                     </div>
                 )}
 
@@ -931,14 +1135,19 @@ export default function App() {
                     onMouseUp={() => { setIsPanning(false); setPanStart(null); }}
                     onMouseLeave={() => { setIsPanning(false); setPanStart(null); }}
                 >
-                    {bgImage && <img src={bgImage.src} alt="background overlay" style={bgStyle} draggable={false} />}
-                    <svg viewBox={`${viewBox.x} ${viewBox.y} ${viewBox.w} ${viewBox.h}`} width="100%" height="100%" style={{ display: "block" }} onAuxClick={e => e.preventDefault()}>
+                    <svg ref={svgElRef} viewBox={`${viewBox.x} ${viewBox.y} ${viewBox.w} ${viewBox.h}`} width="100%" height="100%" style={{ display: "block" }} onAuxClick={e => e.preventDefault()}>
+                        {bgImage && bgPlacement && (
+                            <g style={{ display: bgImage.visible ? "inline" : "none", opacity: bgImage.opacity, pointerEvents: "none" }}>
+                                <image href={bgImage.src} x={bgPlacement.x} y={bgPlacement.y} width={bgPlacement.width} height={bgPlacement.height} preserveAspectRatio="none" />
+                                <rect x={bgPlacement.x} y={bgPlacement.y} width={bgPlacement.width} height={bgPlacement.height} fill={BG_TINT_COLOR} style={{ mixBlendMode: "color" }} />
+                            </g>
+                        )}
                         {parsed?.graphics.elements.map(el => {
                             const isSelected = !!el.representedId && selectedRepresentedIds.has(el.representedId);
                             const ch = connectivityHighlight;
                             const connColor = el.representedId ? (ch.upstream.has(el.representedId) ? "#0969da" : ch.downstream.has(el.representedId) ? "#1a7f37" : ch.group.has(el.representedId) ? "#8250df" : null) : null;
-                            if (el.kind === "symbolUsage") return <SymbolGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} />;
-                            return <PrimitiveGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} nodePosMap={parsed.graphics.nodePosMap} strokeAdjust={strokeAdjust} />;
+                            if (el.kind === "symbolUsage") return <SymbolGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} boostPct={lineBoostPct} boostSymbolOutlines={boostSymbolOutlines} />;
+                            return <PrimitiveGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} nodePosMap={parsed.graphics.nodePosMap} boostPct={lineBoostPct} boostSymbolOutlines={boostSymbolOutlines} />;
                         })}
                         {/* Heat-trace overlays – rendered on top, only when a DISC profile is loaded */}
                         {parsed?.heatTraceSet?.size > 0 && parsed.graphics.elements.map(el => {

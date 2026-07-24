@@ -147,17 +147,18 @@ The centre panel renders the DEXPI drawing graphically from the XML data. Symbol
 
 | Action | How |
 |--------|-----|
-| Zoom | Scroll the mouse wheel over the drawing |
+| Zoom | Scroll the mouse wheel over the drawing (zooms toward the cursor) |
 | Pan | Hold **Space** and drag |
 | Fit to window | Click the **Fit** button in the centre toolbar |
+| Export view | Click **Save PNG** / **Save PDF** in the centre toolbar (see 5.8, below) |
 
 ### 5.2 Selecting Objects
 
-Click any symbol or piping line in the drawing to select it. The selected object is highlighted with a red outline and its details appear in the right panel. The corresponding node in the topology tree is also highlighted.
+Click any symbol or piping line in the drawing to select it. The selected object is highlighted with a red outline (orange for label elements) and its details appear in the right panel. The corresponding node in the topology tree is also highlighted.
 
 ### 5.3 Connectivity Mode
 
-Click the **Connectivity** button in the centre toolbar to enable connectivity highlighting. When an object is selected, the drawing colour-codes its network neighbours:
+Check **Connectivity** in the centre toolbar to enable connectivity highlighting. When an object is selected, the drawing colour-codes its network neighbours:
 
 | Colour | Meaning |
 |--------|---------|
@@ -165,31 +166,49 @@ Click the **Connectivity** button in the centre toolbar to enable connectivity h
 | 🟢 Green | Downstream objects (flow out from the selected item) |
 | 🟣 Purple | Group members (same piping network segment or instrumentation loop) |
 
-A legend is shown in the lower-left corner while connectivity mode is active. Directional arrows appear on connector lines to show flow direction.
+A legend is shown in the lower-left corner while the checkbox is checked. The highlight is off by default.
 
-### 5.4 Heat Trace Overlay
+### 5.4 Sub-Components
 
-When a DISC profile is loaded, heat-traced elements are detected automatically from the `HeatTracingType` data property. The overlay draws coloured dashed highlights on top of the main drawing:
+Check **Sub-components** to have a selection also highlight (in red) every child object of the selected item, plus any object it references (e.g. a driven equipment's reference to its motor) other than connectivity refs — useful when selecting a container such as a `PipingNetworkSystem` or `PipingNetworkSegment`. Off by default, so selecting a large container only highlights the container itself.
+
+### 5.5 Heat Trace Overlay
+
+When a DISC profile is loaded, heat-traced elements are detected automatically from the `HeatTracingType` data property. The overlay only activates when `HeatTracingType` is `ElectricalHeatTracingSystem`, `HeatTracingSystem`, `SteamHeatTracingSystem`, or `TubularHeatTracingSystem`; the overlay draws coloured dashed highlights on top of the main drawing — no toggle needed:
 
 - **Piping segments** — dashed overlay on connector lines.
 - **Inline components** (valves, fittings, nozzles) — dashed bounding box around the symbol.
 - **Instruments** (`ProcessInstrumentationFunction`) — dashed rectangle around the symbol.
 
-### 5.5 Line Weight Adjustment
+### 5.6 Line Boost
 
-The **Line weight** toggle boosts very thin connector lines to a minimum visible width. Turn it off to render lines at their exact drawn weight as encoded in the DEXPI file.
+**Line Boost** is a percentage multiplier applied to the drawn stroke width of every connector/centerline in the drawing — 100% (the default) is a no-op; raise it to bulk up thin piping and signal lines, e.g. to match the weight of a loaded BG reference image.
 
-### 5.6 Background Image
+Check **Include symbol outlines** to also apply the same percentage to symbol outline strokes. Left unchecked (the default), only connector/centerlines are boosted and symbol geometry renders at its exact drawn weight.
 
-Click **BG Image** to overlay an image or PDF behind the P&ID drawing. Once loaded, **BG Controls** provides:
+### 5.7 Background Image
+
+Click **BG Image** to overlay a reference image behind the P&ID drawing. Once one is loaded, **BG Controls** appears with:
 
 | Control | Description |
 |---------|-------------|
 | Visible | Toggle the overlay on or off |
-| Opacity | 0–100% |
-| Scale | 0.1x–3x |
-| X / Y | Position offset relative to the drawing origin |
+| Opacity | 0–1 |
+| Scale | Uniform scale factor applied to the auto-fit size (native aspect ratio is always preserved) |
+| X / Y | Offset, in drawing units, from the auto-fit (centered) position — not screen pixels, so the range scales with the drawing's own size |
+| Reset fit | Sets scale back to 1 and X/Y back to 0, returning to the auto-fit (centered, aspect-correct) placement |
 | Remove | Clear the background image |
+
+The image is placed inside the same coordinate space as the drawing, so it pans and zooms in lockstep with it — it stays aligned at any zoom level, not just the level it was set up at.
+
+### 5.8 Exporting the Drawing
+
+Use **Save PNG** or **Save PDF** in the centre toolbar to save exactly what's currently in the drawing viewport — the DEXPI drawing plus the BG image overlay, if one is loaded and visible — as a file. Both buttons are disabled until a drawing is loaded, and while an export is in progress.
+
+- **Save PNG** — rasterizes the current view to a PNG at a fixed long-edge resolution, aspect ratio matching the current view.
+- **Save PDF** — the same rendering, embedded as a single full-page image in a PDF (long edge ~420mm, A3-ish). DEXPI drawing coordinates aren't reliably tied to real-world units, so this is a print-friendly fit rather than a to-scale export.
+
+The downloaded file name is derived from the drawing number where available.
 
 ---
 
@@ -438,4 +457,4 @@ Use **Data → From Text/CSV** in Excel and select UTF-8 encoding.
 The file may reference profile symbols that are not loaded. Load the appropriate `DiscProfile.xml` (and FL0 profile if needed) — the parser re-runs automatically when a new profile is added.
 
 **Background image does not align with the drawing**
-Use the Scale, X, and Y controls in the BG Controls bar. The drawing coordinate system uses DEXPI document units; the image offset is in screen pixels relative to the drawing origin.
+The image is auto-fit (centered, aspect-correct) into the drawing extents on load and rendered inside the same coordinate space as the drawing, so it stays aligned at any pan/zoom level. Use the Scale and X/Y controls in BG Controls, or click **Reset fit** to snap back to the auto-fit placement — offsets are in drawing units, not screen pixels.

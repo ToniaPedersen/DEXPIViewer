@@ -613,10 +613,11 @@ export function buildHeatTraceSet(tree, discDoc = null) {
     const result = new Map();
     const isEligibleType = buildHtEligibility(discDoc);
 
-    // Extract HeatTracingType from a node's own data.
+    // Driving attribute for the HeatTracing line rule: HeatTracingType.
     //   undefined → attribute absent on this node  (use parent's value)
-    //   null      → explicitly NoHeatTracingSystem  (no heat trace)
-    //   string    → any other active value, e.g. "HeatTracingSystem"
+    //   null      → explicitly NoHeatTracingSystem, or any value other than
+    //               the four recognised heat-tracing types  (no heat trace)
+    //   string    → one of the recognised active values (see HEAT_TRACING_ACTIVE_TYPES)
     function getHT(node) {
         if (!node || !Array.isArray(node.data)) return undefined;
         const entry = node.data.find(d =>
@@ -637,7 +638,16 @@ export function buildHeatTraceSet(tree, discDoc = null) {
         return (!last || last === "NoHeatTracingSystem") ? null : last;
     }
 
-    function isActive(ht) { return ht !== null && ht !== undefined; }
+    // The HeatTracing line rule only fires when the driving attribute
+    // (HeatTracingType) resolves to one of these recognised values.
+    const HEAT_TRACING_ACTIVE_TYPES = new Set([
+        "ElectricalHeatTracingSystem",
+        "HeatTracingSystem",
+        "SteamHeatTracingSystem",
+        "TubularHeatTracingSystem",
+    ]);
+
+    function isActive(ht) { return ht !== null && ht !== undefined && HEAT_TRACING_ACTIVE_TYPES.has(ht); }
 
     // Map the element's DEXPI class to the heat-trace overlay render mode.
     function overlayType(type) {
@@ -680,6 +690,28 @@ export function buildHeatTraceSet(tree, discDoc = null) {
     return result;
 }
 
+// A ref property "counts" toward connectivity (upstream/downstream/group)
+// classification when it substring-matches "upstream"/"source"/"inlet"/
+// "downstream"/"target"/"outlet"/"function"/"member"/"piping"/"instrument" -
+// see buildConnectivityMap() below. Exported so App.jsx can exclude these
+// same refs from selectedRepresentedIds (the "selected"/red-highlight set)
+// when the Sub-components checkbox is on: connectivity refs exist purely to
+// drive the separate upstream/downstream/group highlight colors, not to mark
+// their target as "also selected". Without this exclusion, e.g. a
+// PipingComponent's upstream ref would cause the object it points at to be
+// drawn in the same red "selected" color as the actually-selected object,
+// regardless of whether connectivity highlighting is even turned on -
+// selected/red is meant to always win over connectivity color (see
+// SymbolGraphic/PrimitiveGraphic's `selected ? ... : connHighlight`
+// priority in App.jsx), so a ref that's only meant to feed connectivity
+// color must never end up in the selected set to begin with.
+export function isConnectivityRefProperty(property) {
+    const prop = (property || "").toLowerCase();
+    return prop.includes("upstream") || prop.includes("source") || prop.includes("inlet")
+        || prop.includes("downstream") || prop.includes("target") || prop.includes("outlet")
+        || prop.includes("function") || prop.includes("member") || prop.includes("piping") || prop.includes("instrument");
+}
+
 export function buildConnectivityMap(flatTree) {
     const map = new Map();
     const ensure = id => {
@@ -714,7 +746,18 @@ export function parseDexpiPackage(mainXml, discProfileXml) {
     if (mainDoc.querySelector("parsererror")) throw new Error("Main XML is not well-formed.");
     if (discDoc && discDoc.querySelector("parsererror")) throw new Error("DiscProfile XML is not well-formed.");
     const conceptualRoot = mainDoc.querySelector('Object[type="Core/EngineeringModel"] > Components[property="ConceptualModel"] > Object');
-    if (!conceptualRoot) throw new Error("Could not find ConceptualModel in the DEXPI file.");
+    if (!conceptualRoot) {
+        // This parser only understands DEXPI 2.0's <Model>/<Object type="Core/EngineeringModel">
+        // structure. A Proteus 4.1.1 / DEXPI 1.3 file (root element <PlantModel>, as produced by
+        // e.g. AKSO/Comos exports) will always land here since it has no such element at all -
+        // give a specific, actionable message instead of the generic one so this mismatch isn't
+        // mistaken for a parsing bug or a missing/incompatible DiscProfile.xml.
+        const rootTag = mainDoc.documentElement?.tagName || "";
+        if (rootTag === "PlantModel") {
+            throw new Error('This file is a Proteus 4.1.1 / DEXPI 1.3 XML (root element <PlantModel>), not a DEXPI 2.0 file. This viewer only supports DEXPI 2.0 files (root element <Model>). Proteus/DEXPI 1.3 files are not supported here.');
+        }
+        throw new Error("Could not find ConceptualModel in the DEXPI file.");
+    }
     const tree = parseTreeFromConceptual(conceptualRoot);
     const flatTree = flattenTree(tree);
     const treeMap = new Map(flatTree.filter(n => n.objectId).map(n => [n.objectId, n]));
