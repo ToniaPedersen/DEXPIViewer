@@ -210,6 +210,25 @@ Use **Save PNG** or **Save PDF** in the centre toolbar to save exactly what's cu
 
 The downloaded file name is derived from the drawing number where available.
 
+### 5.9 Signal-Conveying Line Styles
+
+When a `SignalConveyingFunction` carries the DiscProfile custom attribute `SignalConveyingFunctionTypeRepresentation` — added by the `SignalConveyingFunctionExtension` class extension (rdl_uri `.../SignalConveyingFunctionTypeRepresentationAssignmentClass`) — its drawn connector line is decorated automatically to indicate the signal type, independent of whatever line style is encoded in the file's own graphics. No configuration is required; the viewer reads the attribute directly from the loaded DEXPI XML whenever it's present. This decoration applies only to `SignalConveyingFunction` itself — its concrete subtypes `MeasuringLineFunction` and `SignalLineFunction` are never decorated, even if they happen to carry the same attribute.
+
+| `SignalConveyingFunctionTypeRepresentation` value | Line decoration |
+|---|---|
+| `ElectricalSignalConveying` | Solid line with a repeated italic **E** |
+| `HydraulicSignalConveying` | Solid line with a repeated upright **L** |
+| `BusSignalConveying` | Solid line with a repeated small circle |
+| `PneumaticSignalConveying` | Solid line with a repeated **^** chevron |
+| `CapillarySignalConveying` | Solid line with a repeated small **x** |
+| `UndefinedSignalConveying` | Solid line with a repeated **/** slash |
+| `ElectromagneticGuidedSignalConveying` | Solid line with a repeated **∿** squiggle |
+| `ElectromagneticUnguidedSignalConveying` | Line hidden entirely — only the repeated **∿** squiggle is drawn, since there is no physical conductor to depict |
+| `SignalConveying` (plain, no sub-type) | Dashed line, no repeated mark |
+| Attribute absent | Line drawn exactly as encoded in the file, unchanged |
+
+Selecting a decorated line, or highlighting it via Connectivity mode, recolours both the line and its repeated mark together.
+
 ---
 
 ## 6. Right Panel — Object Details

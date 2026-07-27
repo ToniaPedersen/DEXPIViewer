@@ -355,6 +355,18 @@ export function collectDescendantObjectIds(node, out = new Set()) {
     return out;
 }
 
+// Dash pattern (SVG stroke-dasharray, world units) used to draw a
+// SignalConveyingFunction's drawn Core/Diagram.ConnectorLine when its
+// DiscProfile custom attribute SignalConveyingFunctionTypeRepresentation
+// (ClassExtension SignalConveyingFunctionExtension, rdl_uri ".../Signal-
+// ConveyingFunctionTypeRepresentationAssignmentClass" - see e.g.
+// ProcessProfile.xml) is the plain, unqualified "SignalConveying" value
+// (i.e. no more specific Electrical/Hydraulic/Bus/etc sub-type). Mirrors
+// AKSODEXPIViewer's SIGNAL_CONVEYING_DASH_ARRAY convention for the
+// equivalent Proteus InformationFlow attribute - see collectGraphicalElements()
+// below and App.jsx's SIGNAL_CONVEYING_MARKS for the sub-type glyphs.
+const SIGNAL_CONVEYING_DASH_ARRAY = "3 2";
+
 export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
     const nodePosMap = parseNodePositionsById(mainDoc);
     const drawn = [];
@@ -363,11 +375,17 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
     // e.g. "NormallyClose" → "NC"
     const enumLiteralSymbols = parseEnumLiteralSymbols(discDoc);
 
-    // Build objectId → Map<propertyName, rawDataValue> for condition evaluation.
+    // Build objectId → Map<propertyName, rawDataValue> for condition evaluation,
+    // and objectId → type (used by signalConveyingTypeFor() below to restrict
+    // the decoration to exactly SignalConveyingFunction, excluding its
+    // concrete subtypes MeasuringLineFunction/SignalLineFunction even though
+    // they'd inherit the same DiscProfile ClassExtension attribute).
     // Only indexed objects (those with an id attribute) are relevant.
     const objectDataMap = new Map();
+    const objectTypeMap = new Map();
     qsa(mainDoc, "Object[id]").forEach(el => {
         const id = el.getAttribute("id");
+        objectTypeMap.set(id, el.getAttribute("type") || "");
         const props = new Map();
         directChildrenByTag(el, "Data").forEach(d => {
             const prop = d.getAttribute("property");
@@ -375,6 +393,41 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         });
         if (props.size) objectDataMap.set(id, props);
     });
+
+    // Resolve a raw Data value (plain string, or a DataReference to an
+    // enumeration literal) down to its bare name - used for the signal-
+    // conveying lookup below, which needs the full representation name
+    // (e.g. "ElectricalSignalConveying"), unlike conditionValue()'s
+    // abbreviated-symbol lookup used for SymbolVariant conditions.
+    function rawStringValue(raw) {
+        if (raw === null || raw === undefined) return null;
+        if (typeof raw === "string") return raw;
+        if (raw?.kind === "DataReference") return raw.value.split(".").pop().split("/").pop();
+        return null;
+    }
+
+    // Reads a SignalConveyingFunction conceptual object's DiscProfile
+    // SignalConveyingFunctionTypeRepresentation custom attribute, if present.
+    // Deliberately restricted to the exact type Plant/Instrumentation.
+    // SignalConveyingFunction - its concrete subtypes MeasuringLineFunction
+    // and SignalLineFunction are excluded even if they happen to carry the
+    // same (inherited) attribute, since the line-style decoration only
+    // applies to SignalConveyingFunction itself. Tries the same property-name
+    // variants pickVariant() below tolerates for DiscProfile-authored
+    // instance data (bare name, "DiscProfile/"-prefixed, or plant-namespace-
+    // prefixed). Only ever returns a value for objects the DiscProfile
+    // extension was actually applied and populated to - absent otherwise.
+    function signalConveyingTypeFor(representedId) {
+        if (!representedId) return null;
+        if (objectTypeMap.get(representedId) !== "Plant/Instrumentation.SignalConveyingFunction") return null;
+        const props = objectDataMap.get(representedId);
+        if (!props) return null;
+        const raw = props.get("SignalConveyingFunctionTypeRepresentation")
+            ?? props.get("DiscProfile/SignalConveyingFunctionTypeRepresentation")
+            ?? props.get("Plant/Instrumentation.SignalConveyingFunctionTypeRepresentation")
+            ?? null;
+        return rawStringValue(raw);
+    }
 
     // Resolve a raw property value (string or DataReference) to the short symbol code
     // used in variant Condition strings.
@@ -473,7 +526,19 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
                 const prim = parsePrimitive(el, i);
                 if (!prim) return;
                 if (prim.kind === "connectorLine") {
-                    drawn.push({ kind: "connectorLine", primitive: prim, representedId: localRepresents, elementRole: "connector", key: `${keyPrefix}_cl_${i}` });
+                    // SignalConveyingFunction connector lines (only that exact
+                    // type - not its concrete subtypes MeasuringLineFunction/
+                    // SignalLineFunction, see signalConveyingTypeFor() above) are
+                    // decorated per the DiscProfile SignalConveyingFunctionTypeRepresentation
+                    // attribute - the raw value is carried through onto the drawn element
+                    // for App.jsx's SIGNAL_CONVEYING_MARKS to interpret, and the plain
+                    // "SignalConveying" value (no more specific sub-type) additionally
+                    // forces a dashed line here (see SIGNAL_CONVEYING_DASH_ARRAY above).
+                    const signalConveyingType = signalConveyingTypeFor(localRepresents);
+                    if (signalConveyingType === "SignalConveying") {
+                        prim.stroke = { ...prim.stroke, dashArray: SIGNAL_CONVEYING_DASH_ARRAY };
+                    }
+                    drawn.push({ kind: "connectorLine", primitive: prim, representedId: localRepresents, elementRole: "connector", key: `${keyPrefix}_cl_${i}`, signalConveyingType: signalConveyingType || undefined });
                 } else {
                     drawn.push({ kind: "primitive", primitive: prim, representedId: localRepresents, elementRole: isLabelGroup ? "label" : "symbol", key: `${keyPrefix}_p_${i}` });
                 }

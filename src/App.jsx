@@ -59,6 +59,8 @@ const S = {
     btnPrimary: { padding: "6px 10px", border: "1px solid #0969da", background: "#0969da", color: "white", borderRadius: 6, cursor: "pointer", fontSize: 13 },
     btnSmall: { padding: "3px 7px", border: "1px solid #c7ced6", background: "white", borderRadius: 4, cursor: "pointer", fontSize: 12 },
     btnDanger: { padding: "3px 7px", border: "1px solid #cf222e", background: "white", color: "#cf222e", borderRadius: 4, cursor: "pointer", fontSize: 12 },
+    // Small green checkmark shown inline on a load button once its file has been loaded.
+    loadedTick: { marginLeft: 6, color: "#1a7f37", fontWeight: 700 },
     input: { width: "100%", padding: "6px 8px", border: "1px solid #c7ced6", borderRadius: 6, boxSizing: "border-box", fontSize: 13 },
     numBox: { width: 52, padding: "2px 4px", border: "1px solid #c7ced6", borderRadius: 4, boxSizing: "border-box", fontSize: 12 },
     // Wide enough for an "nnn.nnnn" value (3 integer digits, 4 decimal places) without clipping.
@@ -136,6 +138,167 @@ function highlightPrimitive(p, key, color) {
     return null;
 }
 
+// ---------- Signal-conveying line decorations --------------------------------
+// A SignalConveyingFunction's drawn Core/Diagram.ConnectorLine is decorated
+// according to the DiscProfile custom attribute SignalConveyingFunctionType-
+// Representation (ClassExtension SignalConveyingFunctionExtension, rdl_uri
+// ".../SignalConveyingFunctionTypeRepresentationAssignmentClass") - see
+// dexpiParser.js's collectGraphicalElements(), which carries the raw
+// attribute value through as el.signalConveyingType (and, for the plain
+// "SignalConveying" value, already forces the line's own dashArray there).
+// Each entry here is the small glyph repeated along the line's length for a
+// more specific representation value - ported from AKSODEXPIViewer's
+// equivalent Proteus InformationFlow decoration (same glyph conventions and
+// world-unit sizing): "ElectricalSignalConveying" (italic "E"),
+// "HydraulicSignalConveying" (upright "L"), "BusSignalConveying" (small
+// circle), "PneumaticSignalConveying" (a "^" chevron),
+// "CapillarySignalConveying" (a small "x"), "UndefinedSignalConveying" (a
+// small "/") and "ElectromagneticGuidedSignalConveying"/"Electromagnetic-
+// UnguidedSignalConveying" (a small "∿" sine-wave squiggle).
+const SIGNAL_CONVEYING_MARKS = {
+    ElectricalSignalConveying: "E",
+    HydraulicSignalConveying: "L",
+    BusSignalConveying: "O",
+    PneumaticSignalConveying: "^",
+    CapillarySignalConveying: "x",
+    UndefinedSignalConveying: "/",
+    ElectromagneticGuidedSignalConveying: "∿",
+    ElectromagneticUnguidedSignalConveying: "∿",
+};
+// Representation values whose own drawn connector line should be hidden
+// entirely, leaving only the repeated mark - used for
+// ElectromagneticUnguidedSignalConveying, which (unlike a guided wire) has
+// no physical conductor to draw a continuous line for.
+const SIGNAL_MARK_HIDE_LINE_TYPES = new Set(["ElectromagneticUnguidedSignalConveying"]);
+const SIGNAL_MARK_SPACING = 14;  // world units between repeated glyphs
+const SIGNAL_MARK_HEIGHT = 2.4;  // glyph cap-height, world units
+const SIGNAL_MARK_WIDTH = 1.6;   // glyph width, world units (E only - L's arms are square, see below)
+const SIGNAL_MARK_STROKE = 0.16; // glyph stroke width, world units - thin, close to the line's own weight
+const SIGNAL_MARK_LEAN = 0.55;   // horizontal shear per unit of y (~29 deg) - a pronounced italic slant, E only
+const SIGNAL_MARK_CIRCLE_RADIUS = 0.9; // "O" (Bus) circle radius, world units
+const SIGNAL_MARK_CARET_WIDTH = 1.8;   // "^" (Pneumatic) chevron width, world units
+const SIGNAL_MARK_X_WIDTH = 1.6;       // "x" (Capillary) cross width, world units
+const SIGNAL_MARK_SLASH_WIDTH = 1.6;   // "/" (Undefined) stroke width, world units
+const SIGNAL_MARK_WAVE_WIDTH = 2.4;    // "∿" (Electromagnetic Guided) one full wave cycle's width, world units
+
+// Vector glyph paths for the marks above, drawn as monoline strokes rather
+// than system-font text: font-based dominant-baseline centering doesn't
+// reliably land on a letter's own visual middle (varies by browser/font),
+// and font glyphs don't give exact control over stroke weight or slant
+// angle. Each path is built in a local frame where y=0 is the line the
+// glyph sits on - so placing a mark at (x, y) on the polyline with y=0 in
+// this local frame puts the glyph precisely on the line (not just its
+// bounding box), and x=0 is the glyph's leading edge along the line's own
+// direction.
+function buildSignalMarkPaths() {
+    const h2 = SIGNAL_MARK_HEIGHT / 2;
+    const w = SIGNAL_MARK_WIDTH;
+    const lean = SIGNAL_MARK_LEAN;
+    // Italic "E": lean is baked directly into each stroke's endpoints
+    // (rather than an SVG skewX transform) so it reads correctly regardless
+    // of the per-mark rotation applied afterwards. y=0 (the line) passes
+    // through the glyph's middle bar.
+    const lx = (x, y) => x - lean * y; // shifts top-of-glyph right, bottom left (standard italic lean)
+    const tl = { x: lx(0, -h2), y: -h2 }, tr = { x: lx(w, -h2), y: -h2 };
+    const bl = { x: lx(0, h2), y: h2 }, br = { x: lx(w, h2), y: h2 };
+    const ml = { x: lx(0, 0), y: 0 }, mr = { x: lx(w * 0.75, 0), y: 0 };
+    const ePath = `M${tl.x},${tl.y} L${tr.x},${tr.y} M${tl.x},${tl.y} L${bl.x},${bl.y} M${bl.x},${bl.y} L${br.x},${br.y} M${ml.x},${ml.y} L${mr.x},${mr.y}`;
+
+    // Upright "L": vertical and horizontal arms are the same length
+    // (SIGNAL_MARK_HEIGHT), and the line (y=0) passes through the middle of
+    // the vertical arm, which runs from -h2 to +h2 with the horizontal arm
+    // extending right from its foot.
+    const lTop = { x: 0, y: -h2 }, lBottom = { x: 0, y: h2 }, lFoot = { x: SIGNAL_MARK_HEIGHT, y: h2 };
+    const lPath = `M${lTop.x},${lTop.y} L${lBottom.x},${lBottom.y} L${lFoot.x},${lFoot.y}`;
+
+    // "O" (Bus): a small circle whose center sits at y=0, so the line
+    // passes straight through its middle. Drawn as two half-circle arcs
+    // (the usual SVG trick for a full circle in one path, since a single
+    // arc command can't span 360deg), positioned so it starts at its own
+    // leading edge (x=0) the same way the other glyphs do.
+    const r = SIGNAL_MARK_CIRCLE_RADIUS;
+    const oPath = `M${r * 2},0 A${r},${r} 0 1 0 0,0 A${r},${r} 0 1 0 ${r * 2},0`;
+
+    // "^" (Pneumatic): a chevron whose apex sits above the line and whose
+    // two feet sit below it, symmetric about y=0 so the line runs through
+    // the vertical middle of the shape (same convention as the "L" arm and
+    // "O" circle above).
+    const cw = SIGNAL_MARK_CARET_WIDTH;
+    const caretLeft = { x: 0, y: h2 }, caretApex = { x: cw / 2, y: -h2 }, caretRight = { x: cw, y: h2 };
+    const caretPath = `M${caretLeft.x},${caretLeft.y} L${caretApex.x},${caretApex.y} L${caretRight.x},${caretRight.y}`;
+
+    // "x" (Capillary): two diagonal strokes corner-to-corner of a bounding
+    // box centered on y=0. Diagonals of a rectangle always cross at its
+    // center, so the line automatically runs straight through the cross
+    // point without any extra alignment math.
+    const xw = SIGNAL_MARK_X_WIDTH;
+    const xPath = `M0,${-h2} L${xw},${h2} M0,${h2} L${xw},${-h2}`;
+
+    // "/" (Undefined): a single diagonal stroke, bottom-left to top-right,
+    // within a bounding box centered on y=0 - its midpoint therefore falls
+    // exactly on the line, same "diagonal of a centered box" trick as "x".
+    const sw_ = SIGNAL_MARK_SLASH_WIDTH;
+    const slashPath = `M0,${h2} L${sw_},${-h2}`;
+
+    // "∿" (Electromagnetic Guided): one full sine-like wave cycle, built
+    // from two symmetric cubic-bezier humps. It starts and ends on y=0 and
+    // also crosses y=0 at its midpoint, so - like the other marks - the
+    // line runs straight through its vertical center throughout.
+    const ww = SIGNAL_MARK_WAVE_WIDTH;
+    const waveQ = ww / 4;
+    const wavePath = `M0,0 C${waveQ},${-h2} ${waveQ},${-h2} ${waveQ * 2},0 `
+        + `C${waveQ * 3},${h2} ${waveQ * 3},${h2} ${ww},0`;
+
+    return { E: ePath, L: lPath, O: oPath, "^": caretPath, x: xPath, "/": slashPath, "∿": wavePath };
+}
+const SIGNAL_MARK_PATHS = buildSignalMarkPaths();
+
+// Marches at a fixed spacing along a polyline's arc length and returns a
+// {x, y, angleDeg} sample at each step. angleDeg follows the local segment's
+// direction but is normalized to stay within (-90, 90] so the glyph is
+// always drawn upright/readable regardless of which way the line's points
+// happen to be ordered.
+function markPointsAlongPolyline(points, spacing, startOffset = spacing / 2) {
+    const marks = [];
+    if (!points || points.length < 2) return marks;
+    let nextMark = startOffset;
+    let accum = 0;
+    for (let i = 0; i < points.length - 1; i++) {
+        const p1 = points[i], p2 = points[i + 1];
+        const dx = p2.x - p1.x, dy = p2.y - p1.y;
+        const len = Math.sqrt(dx * dx + dy * dy);
+        if (len < 0.001) continue;
+        let angleDeg = Math.atan2(dy, dx) * 180 / Math.PI;
+        if (angleDeg > 90) angleDeg -= 180;
+        else if (angleDeg <= -90) angleDeg += 180;
+        while (nextMark <= accum + len) {
+            const t = (nextMark - accum) / len;
+            marks.push({ x: p1.x + dx * t, y: p1.y + dy * t, angleDeg });
+            nextMark += spacing;
+        }
+        accum += len;
+    }
+    return marks;
+}
+
+// Renders a small italic vector glyph (e.g. "E" for ElectricalSignalConveying)
+// repeated along a SignalConveyingFunction connector line's drawn length -
+// see SIGNAL_CONVEYING_MARKS/SIGNAL_MARK_PATHS above.
+function SignalConveyingMarks({ points, markKey, color }) {
+    const d = SIGNAL_MARK_PATHS[markKey];
+    if (!d) return null;
+    const marks = markPointsAlongPolyline(points, SIGNAL_MARK_SPACING);
+    if (marks.length === 0) return null;
+    return (
+        <g pointerEvents="none">
+            {marks.map((m, i) => (
+                <path key={i} d={d} fill="none" stroke={color} strokeWidth={SIGNAL_MARK_STROKE} strokeLinecap="round"
+                    vectorEffect="non-scaling-stroke" transform={`translate(${m.x} ${m.y}) rotate(${m.angleDeg})`} />
+            ))}
+        </g>
+    );
+}
+
 function ConnectorLineSvg({ el, nodePosMap, selected, connColor, boostPct }) {
     const { primitive: prim } = el;
     const src = prim.sourceRef ? nodePosMap.get(prim.sourceRef) : null;
@@ -161,17 +324,26 @@ function ConnectorLineSvg({ el, nodePosMap, selected, connColor, boostPct }) {
     const ux = dx / len; const uy = dy / len;
     const mx = (p1.x + p2.x) / 2; const my = (p1.y + p2.y) / 2;
     const ar = Math.max(baseWidth * 3, 1.5);
+    // Signal-conveying decoration: a repeated glyph along the line for a
+    // known SignalConveyingFunctionTypeRepresentation sub-type (see above),
+    // with the base line itself hidden for the sub-types in
+    // SIGNAL_MARK_HIDE_LINE_TYPES (no physical conductor to draw).
+    const markKey = SIGNAL_CONVEYING_MARKS[el.signalConveyingType];
+    const hideLine = SIGNAL_MARK_HIDE_LINE_TYPES.has(el.signalConveyingType);
     return (
         <g>
             {/* Unselected: no vectorEffect so stroke scales naturally with the viewBox.
                 Selected/connectivity: vectorEffect keeps highlight width constant while zooming. */}
-            <polyline points={pts.map(p => `${p.x},${p.y}`).join(" ")} fill="none" stroke={color} strokeWidth={sw} strokeDasharray={scaledDash || undefined} vectorEffect={(selected || connColor) ? "non-scaling-stroke" : "none"} />
+            {!hideLine && (
+                <polyline points={pts.map(p => `${p.x},${p.y}`).join(" ")} fill="none" stroke={color} strokeWidth={sw} strokeDasharray={scaledDash || undefined} vectorEffect={(selected || connColor) ? "non-scaling-stroke" : "none"} />
+            )}
             {(selected || connColor) && (
                 <polygon
                     points={`${mx},${my} ${mx - ux * ar - uy * ar * 0.5},${my - uy * ar + ux * ar * 0.5} ${mx - ux * ar + uy * ar * 0.5},${my - uy * ar - ux * ar * 0.5}`}
                     fill={color} stroke="none" vectorEffect="non-scaling-stroke"
                 />
             )}
+            {markKey && <SignalConveyingMarks points={pts} markKey={markKey} color={color} />}
         </g>
     );
 }
@@ -477,6 +649,7 @@ export default function App() {
     const [mainFileFullName, setMainFileFullName] = useState("");
     const [loadMode, setLoadMode] = useState("with-profile");
     const [discXmlText, setDiscXmlText] = useState("");
+    const [discFileFullName, setDiscFileFullName] = useState("");
     const [parsed, setParsed] = useState(null);
     const [parseError, setParseError] = useState("");
     const [selectedId, setSelectedId] = useState(null);
@@ -587,6 +760,7 @@ export default function App() {
     async function handleDiscFile(e) {
         const file = e.target.files?.[0]; if (!file) return;
         const txt = await file.text(); setDiscXmlText(txt);
+        setDiscFileFullName(file.name);
         rebuild(mainXmlText, txt, "with-profile");
     }
     async function handleProfileFile(e) {
@@ -888,11 +1062,17 @@ export default function App() {
                         </div>
                         <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
                             <button style={{ ...S.btn, background: loadMode === "with-profile" ? "#eaf2ff" : "white" }} onClick={() => setLoadMode("with-profile")}>With profile</button>
-                            <button style={{ ...S.btn, background: loadMode === "internal" ? "#eaf2ff" : "white" }} onClick={() => { setLoadMode("internal"); setDiscXmlText(""); if (mainXmlText) rebuild(mainXmlText, "", "internal"); }}>Internal</button>
+                            <button style={{ ...S.btn, background: loadMode === "internal" ? "#eaf2ff" : "white" }} onClick={() => { setLoadMode("internal"); setDiscXmlText(""); setDiscFileFullName(""); if (mainXmlText) rebuild(mainXmlText, "", "internal"); }}>Internal</button>
                         </div>
                         <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                            <button style={S.btn} onClick={() => mainInputRef.current?.click()}>Load DEXPI XML</button>
-                            {loadMode === "with-profile" && <button style={S.btn} onClick={() => discInputRef.current?.click()}>DiscProfile.xml</button>}
+                            <button style={S.btn} onClick={() => mainInputRef.current?.click()}>
+                                Load DEXPI XML{mainXmlText && <span style={S.loadedTick} title="File loaded">✓</span>}
+                            </button>
+                            {loadMode === "with-profile" && (
+                                <button style={S.btn} onClick={() => discInputRef.current?.click()}>
+                                    DiscProfile.xml{discXmlText && <span style={S.loadedTick} title="File loaded">✓</span>}
+                                </button>
+                            )}
                             <button style={S.btn} onClick={() => profileInputRef.current?.click()} title="Load a validation profile">+ Profile</button>
                         </div>
                         <input ref={mainInputRef} type="file" accept=".xml" style={{ display: "none" }} onChange={handleMainFile} />
@@ -900,7 +1080,12 @@ export default function App() {
                         <input ref={profileInputRef} type="file" accept=".xml" style={{ display: "none" }} onChange={handleProfileFile} />
                         {mainFileFullName && (
                             <div style={{ marginTop: 6, fontSize: 12, color: "#57606a", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={mainFileFullName}>
-                                Loaded: <span style={{ fontWeight: 600, color: "#24292f" }}>{mainFileFullName}</span>
+                                Test file: <span style={{ fontWeight: 600, color: "#24292f" }}>{mainFileFullName}</span>
+                            </div>
+                        )}
+                        {loadMode === "with-profile" && discFileFullName && (
+                            <div style={{ marginTop: 2, fontSize: 12, color: "#57606a", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={discFileFullName}>
+                                Profile: <span style={{ fontWeight: 600, color: "#24292f" }}>{discFileFullName}</span>
                             </div>
                         )}
                         {parsed && <button style={{ ...S.btnPrimary, marginTop: 8, width: "100%" }} onClick={runValidation}>Run Validation</button>}
