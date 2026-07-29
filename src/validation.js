@@ -1,5 +1,5 @@
 // DEXPI Verificator – Validation Engine
-// Implements: VAL-001..005, VAX-001..005, VAE-001..006, PRF-001..007, ERR-E01..E19, RPT-001..004
+// Implements: VAL-001..005, VAX-001..005, VAE-001..006, PRF-001..007, ERR-E01..E20, RPT-001..004
 
 import { DEXPI_ALL_TYPES, DEXPI_STD_PREFIXES as _DEXPI_STD_PREFIXES } from "./dexpiTypes.js";
 // Auto-generated meta-model data for Plant (P&ID) and Process (PFD/PBD).
@@ -35,11 +35,13 @@ export const DEFAULT_SEVERITIES = {
     "ERR-E01": { level: "Error",   score: 3 },
     "ERR-E18": { level: "Error",   score: 3 },
     "ERR-E19": { level: "Error",   score: 3 },
+    "ERR-E20": { level: "Warning", score: 2 },
     "ERR":     { level: "Error",   score: 3 },
     "PRF-E01": { level: "Error",   score: 3 },
     "PRF-E02": { level: "Error",   score: 3 },
     "PRF-E04": { level: "Error",   score: 3 },
     "PRF-E05": { level: "Warning", score: 2 },
+    "PRF-E06": { level: "Error",   score: 3 },
 };
 
 export function resolveSeverity(ruleId, severityConfig) {
@@ -1238,7 +1240,7 @@ const DEXPI_BUILT_IN_ATTRIBUTE_RULES = {
     },
 };
 
-export function runBuiltInAttributeValidation(flatTree, severityConfig) {
+export function runBuiltInAttributeValidation(flatTree, severityConfig, profileAttrMap = new Map()) {
     const issues = [];
 
     // Does nodeType satisfy the rule's allowed-class constraint?
@@ -1277,6 +1279,16 @@ export function runBuiltInAttributeValidation(flatTree, severityConfig) {
             const loc = node.objectId ? `//*[@id='${node.objectId}']` : `(type: ${node.type})`;
 
             if (!typeAllowed(node.type, rule)) {
+                // A loaded profile's own class model (ClassExtension/ConcreteClass
+                // DataProperty declarations - see buildProfileAttributeMap() below)
+                // can legitimately extend a class with an attribute this hardcoded,
+                // profile-independent DEXPI 2.0 rule doesn't otherwise know about -
+                // e.g. a DiscProfile.xml NozzleExtension granting HeatTracingType to
+                // Nozzle, even though the base DEXPI 2.0 model only defines it for
+                // Plant/Piping.* types. Such a grant takes precedence over this
+                // built-in rule entirely for that class - no issue is raised.
+                const nodeSuffix = (node.type || "").split(/[.\/]/).pop();
+                if (profileAttrMap.has(localProp) && profileAttrMap.get(localProp).has(nodeSuffix)) continue;
                 // ERR-E18: attribute not allowed on this element class per DEXPI 2.0 model
                 const allowed = [
                     ...(rule.allowedPackages || []).map(p => `${p}.*`),
@@ -1338,6 +1350,29 @@ function buildProfileAttributeMap(profileXmlList) {
     for (const [cls, sup] of PLANT_HIERARCHY) {
         if (!hierarchy.has(cls)) hierarchy.set(cls, new Set());
         hierarchy.get(cls).add(sup);
+    }
+
+    // Seed classAttrs from the base Plant meta-model's own native Data
+    // property declarations (PLANT_PROPS) too - not just profile-declared
+    // ClassExtension/ConcreteClass DataProperty grants. Some attributes an
+    // ERR-E18 built-in rule cares about (e.g. HeatTracingType, natively
+    // defined on PipingComponent per PLANT_PROPS) are base DEXPI 2.0
+    // attributes, not profile extensions - a DiscProfile-redeclared
+    // subclass (e.g. "DiscProfile/InformationModel.WedgeGateValve", whose
+    // own superTypes chain reaches "PipingComponent" via
+    // "Plant/Piping.OperatedValve") needs to inherit that NATIVE grant the
+    // same way it inherits a profile-declared one, via the fixpoint
+    // propagation below - without this seed, PipingComponent would have no
+    // classAttrs entry at all (since no profile ClassExtension re-declares
+    // an attribute the base model already grants), and the whole chain
+    // would incorrectly appear unbacked.
+    for (const [cls, dcsv] of PLANT_PROPS) {
+        if (!dcsv) continue;
+        if (!classAttrs.has(cls)) classAttrs.set(cls, new Set());
+        for (const entry of dcsv.split("|")) {
+            const name = entry.split(":")[0];
+            if (name) classAttrs.get(cls).add(name);
+        }
     }
 
     const parser = new DOMParser();
@@ -1735,7 +1770,18 @@ export function runProfileValidation(flatTree, mergedConstraints, overrideLog, s
  * Parse a profile XML and extract:
  *   symbolUsage : Map<symbolName, string[]>    – normalised DEXPI type strings allowed for the symbol
  *   symbolNodes : Map<symbolName, {x,y,dir}[]> – profile connection points in symbol-local coords
+ *   labelTemplateAttrs : Map<symbolName, Set<attrName>> – bare AttributeName placeholders
+ *     (e.g. "ObjectDisplayName") referenced across ALL of the symbol's variants' own
+ *     Profile/LabelTemplate.Text values — see PRF-E06 below.
  */
+// Matches an optional "RoleName:" role-path prefix followed by a bare
+// "<AttrName>" placeholder inside a Profile/LabelTemplate.Text value — same
+// convention as dexpiParser.js's resolveProfileLabelFallback() placeholder
+// regex. Only the bare attribute name (capture group 1) is kept; the
+// role-path prefix (if any) names a related object's class, not part of the
+// attribute name itself.
+const LABEL_TEMPLATE_PLACEHOLDER_RE = /(?:[A-Za-z][A-Za-z0-9_]*:)?<([^<>]+)>/g;
+
 function parseProfileSymbols(profileXml) {
     const symbolUsage = new Map();
     const symbolNodes = new Map();
@@ -1743,9 +1789,10 @@ function parseProfileSymbols(profileXml) {
     // actuator/valve-operator connection points. A PipingNodePosition in the drawing
     // must NOT align with these — pipes cannot attach to actuator ports.
     const auxiliaryNodes = new Map();
+    const labelTemplateAttrs = new Map();
     const parser = new DOMParser();
     const doc = parser.parseFromString(profileXml, "application/xml");
-    if (doc.querySelector("parsererror")) return { symbolUsage, symbolNodes, auxiliaryNodes, typeToSymbols: new Map() };
+    if (doc.querySelector("parsererror")) return { symbolUsage, symbolNodes, auxiliaryNodes, labelTemplateAttrs, typeToSymbols: new Map() };
 
     doc.querySelectorAll('Object[type="Profile/Symbol"]').forEach(sym => {
         const name = sym.getAttribute("name");
@@ -1767,7 +1814,24 @@ function parseProfileSymbols(profileXml) {
         // NodePositions are inside Profile/SymbolVariant children
         const nodes = [];
         const auxNodes = [];
+        const attrs = new Set();
         sym.querySelectorAll('Object[type="Profile/SymbolVariant"]').forEach(variant => {
+            const ltComp = Array.from(variant.children).find(
+                c => c.tagName === "Components" && c.getAttribute("property") === "LabelTemplates"
+            );
+            if (ltComp) {
+                Array.from(ltComp.children).filter(c => c.tagName === "Object").forEach(lt => {
+                    const textEl = Array.from(lt.children).find(
+                        c => c.tagName === "Data" && c.getAttribute("property") === "Text"
+                    );
+                    const str = textEl?.querySelector("String");
+                    const text = str ? str.textContent : "";
+                    if (!text) return;
+                    LABEL_TEMPLATE_PLACEHOLDER_RE.lastIndex = 0;
+                    let m;
+                    while ((m = LABEL_TEMPLATE_PLACEHOLDER_RE.exec(text)) !== null) attrs.add(m[1]);
+                });
+            }
             variant.querySelectorAll('Object[type="Profile/NodePosition"]').forEach(np => {
                 let x = null, y = null, dir = null, npType = null;
                 for (const data of np.children) {
@@ -1806,6 +1870,7 @@ function parseProfileSymbols(profileXml) {
         });
         if (nodes.length)    symbolNodes.set(name, nodes);
         if (auxNodes.length) auxiliaryNodes.set(name, auxNodes);
+        if (attrs.size)      labelTemplateAttrs.set(name, attrs);
     });
 
     // Build reverse map: dexpi-type → Set<symbolName> (non-decorator symbols only)
@@ -1818,7 +1883,7 @@ function parseProfileSymbols(profileXml) {
         });
     });
 
-    return { symbolUsage, symbolNodes, auxiliaryNodes, typeToSymbols };
+    return { symbolUsage, symbolNodes, auxiliaryNodes, labelTemplateAttrs, typeToSymbols };
 }
 
 /**
@@ -1843,7 +1908,7 @@ export function validateSymbolRules(mainXml, profileXml, profileName, severityCo
     const issues = [];
     if (!mainXml || !profileXml) return issues;
 
-    const { symbolUsage, symbolNodes, auxiliaryNodes, typeToSymbols } = parseProfileSymbols(profileXml);
+    const { symbolUsage, symbolNodes, auxiliaryNodes, labelTemplateAttrs, typeToSymbols } = parseProfileSymbols(profileXml);
 
     // Combined symbol set across all loaded profiles — used by PRF-E04 to avoid
     // false positives when a SymbolUsage references a symbol defined in a different
@@ -1864,6 +1929,28 @@ export function validateSymbolRules(mainXml, profileXml, profileName, severityCo
     doc.querySelectorAll("Object[id]").forEach(o =>
         objectTypes.set(o.getAttribute("id"), o.getAttribute("type") || "")
     );
+
+    // Build owning-object id → [{attrName, el}, ...] for every
+    // Core/Diagram.AttributeRepresentation in the drawing — used by PRF-E06
+    // below to cross-check each represented object's own TextTemplate
+    // AttributeName(s) against the placed symbol's own Profile/LabelTemplate
+    // placeholders (labelTemplateAttrs, from parseProfileSymbols above).
+    const attrRepsByTargetId = new Map();
+    doc.querySelectorAll('Object[type="Core/Diagram.AttributeRepresentation"]').forEach(attrRep => {
+        const attrNameEl = Array.from(attrRep.children).find(
+            c => c.tagName === "Data" && c.getAttribute("property") === "AttributeName"
+        );
+        const attrName = attrNameEl?.querySelector("String")?.textContent?.trim();
+        if (!attrName) return;
+        const objRefEl = Array.from(attrRep.children).find(
+            c => c.tagName === "References" && c.getAttribute("property") === "Object"
+        );
+        const rawTarget = (objRefEl?.getAttribute("objects") || "").split(/\s+/).filter(Boolean)[0];
+        const targetId = rawTarget ? rawTarget.replace(/^#/, "") : null;
+        if (!targetId) return;
+        if (!attrRepsByTargetId.has(targetId)) attrRepsByTargetId.set(targetId, []);
+        attrRepsByTargetId.get(targetId).push(attrName);
+    });
 
     // Compute drawing bounding box from all Position elements
     let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
@@ -2023,6 +2110,41 @@ export function validateSymbolRules(mainXml, profileXml, profileName, severityCo
                         });
                     }
                 }
+            }
+        }
+
+        // ── PRF-E06: TextTemplate AttributeName not offered by the placed symbol ──
+        // representsId's own Core/Diagram.AttributeRepresentation Fragment(s) (if
+        // any) name an AttributeName that should match one of the placeholders the
+        // PLACED symbol's own Profile/LabelTemplate(s) actually define (e.g. symbol
+        // 'ND0192A' only offers ObjectDisplayName, NominalDiameterRepresentation,
+        // ValveDataSheet, TrimType, LockMechanism) — referencing an attribute the
+        // symbol doesn't offer at all (e.g. 'ItemTag') is flagged even if that
+        // attribute happens to resolve fine elsewhere (see ERR-E20, which checks
+        // resolvability rather than the profile's own declared placeholder set).
+        // Only checked when the symbol defines at least one LabelTemplate with a
+        // placeholder at all — a symbol with none simply isn't modelled for this
+        // check and shouldn't produce false positives.
+        {
+            const allowedAttrs = labelTemplateAttrs.get(symName);
+            if (allowedAttrs && allowedAttrs.size && representsId) {
+                const usedAttrs = attrRepsByTargetId.get(representsId) || [];
+                usedAttrs.forEach(attrName => {
+                    const bare = attrName.split("/").pop();
+                    if (allowedAttrs.has(attrName) || allowedAttrs.has(bare)) return;
+                    const sev = resolveSeverity("PRF-E06", severityConfig);
+                    issues.push({
+                        objectId:    representsId,
+                        objectType:  modelType,
+                        ruleId:      "PRF-E06",
+                        severity:    sev.level,
+                        score:       sev.score,
+                        description: `Invalid Text Template attribute used: AttributeName '${attrName}' referenced for '${representsId}' is not a valid attribute for symbol '${symName}', which only allows: ${[...allowedAttrs].join(", ")}.`,
+                        location:    `//*[@id='${representsId}']`,
+                        profileSource: profileName,
+                        suggestedCorrection: `Change the AttributeName to one of: ${[...allowedAttrs].join(", ")}, or remove this Fragment.`,
+                    });
+                });
             }
         }
 
@@ -2295,6 +2417,166 @@ function runDiscProfileGraphicalValidation(mainXml, flatTree, severityConfig) {
 }
 
 
+// Union of every bare AttributeName referenced anywhere across ALL of a set
+// of loaded profile XMLs' own Profile/LabelTemplate placeholders — i.e.
+// every symbol's labelTemplateAttrs (see parseProfileSymbols()) flattened
+// together, regardless of which specific symbol each one belongs to. Used
+// by runTextTemplateAttributeValidation() (ERR-E20) below to recognise a
+// currently-unresolved instance AttributeName as a real, profile-defined
+// attribute (just not populated for this particular instance) rather than
+// a broken/typo'd reference.
+function collectProfileLabelTemplateAttrNames(profileXmlList) {
+    const all = new Set();
+    for (const xml of profileXmlList) {
+        if (!xml) continue;
+        const { labelTemplateAttrs } = parseProfileSymbols(xml);
+        for (const attrs of labelTemplateAttrs.values()) {
+            for (const a of attrs) all.add(a);
+        }
+    }
+    return all;
+}
+
+// ─── Text Template Attribute Reference Validation (ERR-E20) ──────────────────
+//
+// A Core/Diagram.TextTemplate builds up a label's displayed text from
+// Core/Diagram.AttributeRepresentation Fragments, each naming an
+// AttributeName and a References[@property="Object"] pointing at the
+// "owning" object whose attribute value should be substituted in (see
+// dexpiParser.js's resolveTemplateFragments()/renderPrimitive() — this is
+// exactly what "Profile labels" renders). If AttributeName doesn't actually
+// resolve to anything on that object — a typo, or a Fragment copy/pasted
+// from a different object's template and left pointing at the wrong
+// attribute (e.g. a literal "SPPID: AlarmH" that exists nowhere in the
+// file) — the Fragment silently renders as blank text at runtime, with no
+// other indication anything is wrong. This rule surfaces that explicitly.
+//
+// Resolution mirrors dexpiParser.js's ownProperty()/lookupProperty(): a
+// direct Data property on the owning object (matched as written, as its
+// bare/last-segment name, or under a "DiscProfile/" prefix), or the same
+// on a nested id-bearing descendant or any References target up to two
+// hops out — since several legitimate attributes (e.g.
+// ProcessPlantIdentificationCode on a ProcessPlant reached via
+// ParentStructure) live on a related object rather than the owning object
+// itself.
+//
+// profileLabelAttrNames (bare attribute names referenced anywhere across
+// EVERY loaded profile's own Profile/LabelTemplate placeholders, regardless
+// of which symbol they belong to — see collectProfileLabelTemplateAttrNames()
+// below) exempts a currently-unresolved AttributeName from this check
+// entirely when the profile itself recognises it as a real, legitimate
+// attribute name (e.g. "NominalDiameterRepresentation") - such attributes
+// are, by the profile's own design, sometimes populated and sometimes not
+// (not mandatory), so a blank one isn't a defect. An AttributeName the
+// profile doesn't recognise at all (e.g. a genuine typo like "SPPID:
+// AlarmH") still gets flagged.
+function runTextTemplateAttributeValidation(mainXml, severityConfig, profileLabelAttrNames = new Set()) {
+    const issues = [];
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(mainXml, "application/xml");
+    if (doc.querySelector("parsererror")) return issues;
+
+    const propsById = new Map();            // id -> Set<direct Data property name>
+    const typeById = new Map();              // id -> type
+    const childrenByParentId = new Map();    // id -> [nested id-bearing descendant id, ...]
+    const referencesByParentId = new Map();  // id -> [any References target id, ...]
+    const lineNumberMap = new Map();         // id -> line number (for issue location)
+
+    {
+        const xmlLines = mainXml.split("\n");
+        xmlLines.forEach((line, i) => {
+            const m = line.match(/\bid=["']([^"']+)["']/);
+            if (m && !lineNumberMap.has(m[1])) lineNumberMap.set(m[1], i + 1);
+        });
+    }
+
+    doc.querySelectorAll("Object[id]").forEach(el => {
+        const id = el.getAttribute("id");
+        typeById.set(id, el.getAttribute("type") || "");
+
+        const props = new Set();
+        directChildren(el, "Data").forEach(d => {
+            const prop = d.getAttribute("property");
+            if (prop) props.add(prop);
+        });
+        if (props.size) propsById.set(id, props);
+
+        let p = el.parentNode;
+        while (p && (typeof p.getAttribute !== "function" || !p.getAttribute("id"))) p = p.parentNode;
+        const parentId = p && typeof p.getAttribute === "function" ? p.getAttribute("id") : null;
+        if (parentId && parentId !== id) {
+            if (!childrenByParentId.has(parentId)) childrenByParentId.set(parentId, []);
+            childrenByParentId.get(parentId).push(id);
+        }
+
+        const refTargets = [];
+        directChildren(el, "References").forEach(r => {
+            (r.getAttribute("objects") || "").split(/\s+/).filter(Boolean).forEach(tok => {
+                refTargets.push(tok.replace(/^#/, ""));
+            });
+        });
+        if (refTargets.length) referencesByParentId.set(id, refTargets);
+    });
+
+    function ownProperty(objectId, attributeName) {
+        if (!objectId || !attributeName) return false;
+        const props = propsById.get(objectId);
+        if (!props) return false;
+        const bare = attributeName.split("/").pop();
+        return props.has(attributeName) || props.has(bare) || props.has(`DiscProfile/${bare}`);
+    }
+
+    function lookupProperty(objectId, attributeName) {
+        if (ownProperty(objectId, attributeName)) return true;
+        if (!objectId) return false;
+        const seen = new Set([objectId]);
+        let frontier = [objectId];
+        for (let depth = 0; depth < 2 && frontier.length; depth++) {
+            const next = [];
+            for (const id of frontier) {
+                const neighborIds = [...(childrenByParentId.get(id) || []), ...(referencesByParentId.get(id) || [])];
+                for (const nid of neighborIds) {
+                    if (!nid || seen.has(nid)) continue;
+                    seen.add(nid);
+                    if (ownProperty(nid, attributeName)) return true;
+                    next.push(nid);
+                }
+            }
+            frontier = next;
+        }
+        return false;
+    }
+
+    doc.querySelectorAll('Object[type="Core/Diagram.AttributeRepresentation"]').forEach(attrRep => {
+        const attrName = getDataText(attrRep, "AttributeName");
+        if (!attrName) return;
+
+        const objRef = directChildren(attrRep, "References").find(r => r.getAttribute("property") === "Object");
+        const rawTarget = (objRef?.getAttribute("objects") || "").split(/\s+/).filter(Boolean)[0];
+        const targetId = rawTarget ? rawTarget.replace(/^#/, "") : null;
+        if (!targetId) return; // no owning object named — nothing to validate against
+        if (!typeById.has(targetId)) return; // broken reference — already reported by VAL-005/ERR-E16
+
+        if (lookupProperty(targetId, attrName)) return; // resolves fine
+
+        const bareAttrName = attrName.split("/").pop();
+        if (profileLabelAttrNames.has(attrName) || profileLabelAttrNames.has(bareAttrName)) return; // a real, profile-recognised attribute that's just not populated for this instance — not mandatory
+
+        const targetType = typeById.get(targetId) || "(unknown)";
+        const sev = resolveSeverity("ERR-E20", severityConfig);
+        issues.push({
+            objectId: targetId, objectType: targetType, ruleId: "ERR-E20",
+            severity: sev.level, score: sev.score,
+            description: `Invalid Text Template Attribute Reference: AttributeName '${attrName}' is not a valid or reachable attribute of the owning object '${targetId}' (type '${targetType}'). This TextTemplate Fragment will resolve to blank text.`,
+            location: `//*[@id='${targetId}']`, profileSource: "Base",
+            suggestedCorrection: `Correct the AttributeName to a valid property of '${targetType}' (or an object it directly references), or remove this Fragment.`,
+            ...(lineNumberMap.has(targetId) ? { lineNumber: lineNumberMap.get(targetId) } : {}),
+        });
+    });
+
+    return issues;
+}
+
 // ─── Full Validation Run ──────────────────────────────────────────────────────
 
 export function runFullValidation({ mainXml, flatTree, profiles, severityConfig, externalValidIds = new Set(), discXml = null, discXmlName = "DiscProfile" }) {
@@ -2345,10 +2627,13 @@ export function runFullValidation({ mainXml, flatTree, profiles, severityConfig,
     });
 
     allIssues.push(...runXmlSchemaValidation(mainXml, flatTree, severityConfig, externalValidIds, profileTypes, profileExtProps));
+    // Every attribute name ANY loaded profile's own LabelTemplate catalog
+    // recognises anywhere, across every symbol - see
+    // collectProfileLabelTemplateAttrNames() and runTextTemplateAttributeValidation() (ERR-E20).
+    const profileLabelAttrNames = collectProfileLabelTemplateAttrNames(allProfileXmls.map(p => p.xml));
+    allIssues.push(...runTextTemplateAttributeValidation(mainXml, severityConfig, profileLabelAttrNames));
     allIssues.push(...runStructuralValidation(flatTree, severityConfig));
     allIssues.push(...runEngineeringValidation(flatTree, severityConfig));
-    // ERR-E18 / ERR-E19 from the DEXPI 2.0 metamodel — runs without any profile loaded
-    allIssues.push(...runBuiltInAttributeValidation(flatTree, severityConfig));
 
     // Build full XML string list for cross-profile symbol lookup in PRF-E04.
     // Profiles build on one another in load order; a symbol declared in the base
@@ -2358,6 +2643,20 @@ export function runFullValidation({ mainXml, flatTree, profiles, severityConfig,
         ...(profiles.map(p => p.xml).filter(Boolean)),
         ...(discXml && !profiles.some(p => p.xml === discXml) ? [discXml] : []),
     ];
+    // Class-model attribute map (ClassExtension/ConcreteClass DataProperty
+    // declarations) from all loaded profile XMLs - built unconditionally
+    // (not gated on any Profile/PropertyConstraint existing) since a
+    // ClassExtension alone is enough to legitimately grant an attribute to a
+    // class. Plant.xml hierarchy is pre-seeded inside buildProfileAttributeMap
+    // via PLANT_CLASS_SUPERTYPES — no need to pass Plant.xml raw text. Used
+    // both by the hardcoded built-in DEXPI 2.0 rules below (ERR-E18/E19) and
+    // by the profile PropertyConstraint-driven check further down.
+    const profileAttrMap = buildProfileAttributeMap(allProfileXmlStrings);
+
+    // ERR-E18 / ERR-E19 from the DEXPI 2.0 metamodel — runs without any profile
+    // loaded, but a loaded profile's own class model (profileAttrMap) can still
+    // override/extend it (see runBuiltInAttributeValidation()).
+    allIssues.push(...runBuiltInAttributeValidation(flatTree, severityConfig, profileAttrMap));
 
     if (profiles.length > 0) {
         const profileSets = profiles.map(p => ({ name: p.name, constraints: p.constraints }));
@@ -2393,11 +2692,7 @@ export function runFullValidation({ mainXml, flatTree, profiles, severityConfig,
             allConstraints.push(...parseProfileConstraints(discXml, discXmlName));
         }
         if (allConstraints.length > 0) {
-            // Build class-model attribute map from all loaded profile XMLs so that
-            // ERR-E18 doesn't fire for attributes granted by DataProperty inheritance.
-            // Plant.xml hierarchy is pre-seeded inside buildProfileAttributeMap
-            // via PLANT_CLASS_SUPERTYPES — no need to pass Plant.xml raw text.
-            const profileAttrMap = buildProfileAttributeMap(allProfileXmlStrings);
+            // profileAttrMap built once, above, and shared with runBuiltInAttributeValidation.
             allIssues.push(...runAttributeConstraintValidation(flatTree, allConstraints, severityConfig, profileAttrMap));
         }
     }

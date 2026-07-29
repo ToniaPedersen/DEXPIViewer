@@ -101,7 +101,106 @@ function ellipseArcToPath(cx, cy, rx, ry, startDeg, endDeg, rotation) {
 
 // ---------- SVG Rendering ----------------------------------------------------
 
-function renderPrimitive(primitive, key, textColorOverride = null, strokeMult = 1) {
+// Renders text that may contain embedded newlines (DiscProfile attribute
+// values occasionally do - e.g. a PropertyBreak's BreakValue1/BreakValue2
+// carry a literal "\n" between an area code and a line number) as one
+// <tspan> per line, each positioned at the same x with an explicit absolute
+// y - a single SVG <text> node otherwise collapses/ignores "\n" and renders
+// everything on one line. Each line's y is computed so the overall
+// multi-line block still honours the original single-line vertical
+// alignment: "hanging" grows downward from the anchor point, "baseline"
+// (bottom-aligned) grows upward so the LAST line's baseline lands on it,
+// and "middle" centers the whole block on it. Falls back to a plain single
+// <text> (no <tspan> wrapper) when there's only one line, to keep the
+// common case's markup unchanged. Blank lines are collapsed to a
+// non-breaking space so an empty BreakValue segment still reserves its row
+// instead of visually merging with its neighbour.
+// Ensures rendered text always reads left-to-right (horizontal) or
+// bottom-to-top (vertical) - never upside-down, right-to-left, or
+// top-to-bottom - regardless of a symbol's own placement rotation. Folds the
+// TOTAL effective rotation (parentRotation - e.g. a symbol placement's own
+// Rotation - PLUS localRotation - e.g. a LabelTemplate's or Text primitive's
+// own Rotation) into the canonical readable set: 0 deg (horizontal) or -90
+// deg / 270 deg (vertical, bottom-to-top). Any other angle - one that would
+// render backwards or upside-down - is brought into that set by adding or
+// subtracting 180 deg; since that changes which side of the anchor point
+// the text visually falls on, the horizontal anchor and vertical baseline
+// are swapped to the opposite side too, so flipped text still sits where it
+// was authored to (e.g. "to the right of its anchor point"), just no longer
+// illegible. Returns the LOCAL rotation to actually render (i.e. already
+// compensated for parentRotation, so parentRotation + returned.rotation ==
+// the canonical target) plus the (possibly swapped) anchor/baseline.
+function readableTextOrientation(parentRotation, localRotation, anchor, baseline) {
+    const raw = (((parentRotation || 0) + (localRotation || 0)) % 360 + 360) % 360; // [0, 360)
+    let target;
+    if (raw === 0) target = 0;
+    else if (raw === 90) target = -90;
+    else if (raw === 180) target = 0;
+    else if (raw === 270) target = -90;
+    else if (raw > 90 && raw < 270) target = raw - 180;
+    else target = raw > 270 ? raw - 360 : raw;
+    let delta = target - raw;
+    delta = ((delta + 180) % 360 + 360) % 360 - 180; // normalize into (-180,180]
+    const flipped = Math.abs(Math.abs(delta) - 180) < 0.01;
+    const rotation = (localRotation || 0) + delta;
+    if (!flipped) return { rotation, anchor, baseline };
+    const flipAnchor = a => a === "start" ? "end" : a === "end" ? "start" : a;
+    const flipBaseline = b => b === "hanging" ? "baseline" : b === "baseline" ? "hanging" : b;
+    return { rotation, anchor: flipAnchor(anchor), baseline: flipBaseline(baseline) };
+}
+
+// Renders text that may contain embedded newlines (DiscProfile attribute
+// values occasionally do - e.g. a PropertyBreak's BreakValue1/BreakValue2
+// carry a literal "\n" between an area code and a line number) as one
+// <tspan> per line, each positioned at the same x with an explicit absolute
+// y - a single SVG <text> node otherwise collapses/ignores "\n" and renders
+// everything on one line. Each line's y is computed so the overall
+// multi-line block still honours the original single-line vertical
+// alignment: "hanging" grows downward from the anchor point, "baseline"
+// (bottom-aligned) grows upward so the LAST line's baseline lands on it,
+// and "middle" centers the whole block on it. Falls back to a plain single
+// <text> (no <tspan> wrapper) when there's only one line, to keep the
+// common case's markup unchanged. Blank lines are collapsed to a
+// non-breaking space so an empty BreakValue segment still reserves its row
+// instead of visually merging with its neighbour.
+//
+// counterScale ({sx, sy}, optional): when given, the text is wrapped in a
+// nested <g> that cancels out a parent symbol placement's own scale/mirror
+// (translate to the label's local anchor point, undo the parent's scale -
+// including any mirror sign baked into sx - then draw the text at the new
+// local origin) so its glyphs render at their true absolute Size regardless
+// of how large/small/non-uniformly the containing symbol instance was
+// placed - see the "LabelTemplates and TextTemplate should not scale"
+// requirement. rotation still composes normally since it isn't part of
+// what's being cancelled.
+function renderMultilineText({ key, x, y, rotation, fontFamily, fontSize, fill, anchor, baseline, counterScale }, text) {
+    const lines = String(text ?? "").split(/\r\n|\r|\n/).map(l => l.trim());
+    let transform, drawX = x, drawY = y;
+    if (counterScale) {
+        const rot = rotation ? ` rotate(${rotation})` : "";
+        transform = `translate(${x} ${y}) scale(${1 / counterScale.sx} ${1 / counterScale.sy})${rot}`;
+        drawX = 0; drawY = 0;
+    } else {
+        transform = rotation ? `rotate(${rotation} ${x} ${y})` : undefined;
+    }
+    if (lines.length <= 1) {
+        return <text key={key} x={drawX} y={drawY} fontFamily={fontFamily} fontSize={fontSize} fill={fill} textAnchor={anchor} dominantBaseline={baseline} transform={transform}>{text}</text>;
+    }
+    const lineHeight = fontSize * 1.2;
+    const n = lines.length;
+    const yFor = i => {
+        if (baseline === "hanging") return drawY + i * lineHeight;
+        if (baseline === "middle") return drawY + (i - (n - 1) / 2) * lineHeight;
+        return drawY - (n - 1 - i) * lineHeight;
+    };
+    return (
+        <text key={key} fontFamily={fontFamily} fontSize={fontSize} fill={fill} textAnchor={anchor} dominantBaseline={baseline} transform={transform}>
+            {lines.map((line, i) => <tspan key={i} x={drawX} y={yFor(i)}>{line || " "}</tspan>)}
+        </text>
+    );
+}
+
+function renderPrimitive(primitive, key, textColorOverride = null, strokeMult = 1, showProfileLabels = false, parentRotation = 0, symbolScale = null) {
     const fill = v => v?.style === "Transparent" ? "none" : (v?.color || "none");
     const sw = v => v * strokeMult;
     if (primitive.kind === "polyline") return <polyline key={key} points={primitive.points.map(p => `${p.x},${p.y}`).join(" ")} fill="none" stroke={primitive.stroke.color} strokeWidth={sw(primitive.stroke.width)} strokeDasharray={primitive.stroke.dashArray || undefined} vectorEffect="non-scaling-stroke" />;
@@ -110,12 +209,80 @@ function renderPrimitive(primitive, key, textColorOverride = null, strokeMult = 
     if (primitive.kind === "ellipse") return <ellipse key={key} cx={primitive.center.x} cy={primitive.center.y} rx={primitive.rx} ry={primitive.ry} transform={`rotate(${primitive.rotation} ${primitive.center.x} ${primitive.center.y})`} fill={fill(primitive.fill)} stroke={primitive.stroke.color} strokeWidth={sw(primitive.stroke.width)} vectorEffect="non-scaling-stroke" />;
     if (primitive.kind === "rect") return <rect key={key} x={primitive.center.x - primitive.width / 2} y={primitive.center.y - primitive.height / 2} width={primitive.width} height={primitive.height} transform={`rotate(${primitive.rotation} ${primitive.center.x} ${primitive.center.y})`} fill={fill(primitive.fill)} stroke={primitive.stroke.color} strokeWidth={sw(primitive.stroke.width)} vectorEffect="non-scaling-stroke" />;
     if (primitive.kind === "text") {
-        const anchor = primitive.style.horizontal.toLowerCase().includes("left") ? "start" : primitive.style.horizontal.toLowerCase().includes("right") ? "end" : "middle";
-        const baseline = primitive.style.vertical.toLowerCase().includes("bottom") ? "baseline" : primitive.style.vertical.toLowerCase().includes("top") ? "hanging" : "middle";
+        const rawAnchor = primitive.style.horizontal.toLowerCase().includes("left") ? "start" : primitive.style.horizontal.toLowerCase().includes("right") ? "end" : "middle";
+        const rawBaseline = primitive.style.vertical.toLowerCase().includes("bottom") ? "baseline" : primitive.style.vertical.toLowerCase().includes("top") ? "hanging" : "middle";
         // textColorOverride applies the selection highlight colour directly to text fill,
         // since text has no stroke geometry for highlightPrimitive to overlay.
         const textFill = textColorOverride || parseColor(primitive.style.color);
-        return <text key={key} x={primitive.position.x} y={primitive.position.y} fontFamily={primitive.style.font} fontSize={primitive.style.size} fill={textFill} textAnchor={anchor} dominantBaseline={baseline} transform={`rotate(${primitive.rotation} ${primitive.position.x} ${primitive.position.y})`}>{primitive.value}</text>;
+        // Profile labels, CHECKED: text shown must come ONLY from a placed
+        // DiscProfile catalog symbol - never from any instance-authored
+        // content. For a label belonging to a DiscProfile-catalogued symbol
+        // (primitive.isDiscProfileLabel, computed in dexpiParser.js), this
+        // Text primitive's own content is NEVER shown - the checkbox always
+        // looks up the placed symbol's own catalog Profile/LabelTemplate
+        // instead, never this Text's instance-authored Core/Diagram.
+        // TextTemplate, even when that instance Template would itself
+        // resolve to real content. dexpiParser.js's third pass in
+        // collectGraphicalElements() always synthesizes el.labelOverlays for
+        // every catalogued symbol placement; SymbolGraphic renders those
+        // separately (at the catalog LabelTemplate's own local Position/
+        // Rotation/Alignment, not this Text's position), which is why this
+        // primitive itself contributes nothing when isDiscProfileLabel.
+        // A Text that ISN'T tied to any catalogued symbol at all - even one
+        // that still carries its own attribute-backed TextTemplate
+        // (primitive.isProfileGoverned via instanceHasAttr, isDiscProfileLabel
+        // false - e.g. a pipe segment's nominal-diameter Text referencing
+        // NominalDiameterNumericalValueRepresentation directly, with no
+        // Profile/SymbolUsage involved) - has no catalogued symbol to defer
+        // to, so it's ignored entirely and shows nothing when checked, same
+        // as isDiscProfileLabel. isProfileGoverned only matters for the
+        // UNCHECKED case below.
+        // When "Profile labels" is UNCHECKED, a Profile-governed label never
+        // shows its raw <Data property="Text"> literal any more - that's the
+        // instance's originally-authored/exported string, which the loaded
+        // Profile supersedes. Instead:
+        //  - no real Profile-driven backing at all (no TextTemplate on the
+        //    instance AND no LabelTemplate on the symbol, or either exists
+        //    but names no attribute whatsoever - primitive.
+        //    hasProfileAttributeBacking, computed in dexpiParser.js) -> show
+        //    nothing; a purely literal label isn't something the Profile has
+        //    any say over.
+        //  - otherwise -> show primitive.validRawProfileText, the attribute-
+        //    resolved value from this Text's own TextTemplate (or the
+        //    catalog LabelTemplate fallback), un-blanked by the suspect-
+        //    duplicate-template pass that only affects the CHECKED-state
+        //    overlay-preference decision (labelOverlays never render when
+        //    unchecked, so there's no risk of double-rendering here) - AND
+        //    with any Fragment whose AttributeName isn't actually valid for
+        //    the owning object's placed DiscProfile symbol (e.g. "ItemTag"
+        //    referenced for an object represented by symbol ND0192A, which
+        //    only offers ObjectDisplayName/NominalDiameterRepresentation/
+        //    ValveDataSheet/TrimType/LockMechanism - see PRF-E06 in
+        //    validation.js) suppressed, rather than shown just because it
+        //    happens to resolve to a real value elsewhere.
+        // The literal instance value is only ever shown when no
+        // DiscProfile.xml is loaded at all, or for a label with neither a
+        // catalogued symbol nor its own TextTemplate (isProfileGoverned is
+        // always false in both cases).
+        const displayText = showProfileLabels
+            ? ((primitive.isDiscProfileLabel || primitive.isProfileGoverned) ? "" : primitive.value)
+            : (primitive.isProfileGoverned
+                ? (primitive.hasProfileAttributeBacking ? (primitive.validRawProfileText ?? primitive.value) : "")
+                : primitive.value);
+        // "LabelTemplates and TextTemplate should not scale": a Text
+        // primitive driven by a Core/Diagram.TextTemplate (templateFragments)
+        // that lives inside a symbol's own catalog primitives (SymbolGraphic
+        // passes symbolScale in that case) renders at its true absolute Size
+        // regardless of that symbol instance's own placement scale - see
+        // renderMultilineText's counterScale. Plain (non-templated) text
+        // baked into a symbol keeps scaling with it as before.
+        const useCounterScale = (symbolScale && primitive.templateFragments) ? symbolScale : null;
+        const { rotation, anchor, baseline } = readableTextOrientation(parentRotation, primitive.rotation, rawAnchor, rawBaseline);
+        return renderMultilineText({
+            key, x: primitive.position.x, y: primitive.position.y, rotation,
+            fontFamily: primitive.style.font, fontSize: primitive.style.size, fill: textFill, anchor, baseline,
+            counterScale: useCounterScale,
+        }, displayText);
     }
     if (primitive.kind === "ellipseArc") {
         const d = ellipseArcToPath(primitive.center.x, primitive.center.y, primitive.rx, primitive.ry, primitive.startAngle, primitive.endAngle, primitive.rotation);
@@ -518,7 +685,35 @@ function HeatTracePIF({ el }) {
     return <g transform={transform} pointerEvents="none">{overlays}</g>;
 }
 
-function SymbolGraphic({ el, selected, connHighlight, onSelect, boostPct, boostSymbolOutlines }) {
+// Renders one synthesized "Profile labels" symbol overlay (el.labelOverlays
+// entry, computed in dexpiParser.js from the DiscProfile symbol's own
+// Profile/LabelTemplate) as a <text>, in the SAME local symbol-coordinate
+// system as the symbol's own primitives - it's meant to be rendered inside
+// SymbolGraphic's already-transformed <g transform={transform}> below, so
+// the browser's own SVG transform composition (translate/rotate/scale from
+// the placement, applied automatically to this nested element) handles
+// local→world placement without any manual matrix math here.
+// el is the owning symbolUsage drawn element - its own placement Rotation/
+// ScaleX/ScaleY/isMirrored are needed both to counter-scale this label back
+// to its true absolute Size (see renderMultilineText's counterScale - a
+// Profile/LabelTemplate overlay always gets this, unconditionally, unlike
+// renderPrimitive's more narrowly-scoped templateFragments check) and to
+// fold the label's total effective rotation (placement + the LabelTemplate's
+// own local Rotation) into a readable orientation.
+function renderLabelOverlay(ov, key, el) {
+    const align = (ov.alignment || "").toLowerCase();
+    const rawAnchor = align.includes("left") ? "start" : align.includes("right") ? "end" : "middle";
+    const rawBaseline = align.includes("bottom") ? "baseline" : align.includes("top") ? "hanging" : "middle";
+    const mirror = el.isMirrored ? -1 : 1;
+    const { rotation, anchor, baseline } = readableTextOrientation(el.rotation, ov.rotation, rawAnchor, rawBaseline);
+    return renderMultilineText({
+        key, x: ov.position.x, y: ov.position.y, rotation,
+        fontFamily: ov.font, fontSize: ov.size, fill: parseColor(ov.color), anchor, baseline,
+        counterScale: { sx: el.scaleX * mirror, sy: el.scaleY },
+    }, ov.text);
+}
+
+function SymbolGraphic({ el, selected, connHighlight, onSelect, boostPct, boostSymbolOutlines, showProfileLabels }) {
     const symbolStrokeMult = boostSymbolOutlines ? boostPct / 100 : 1;
     const mirror = el.isMirrored ? -1 : 1;
     const transform = `translate(${el.position.x} ${el.position.y}) rotate(${el.rotation}) scale(${el.scaleX * mirror} ${el.scaleY})`;
@@ -544,14 +739,15 @@ function SymbolGraphic({ el, selected, connHighlight, onSelect, boostPct, boostS
             </g>}
             {hlColor && <g transform={transform} pointerEvents="none">{el.variant.primitives.map((p, i) => highlightPrimitive(p, `hl_${el.key}_${i}`, hlColor))}</g>}
             <g transform={transform} pointerEvents="none">
-                {el.variant.primitives.map((p, i) => renderPrimitive(p, `${el.key}_${i}`, null, symbolStrokeMult))}
+                {el.variant.primitives.map((p, i) => renderPrimitive(p, `${el.key}_${i}`, null, symbolStrokeMult, false, el.rotation, { sx: el.scaleX * mirror, sy: el.scaleY }))}
+                {showProfileLabels && el.labelOverlays && el.labelOverlays.map((ov, i) => renderLabelOverlay(ov, `ovl_${el.key}_${i}`, el))}
                 {hlColor && <rect x={el.variant.minX - 0.8} y={el.variant.minY - 0.8} width={(el.variant.maxX - el.variant.minX) + 1.6} height={(el.variant.maxY - el.variant.minY) + 1.6} fill="none" stroke={hlColor} strokeWidth={0.6} vectorEffect="non-scaling-stroke" />}
             </g>
         </g>
     );
 }
 
-function PrimitiveGraphic({ el, selected, connHighlight, onSelect, nodePosMap, boostPct, boostSymbolOutlines }) {
+function PrimitiveGraphic({ el, selected, connHighlight, onSelect, nodePosMap, boostPct, boostSymbolOutlines, showProfileLabels }) {
     const hitPad = 2.0;
     const hlColor = selected ? (connHighlight || selectionColor(el.elementRole)) : connHighlight || null;
     const prim = el.primitive;
@@ -571,7 +767,7 @@ function PrimitiveGraphic({ el, selected, connHighlight, onSelect, nodePosMap, b
             {hlColor && el.kind !== "connectorLine" && prim?.kind !== "text" && highlightPrimitive(prim, `hl_${el.key}`, hlColor)}
             {el.kind === "connectorLine"
                 ? <ConnectorLineSvg el={el} nodePosMap={nodePosMap} selected={selected} connColor={connHighlight} boostPct={boostPct} />
-                : renderPrimitive(prim, el.key, prim?.kind === "text" ? hlColor : null, (boostSymbolOutlines && el.elementRole === "symbol") ? boostPct / 100 : 1)}
+                : renderPrimitive(prim, el.key, prim?.kind === "text" ? hlColor : null, (boostSymbolOutlines && el.elementRole === "symbol") ? boostPct / 100 : 1, showProfileLabels)}
         </g>
     );
 }
@@ -647,7 +843,6 @@ export default function App() {
     const [mainXmlText, setMainXmlText] = useState("");
     const [mainFileName, setMainFileName] = useState("validation-report");
     const [mainFileFullName, setMainFileFullName] = useState("");
-    const [loadMode, setLoadMode] = useState("with-profile");
     const [discXmlText, setDiscXmlText] = useState("");
     const [discFileFullName, setDiscFileFullName] = useState("");
     const [parsed, setParsed] = useState(null);
@@ -681,6 +876,13 @@ export default function App() {
     // 100 = unchanged (no-op), so nothing is boosted until the user raises it.
     const [lineBoostPct, setLineBoostPct] = useState(100);
     const [boostSymbolOutlines, setBoostSymbolOutlines] = useState(false);
+    // Profile labels: only meaningful (and only shown, see the toolbar below)
+    // once a DiscProfile.xml is loaded. When checked, labels belonging to a
+    // symbol placed from that DiscProfile catalogue show their
+    // attribute-resolved value (primitive.profileText, computed in
+    // dexpiParser.js's collectGraphicalElements()) instead of the instance's
+    // own literal Text string - see renderPrimitive()'s text branch.
+    const [showProfileLabels, setShowProfileLabels] = useState(false);
     const [spaceDown, setSpaceDown] = useState(false);
     const [exporting, setExporting] = useState(false);
 
@@ -726,18 +928,13 @@ export default function App() {
         return parsed.connectivityMap.get(selectedId) || { upstream: new Set(), downstream: new Set(), group: new Set() };
     }, [showConnectivity, selectedId, parsed]);
 
-    function rebuild(nextMain, nextDisc, mode) {
+    // Whether a DiscProfile.xml is loaded decides the parsing behavior -
+    // there's no separate mode to pick: no profile loaded means "internal",
+    // a profile loaded means "with profile", full stop.
+    function rebuild(nextMain, nextDisc) {
         if (!nextMain) return;
-        if ((mode || loadMode) === "with-profile" && !nextDisc) {
-            // Silently no-op'ing here (the old behavior) left the drawing area stuck on
-            // "No drawing loaded" with no explanation whenever a DEXPI XML file was loaded
-            // before a DiscProfile.xml in "With profile" mode (the default mode). Surface
-            // the reason so the user knows to load a profile or switch to "Internal" mode.
-            setParseError('Load a DiscProfile.xml file to continue in "With profile" mode, or switch to "Internal" mode.');
-            return;
-        }
         try {
-            const p = parseDexpiPackage(nextMain, (mode || loadMode) === "with-profile" ? nextDisc : "");
+            const p = parseDexpiPackage(nextMain, nextDisc || "");
             const b = boundsFromElements(p.graphics);
             setFullBounds(b);
             setParsed(p);
@@ -755,13 +952,17 @@ export default function App() {
         // Strip extension for CSV filename
         setMainFileName(file.name.replace(/\.[^.]+$/, ""));
         setMainFileFullName(file.name);
-        rebuild(txt, discXmlText, loadMode);
+        rebuild(txt, discXmlText);
     }
     async function handleDiscFile(e) {
         const file = e.target.files?.[0]; if (!file) return;
         const txt = await file.text(); setDiscXmlText(txt);
         setDiscFileFullName(file.name);
-        rebuild(mainXmlText, txt, "with-profile");
+        rebuild(mainXmlText, txt);
+    }
+    function clearDiscProfile() {
+        setDiscXmlText(""); setDiscFileFullName(""); setShowProfileLabels(false);
+        if (mainXmlText) rebuild(mainXmlText, "");
     }
     async function handleProfileFile(e) {
         const file = e.target.files?.[0]; if (!file) return;
@@ -943,6 +1144,25 @@ export default function App() {
         return ids;
     }, [selectedNode, selectHighlightSubComponents]);
 
+    // Every graphical Profile/SymbolUsage or Core/Diagram.ShapeUsage placement
+    // whose Represents reference resolves to the selected object - an object
+    // can have more than one (e.g. a base symbol + a separate cap/decoration
+    // symbol, both representing the same id) - used by the Object tab below
+    // to show each placement's Symbol reference, ScaleX, IsMirrored, and
+    // Rotation alongside the object's own Data/References. Split by
+    // elementRole (see pushSymbolUsage() in dexpiParser.js): "symbol" for the
+    // object's own body/outline placements, "label" for a SymbolUsage that
+    // sits inside a Core/Diagram.Label group instead (e.g. a "special item
+    // number" balloon) - shown as a distinct "Label SymbolUsage" section.
+    const selectedSymbolUsages = useMemo(() => {
+        if (!selectedId || !parsed?.graphics?.elements) return [];
+        return parsed.graphics.elements.filter(el => el.kind === "symbolUsage" && el.representedId === selectedId && el.elementRole !== "label");
+    }, [selectedId, parsed]);
+    const selectedLabelSymbolUsages = useMemo(() => {
+        if (!selectedId || !parsed?.graphics?.elements) return [];
+        return parsed.graphics.elements.filter(el => el.kind === "symbolUsage" && el.representedId === selectedId && el.elementRole === "label");
+    }, [selectedId, parsed]);
+
     const handleSelect = useCallback((id) => {
         if (!id) return;
         setSelectedId(id);
@@ -1060,20 +1280,13 @@ export default function App() {
                                 <button style={S.collapseBtn} onClick={() => setLeftCollapsed(true)}>{"<"}</button>
                             </div>
                         </div>
-                        <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
-                            <button style={{ ...S.btn, background: loadMode === "with-profile" ? "#eaf2ff" : "white" }} onClick={() => setLoadMode("with-profile")}>With profile</button>
-                            <button style={{ ...S.btn, background: loadMode === "internal" ? "#eaf2ff" : "white" }} onClick={() => { setLoadMode("internal"); setDiscXmlText(""); setDiscFileFullName(""); if (mainXmlText) rebuild(mainXmlText, "", "internal"); }}>Internal</button>
-                        </div>
                         <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                             <button style={S.btn} onClick={() => mainInputRef.current?.click()}>
                                 Load DEXPI XML{mainXmlText && <span style={S.loadedTick} title="File loaded">✓</span>}
                             </button>
-                            {loadMode === "with-profile" && (
-                                <button style={S.btn} onClick={() => discInputRef.current?.click()}>
-                                    DiscProfile.xml{discXmlText && <span style={S.loadedTick} title="File loaded">✓</span>}
-                                </button>
-                            )}
-                            <button style={S.btn} onClick={() => profileInputRef.current?.click()} title="Load a validation profile">+ Profile</button>
+                            <button style={S.btn} onClick={() => discInputRef.current?.click()}>
+                                DiscProfile.xml{discXmlText && <span style={S.loadedTick} title="File loaded">✓</span>}
+                            </button>
                         </div>
                         <input ref={mainInputRef} type="file" accept=".xml" style={{ display: "none" }} onChange={handleMainFile} />
                         <input ref={discInputRef} type="file" accept=".xml" style={{ display: "none" }} onChange={handleDiscFile} />
@@ -1083,9 +1296,12 @@ export default function App() {
                                 Test file: <span style={{ fontWeight: 600, color: "#24292f" }}>{mainFileFullName}</span>
                             </div>
                         )}
-                        {loadMode === "with-profile" && discFileFullName && (
-                            <div style={{ marginTop: 2, fontSize: 12, color: "#57606a", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={discFileFullName}>
-                                Profile: <span style={{ fontWeight: 600, color: "#24292f" }}>{discFileFullName}</span>
+                        {discFileFullName && (
+                            <div style={{ marginTop: 2, fontSize: 12, color: "#57606a", display: "flex", alignItems: "center", gap: 6 }}>
+                                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={discFileFullName}>
+                                    Profile: <span style={{ fontWeight: 600, color: "#24292f" }}>{discFileFullName}</span>
+                                </span>
+                                <button style={{ ...S.btnDanger, padding: "1px 6px", flexShrink: 0 }} title="Remove profile (revert to internal)" onClick={clearDiscProfile}>x</button>
                             </div>
                         )}
                         {parsed && <button style={{ ...S.btnPrimary, marginTop: 8, width: "100%" }} onClick={runValidation}>Run Validation</button>}
@@ -1216,8 +1432,6 @@ export default function App() {
                     {leftTab === "config" && (
                         <div style={S.scroll}>
                             <div style={S.section}>
-                                <div style={{ fontWeight: 700, marginBottom: 8, fontSize: 13 }}>Profiles (later = higher precedence)</div>
-                                {profiles.length === 0 && <div style={{ color: "#888", fontSize: 12 }}>No profiles loaded.</div>}
                                 {profiles.map((p, i) => (
                                     <div key={i} style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 5, padding: "4px 8px", background: "#f6f8fa", borderRadius: 4 }}>
                                         <span style={{ fontSize: 12, flex: 1 }}>{p.name}</span>
@@ -1269,6 +1483,12 @@ export default function App() {
                             <input type="checkbox" checked={selectHighlightSubComponents} onChange={e => setSelectHighlightSubComponents(e.target.checked)} />
                             Sub-components
                         </label>
+                        {discXmlText && (
+                            <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "#57606a", cursor: "pointer" }} title="When checked, labels on symbols placed from the loaded DiscProfile.xml show only the value of their referenced Attribute - from the instance's own AttributeRepresentation Template if it has one, otherwise the DiscProfile symbol's own LabelTemplate - instead of the instance's literal Text string.">
+                                <input type="checkbox" checked={showProfileLabels} onChange={e => setShowProfileLabels(e.target.checked)} />
+                                Profile labels
+                            </label>
+                        )}
                         <button style={S.btn} onClick={() => bgInputRef.current?.click()} title="Overlay an image behind the drawing">BG Image</button>
                         {bgImage && <button style={{ ...S.btn, background: showBgControls ? "#eaf2ff" : "white" }} onClick={() => setShowBgControls(p => !p)}>BG Controls</button>}
                         <input ref={bgInputRef} type="file" accept="image/*" style={{ display: "none" }} onChange={handleBgFile} />
@@ -1331,8 +1551,8 @@ export default function App() {
                             const isSelected = !!el.representedId && selectedRepresentedIds.has(el.representedId);
                             const ch = connectivityHighlight;
                             const connColor = el.representedId ? (ch.upstream.has(el.representedId) ? "#0969da" : ch.downstream.has(el.representedId) ? "#1a7f37" : ch.group.has(el.representedId) ? "#8250df" : null) : null;
-                            if (el.kind === "symbolUsage") return <SymbolGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} boostPct={lineBoostPct} boostSymbolOutlines={boostSymbolOutlines} />;
-                            return <PrimitiveGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} nodePosMap={parsed.graphics.nodePosMap} boostPct={lineBoostPct} boostSymbolOutlines={boostSymbolOutlines} />;
+                            if (el.kind === "symbolUsage") return <SymbolGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} boostPct={lineBoostPct} boostSymbolOutlines={boostSymbolOutlines} showProfileLabels={showProfileLabels} />;
+                            return <PrimitiveGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} nodePosMap={parsed.graphics.nodePosMap} boostPct={lineBoostPct} boostSymbolOutlines={boostSymbolOutlines} showProfileLabels={showProfileLabels} />;
                         })}
                         {/* Heat-trace overlays – rendered on top, only when a DISC profile is loaded */}
                         {parsed?.heatTraceSet?.size > 0 && parsed.graphics.elements.map(el => {
@@ -1522,6 +1742,38 @@ export default function App() {
                                                 </div>
                                             );
                                         })}
+                                    </div>
+                                )}
+                                {selectedSymbolUsages.length > 0 && (
+                                    <div style={S.section}>
+                                        <div style={{ fontWeight: 600, fontSize: 12, marginBottom: 6 }}>Symbol Usage</div>
+                                        {selectedSymbolUsages.map((su, i) => (
+                                            <div key={i} style={{ marginBottom: 6, padding: "4px 6px", background: "#f9fafb", borderRadius: 4 }}>
+                                                <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 3 }}>{su.symbol?.key?.split("/").pop() || su.symbol?.key || "(unknown symbol)"}</div>
+                                                <div style={{ fontSize: 11, color: "#57606a", display: "flex", flexWrap: "wrap", gap: "2px 12px" }}>
+                                                    <span>Scale X: {su.scaleX}</span>
+                                                    <span>Scale Y: {su.scaleY}</span>
+                                                    <span>Is Mirrored: {su.isMirrored ? "true" : "false"}</span>
+                                                    <span>Rotation: {su.rotation}°</span>
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+                                {selectedLabelSymbolUsages.length > 0 && (
+                                    <div style={S.section}>
+                                        <div style={{ fontWeight: 600, fontSize: 12, marginBottom: 6 }}>Label SymbolUsage</div>
+                                        {selectedLabelSymbolUsages.map((su, i) => (
+                                            <div key={i} style={{ marginBottom: 6, padding: "4px 6px", background: "#f9fafb", borderRadius: 4 }}>
+                                                <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 3 }}>{su.symbol?.key?.split("/").pop() || su.symbol?.key || "(unknown symbol)"}</div>
+                                                <div style={{ fontSize: 11, color: "#57606a", display: "flex", flexWrap: "wrap", gap: "2px 12px" }}>
+                                                    <span>Scale X: {su.scaleX}</span>
+                                                    <span>Scale Y: {su.scaleY}</span>
+                                                    <span>Is Mirrored: {su.isMirrored ? "true" : "false"}</span>
+                                                    <span>Rotation: {su.rotation}°</span>
+                                                </div>
+                                            </div>
+                                        ))}
                                     </div>
                                 )}
                             </>

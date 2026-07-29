@@ -14,8 +14,8 @@ Developed by **Tonia Pedersen** at **[Draga AS](https://draga.no)**.
 2. [Getting Started](#2-getting-started)
 3. [Interface Overview](#3-interface-overview)
 4. [Left Panel](#4-left-panel)
-5. [Centre Panel — P&ID Drawing](#5-centre-panel--pid-drawing)
-6. [Right Panel — Object Details](#6-right-panel--object-details)
+5. [Centre Panel — P&ID Drawing](#5-centre-panel-p-id-drawing)
+6. [Right Panel — Object Details](#6-right-panel-object-details)
 7. [Validation Rules Reference](#7-validation-rules-reference)
 8. [Severity Configuration](#8-severity-configuration)
 9. [CSV Export](#9-csv-export)
@@ -30,7 +30,7 @@ DEXPI Viewer & Verificator reads DEXPI 2.0 XML files and provides three integrat
 
 - **Graphical rendering** — renders the P&ID drawing directly from the XML, including symbols, piping lines, signal connectors, heat trace overlays, and labels.
 - **Object model exploration** — structured topology tree with full property, reference, and connectivity details for every object.
-- **Validation** — 35+ named rules covering XML well-formedness, DEXPI schema conformance, engineering semantics, and DISC profile compliance.
+- **Validation** — 38+ named rules covering XML well-formedness, DEXPI schema conformance, engineering semantics, and DISC profile compliance.
 
 The application runs entirely in the browser with no server component. A companion command-line tool (`validate-cli.js`) provides the same validation engine for CI/CD pipelines and batch processing.
 
@@ -229,6 +229,18 @@ When a `SignalConveyingFunction` carries the DiscProfile custom attribute `Signa
 
 Selecting a decorated line, or highlighting it via Connectivity mode, recolours both the line and its repeated mark together.
 
+### 5.10 Profile Labels
+
+Once a DiscProfile.xml is loaded, a **Profile labels** checkbox appears in the centre toolbar. It controls whether a label's displayed text comes from the loaded profile's own attribute-driven definitions, or from the literal text baked into the DEXPI file.
+
+**Checked** — text shown comes *only* from a placed DiscProfile catalog symbol. A label belonging to a symbol placed from the loaded DiscProfile.xml always shows the value built from that *symbol's own* catalog `Profile/LabelTemplate` (e.g. an `<ObjectDisplayName>` placeholder resolved against the represented object) — never the instance's own literal text or its own `Core/Diagram.TextTemplate`.
+
+**Unchecked** — the raw literal `<Data property="Text">` string is no longer shown for a Profile-governed label once a DiscProfile.xml is loaded. Instead:
+- If there is no real attribute backing at all (no `TextTemplate` on the instance and no `LabelTemplate` on the symbol, or either exists but references no attribute), nothing is shown — a purely literal label isn't something the loaded profile has any say over.
+- Otherwise, the attribute-resolved value is shown, with any attribute reference that isn't actually valid for the placed symbol (see PRF-E06 in the [Validation Rules Reference](#7-validation-rules-reference)) suppressed rather than displayed.
+
+Text driven by a `TextTemplate`/`LabelTemplate` always renders at its true absolute size regardless of the symbol's own placement scale, and reads left-to-right or bottom-to-top rather than upside-down or right-to-left.
+
 ---
 
 ## 6. Right Panel — Object Details
@@ -245,6 +257,8 @@ Selecting a decorated line, or highlighting it via Connectivity mode, recolours 
 | Referenced By | Objects elsewhere in the file that reference this object |
 | Parent Component | The containing object with its issue status dot |
 | Sub-Components | Children of this object — click any to navigate to it |
+| Symbol Usage | For each graphical symbol placement representing this object: its Symbol reference (e.g. `ND0006`), Scale X, Scale Y, Is Mirrored, and Rotation |
+| Label SymbolUsage | Same fields as Symbol Usage, shown separately for any symbol placement that sits inside a `Core/Diagram.Label` group (e.g. a special-item-number balloon) rather than the object's own body |
 
 ### 6.2 Connections Tab
 
@@ -294,6 +308,7 @@ Rules marked **Profile required** only fire when at least one profile XML has be
 | ERR-E17 | Error | Important equipment, valve, or connector has no `RepresentationGroup` (orphaned model object). | |
 | ERR-E18 | Error | Attribute used on a class that does not allow it per the loaded profile's `PropertyConstraint` definitions. | ✓ |
 | ERR-E19 | Error | Attribute appears more times than the upper cardinality allows per the loaded profile. | ✓ |
+| ERR-E20 | Warning | A `Core/Diagram.TextTemplate`'s `AttributeName` doesn't resolve to a value anywhere reachable from the owning object (direct property, or a nested/related object up to two hops out). Skipped when the loaded profile itself recognises the attribute name somewhere in its own LabelTemplate catalogue, since such attributes are legitimately optional. | |
 
 ### VAX — Structural / Topology Validation
 
@@ -329,6 +344,7 @@ Rules marked **Profile required** only fire when at least one profile XML has be
 |------|---------|-------------|:---:|
 | PRF-E04 | Error | A `SymbolUsage` references a Symbol not declared in the profile, or the symbol's allowed types do not match the model object's DEXPI type. | ✓ |
 | PRF-E05 | Warning | A `PipingNodePosition` does not align with any profile-defined piping connection point of the placed symbol (within 0.5% of drawing size); or the connection point is designated as Auxiliary (actuator/operator port — piping must not be routed there). | ✓ |
+| PRF-E06 | Error | A `Core/Diagram.TextTemplate`'s `AttributeName` is not one of the attribute placeholders the placed symbol's own catalog `Profile/LabelTemplate`(s) actually define — even if that attribute happens to resolve to a real value elsewhere (see ERR-E20 above, which checks resolvability rather than the symbol's own declared placeholder set). | ✓ |
 | PRF-007 | Info | A profile constraint was silently overridden by a later-loaded profile (logged when multiple profiles are stacked). | ✓ |
 | PRF-{profile}-{property} | Warning | A model object is missing a property that is required (`Lower ≥ 1`) by the loaded profile's `PropertyConstraint`. Generated dynamically per property. | ✓ |
 

@@ -116,6 +116,36 @@ export function parsePointsFromData(dataNode) {
     return directChildrenByTag(dataNode, "AggregatedDataValue").map(p => aggregatedValue(p)).filter(Boolean);
 }
 
+// Reads a Core/Diagram.Text|LiteralText object's optional Template
+// (Components property="Template" > Object type="Core/Diagram.TextTemplate"
+// > Components property="Fragments" > Object[]) and returns an ordered,
+// unresolved list of fragment descriptors, or null when there is no
+// Template at all. Each fragment is one of:
+//   { kind: "attr", attributeName, objectId, repType }   — Core/Diagram.AttributeRepresentation
+//   { kind: "literal", text }                            — Core/Diagram.LiteralText (as a fragment)
+// See resolveTemplateFragments() in collectGraphicalElements() for how
+// these get turned into displayed text (profileText).
+function parseTextTemplateFragments(objectNode) {
+    const templateObj = directComponentsObjects(objectNode, "Template")[0];
+    if (!templateObj) return null;
+    const fragments = directComponentsObjects(templateObj, "Fragments").map(f => {
+        const ftype = f.getAttribute("type") || "";
+        if (ftype === "Core/Diagram.AttributeRepresentation") {
+            return {
+                kind: "attr",
+                attributeName: valueFromData(f, "AttributeName") || "",
+                objectId: referenceTargets(f, "Object")[0] || null,
+                repType: refName(valueFromData(f, "Type")) || "Value",
+            };
+        }
+        if (ftype === "Core/Diagram.LiteralText") {
+            return { kind: "literal", text: valueFromData(f, "Text") || "" };
+        }
+        return null;
+    }).filter(Boolean);
+    return fragments.length ? fragments : null;
+}
+
 export function parsePrimitive(objectNode, idx) {
     if (!objectNode || typeof objectNode.getAttribute !== "function") return null;
     const type = objectNode.getAttribute("type") || "";
@@ -168,6 +198,13 @@ export function parsePrimitive(objectNode, idx) {
             horizontal: refName(valueFromData(objectNode, "Alignment")) || refName(valueFromData(objectNode, "HorizontalAlignment")) || "Center",
             vertical: refName(valueFromData(objectNode, "Alignment")) || refName(valueFromData(objectNode, "VerticalAlignment")) || "Center",
         },
+        // Raw (unresolved) Template/Fragments, if this Text carries a
+        // Core/Diagram.TextTemplate — used by collectGraphicalElements() to
+        // compute profileText, the attribute-driven label value shown instead
+        // of the literal `value` above when the "Profile labels" checkbox is
+        // on and this label belongs to a DiscProfile-catalogued symbol.
+        // null when the Text has no Template (plain literal label).
+        templateFragments: parseTextTemplateFragments(objectNode),
     };
     if (type === "Core/Diagram.ConnectorLine") return {
         kind: "connectorLine", key,
@@ -220,6 +257,33 @@ export function parseSymbolCatalogue(discDoc) {
                 primitives: directComponentsObjects(variant, "Primitives").map(parsePrimitive).filter(Boolean),
                 variantNumber: intFromData(variant, "VariantNumber", i),
                 condition: typeof condRaw === "string" ? parseVariantCondition(condRaw) : null,
+                // Profile/LabelTemplate entries (Data property="Text", e.g.
+                // "<ObjectDisplayName>" or "<SpecialItemNumber>") defined for
+                // this symbol variant in the DiscProfile — used as a
+                // "Profile labels" source (see resolveProfileLabelFallback()
+                // and the labelOverlays second pass below) both (a) as a
+                // fallback for a placed instance whose own Label Text
+                // carries no AttributeRepresentation Template of its own,
+                // and (b) to synthesize an overlay text entirely, for
+                // symbols (e.g. a "special item number" balloon) whose
+                // instance-drawn "label" is itself another symbol/leader
+                // line rather than any Text element at all. Position/
+                // Rotation/Alignment/Font/Size/Color are all in the symbol's
+                // own local coordinate system, exactly like its Primitives
+                // above - see SymbolGraphic's labelOverlays rendering in
+                // App.jsx, which draws them inside the same transformed <g>
+                // as the symbol's own primitives so the browser's SVG
+                // transform composition handles local→world placement.
+                labelTemplates: directComponentsObjects(variant, "LabelTemplates").map(lt => ({
+                    text: valueFromData(lt, "Text") || "",
+                    index: valueFromData(lt, "Index") || "",
+                    position: aggregatedValue(getData(lt, "Position")?.firstElementChild) || { x: 0, y: 0 },
+                    rotation: numberFromData(lt, "Rotation", 0),
+                    alignment: refName(valueFromData(lt, "Alignment")) || "CenterCenter",
+                    font: valueFromData(lt, "Font") || "Arial",
+                    size: numberFromData(lt, "Size", 3.3),
+                    color: aggregatedValue(getData(lt, "Color")?.firstElementChild) || { r: 0, g: 0, b: 0 },
+                })),
             };
         });
         map.set(symbolKey, { key: symbolKey, name, variants });
@@ -383,6 +447,29 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
     // Only indexed objects (those with an id attribute) are relevant.
     const objectDataMap = new Map();
     const objectTypeMap = new Map();
+    // objectId → [{id, type}, ...] for its nested id-bearing conceptual
+    // objects (nearest-enclosing-id-ancestor walk, so e.g. a
+    // ProcessInstrumentationFunction's Components/SignalConveyingFunctions
+    // child lands here under the PIF's id) - used by resolveProfileLabelFallback()'s
+    // "ClassName:<Attribute>" role-path syntax below, since a DISC-added
+    // attribute like AlarmValue (or a base attribute like PortStatus) lives
+    // on the nested SignalConveyingFunction, not on the PIF the label
+    // template itself is attached to.
+    //
+    // Deliberately requires a real id attribute (Object[id], not every
+    // Object) - a nested SignalConveyingFunction etc. with no id of its own
+    // is source-data that's missing what the DiscProfile role-path
+    // convention requires to be individually addressable, and is treated as
+    // "no match" (its label stays suppressed) rather than papered over with
+    // an internally-generated id it doesn't actually have in the file.
+    const childrenByParentId = new Map();
+    // objectId → [targetId, ...] for every References target the object
+    // itself carries (any property, e.g. ParentStructure/PlantSystem/etc.) -
+    // used by lookupProperty()'s nearby-object search below, since a
+    // template placeholder like <ProcessPlantIdentificationCode> or
+    // <PlantSystemIdentificationCode> lives on a REFERENCED ProcessPlant/
+    // PlantSystem object, not on the object the template is attached to.
+    const referencesByParentId = new Map();
     qsa(mainDoc, "Object[id]").forEach(el => {
         const id = el.getAttribute("id");
         objectTypeMap.set(id, el.getAttribute("type") || "");
@@ -392,6 +479,17 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
             if (prop) props.set(prop, dataValue(d));
         });
         if (props.size) objectDataMap.set(id, props);
+
+        let p = el.parentNode;
+        while (p && (typeof p.getAttribute !== "function" || !p.getAttribute("id"))) p = p.parentNode;
+        const parentId = p && typeof p.getAttribute === "function" ? p.getAttribute("id") : null;
+        if (parentId) {
+            if (!childrenByParentId.has(parentId)) childrenByParentId.set(parentId, []);
+            childrenByParentId.get(parentId).push({ id, type: el.getAttribute("type") || "" });
+        }
+
+        const refTargets = referenceTargets(el);
+        if (refTargets.length) referencesByParentId.set(id, refTargets);
     });
 
     // Resolve a raw Data value (plain string, or a DataReference to an
@@ -404,6 +502,262 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         if (typeof raw === "string") return raw;
         if (raw?.kind === "DataReference") return raw.value.split(".").pop().split("/").pop();
         return null;
+    }
+
+    // ---------------------------------------------------------------------
+    // "Profile labels" support: for a symbol placed from the loaded
+    // DiscProfile.xml catalogue, App.jsx's "Profile labels" checkbox forces
+    // the label's displayed text to come from a referenced Attribute value
+    // rather than the instance's own literal <String> Text - either (a) the
+    // AttributeRepresentation Template already carried by the instance's own
+    // Label Text (see parseTextTemplateFragments() above), or (b), when the
+    // instance Text has no such Template, the matching DiscProfile Profile/
+    // Symbol variant's own LabelTemplate (see parseSymbolCatalogue() above).
+    // Both resolve down to a single computed `profileText` string per label
+    // Text primitive - see the second pass at the bottom of this function.
+    // ---------------------------------------------------------------------
+
+    // Look up objectId's Data property directly, tolerating the same
+    // DiscProfile/, bare, and Plant-prefixed spellings used elsewhere in
+    // this file. No traversal - just this one object.
+    function ownProperty(objectId, attributeName) {
+        if (!objectId || !attributeName) return undefined;
+        const props = objectDataMap.get(objectId);
+        if (!props) return undefined;
+        const bare = attributeName.split("/").pop();
+        return props.get(attributeName) ?? props.get(bare) ?? props.get(`DiscProfile/${bare}`);
+    }
+
+    // Look up objectId's Data property, and - when it's not there directly -
+    // search up to two hops out through objectId's own nested children
+    // (Components) and References targets (any property) for the nearest
+    // object that DOES carry it. Several DiscProfile LabelTemplate.Text
+    // placeholders name an attribute that lives on a related object rather
+    // than the one the template itself is attached to - e.g.
+    // <ProcessPlantIdentificationCode> lives on the ProcessPlant a
+    // ProcessInstrumentationFunction reaches via its own ParentStructure
+    // reference, and <PlantSystemIdentificationCode> on the PlantSystem it
+    // reaches via its own PlantSystem reference - neither is a property of
+    // the PIF itself. Breadth-first, so the CLOSEST object with a matching
+    // property wins over a more distant one.
+    function lookupProperty(objectId, attributeName) {
+        const direct = ownProperty(objectId, attributeName);
+        if (direct !== undefined) return direct;
+        if (!objectId) return undefined;
+        const seen = new Set([objectId]);
+        let frontier = [objectId];
+        for (let depth = 0; depth < 2 && frontier.length; depth++) {
+            const next = [];
+            for (const id of frontier) {
+                const neighborIds = [
+                    ...(childrenByParentId.get(id) || []).map(c => c.id),
+                    ...(referencesByParentId.get(id) || []),
+                ];
+                for (const nid of neighborIds) {
+                    if (!nid || seen.has(nid)) continue;
+                    seen.add(nid);
+                    const v = ownProperty(nid, attributeName);
+                    if (v !== undefined) return v;
+                    next.push(nid);
+                }
+            }
+            frontier = next;
+        }
+        return undefined;
+    }
+
+    // Render a resolved Data value (string / number / boolean / DataReference /
+    // PhysicalQuantity / SingleLanguageString) down to display text, honouring
+    // an AttributeRepresentation fragment's Type (Value | Units | ValueAndUnits).
+    function fragmentValueToText(raw, repType) {
+        if (raw === null || raw === undefined) return "";
+        if (typeof raw === "string") return raw;
+        if (typeof raw === "number") return String(raw);
+        if (typeof raw === "boolean") return raw ? "true" : "false";
+        if (raw.kind === "DataReference") return refName(raw);
+        if (raw.kind === "PhysicalQuantity") {
+            const val = raw.value !== null && raw.value !== undefined ? String(raw.value) : "";
+            if (repType === "Units") return raw.unit || "";
+            if (repType === "ValueAndUnits") return [val, raw.unit].filter(Boolean).join(" ");
+            return val;
+        }
+        if (typeof raw === "object" && typeof raw.value === "string") return raw.value; // SingleLanguageString
+        if (typeof raw === "object" && raw.kind === "AggregatedValue") return "";
+        return String(raw);
+    }
+
+    // Resolve a Text primitive's raw templateFragments (see
+    // parseTextTemplateFragments()) into the final display string, or null
+    // when there is no Template at all.
+    function resolveTemplateFragments(fragments) {
+        if (!fragments || !fragments.length) return null;
+        return fragments.map(f => {
+            if (f.kind === "literal") return f.text || "";
+            if (f.kind === "attr") return fragmentValueToText(lookupProperty(f.objectId, f.attributeName), f.repType);
+            return "";
+        }).join("");
+    }
+
+    // A SignalConveyingFunction's (base DEXPI, non-DiscProfile) PortStatus
+    // attribute classifies which alarm/status level it conveys - see
+    // Plant.xml's PortStatusClassification enumeration. DiscProfile label
+    // templates don't carry this as structured data (Profile/LabelTemplate
+    // has no Condition-like property), only as a literal "H=", "HH=", "L=",
+    // or "LL=" prefix in the template's own Text - extractPortStatusHint()
+    // below recovers the intended classification from that prefix so
+    // pickRoleChild() can pick the SignalConveyingFunction that actually
+    // carries the matching PortStatus, instead of guessing positionally.
+    // Longest-prefix-first so "HHH=" isn't misread as "HH=" then "H=".
+    const PORT_STATUS_HINTS = {
+        HHH: "StatusHighHighHighPort", HH: "StatusHighHighPort", H: "StatusHighPort",
+        LLL: "StatusLowLowLowPort", LL: "StatusLowLowPort", L: "StatusLowPort",
+    };
+    function extractPortStatusHint(text) {
+        const m = /^\s*(HHH|HH|H|LLL|LL|L)\s*=/.exec(text || "");
+        return m ? PORT_STATUS_HINTS[m[1]] : null;
+    }
+
+    // Picks the child of parentId whose type suffix matches roleName (e.g.
+    // "SignalConveyingFunction") that should supply a "ClassName:<Attr>"
+    // role-path reference's value.
+    //
+    // When portStatusHint is given (see extractPortStatusHint() above), ONLY
+    // a child whose own PortStatus attribute matches that hint counts - e.g.
+    // an "HH=" template's SignalConveyingFunction:<AlarmValue> requires a
+    // child whose PortStatus is StatusHighHighPort specifically. No
+    // positional fallback in this case: if the ProcessInstrumentationFunction
+    // has no SignalConveyingFunction with that exact PortStatus, this
+    // returns null (and resolveProfileLabelFallback() below then suppresses
+    // the whole H/HH/L/LL label entirely) - guessing at some OTHER alarm's
+    // signal by document position would show the wrong value, which is worse
+    // than showing nothing.
+    //
+    // Without a hint (a role-path with no H/HH/L/LL-style prefix), falls
+    // back to positional pairing: the Nth reference to this same roleName
+    // among the symbol's LabelTemplates (tracked via the caller-shared
+    // roleCounters) picks the Nth same-class child in document order - kept
+    // for any other "ClassName:<Attr>" convention that doesn't carry a
+    // disambiguating attribute like PortStatus.
+    function pickRoleChild(parentId, roleName, roleCounters, portStatusHint) {
+        if (!parentId) return null;
+        const matches = (childrenByParentId.get(parentId) || []).filter(c => c.type && c.type.split(/[./]/).pop() === roleName);
+        if (!matches.length) return null;
+        if (portStatusHint) {
+            const byStatus = matches.find(c => refName(ownProperty(c.id, "PortStatus")) === portStatusHint);
+            return byStatus ? byStatus.id : null;
+        }
+        const idx = roleCounters[roleName] || 0;
+        roleCounters[roleName] = idx + 1;
+        return (matches[idx] || matches[matches.length - 1]).id;
+    }
+
+    // Fallback for a DiscProfile-symbol label whose own Text carries no
+    // Template: substitute <PlaceholderName> tokens in the matching symbol
+    // variant's Profile/LabelTemplate.Text against representedId's own (or,
+    // failing that, a nearby related object's - see lookupProperty() above)
+    // Data properties. Handles two placeholder forms:
+    //   <AttributeName>                 e.g. "<ObjectDisplayName>",
+    //                                    "<ProcessPlantIdentificationCode>-<PlantSystemIdentificationCode>"
+    //                                    - looked up via lookupProperty(),
+    //                                    which searches outward from
+    //                                    representedId (its own data first,
+    //                                    then nested children/references)
+    //                                    for the nearest object that has it.
+    //   ClassName:<AttributeName>       e.g. "H=' & SignalConveyingFunction:<AlarmValue>"
+    //                                    - some DISC-added attributes (like
+    //                                    AlarmValue, a ClassExtension on
+    //                                    Plant/Instrumentation.SignalConveyingFunction)
+    //                                    only make sense on a SPECIFIC nested
+    //                                    child of a given class, not just
+    //                                    "whichever nearby object happens to
+    //                                    have it" - the "ClassName:" prefix
+    //                                    picks that child explicitly via
+    //                                    pickRoleChild() above (by PortStatus
+    //                                    when available, else positionally).
+    //
+    // roleCounters is an object the caller shares across every LabelTemplate
+    // belonging to the same symbol placement, so positional pairing (the
+    // pickRoleChild() fallback) advances correctly across e.g. a symbol's
+    // H/HH/L/LL templates instead of every one reusing the first match.
+    function resolveProfileLabelFallback(rawLabelTemplateText, representedId, roleCounters = {}) {
+        if (!rawLabelTemplateText) return null;
+        // Some DiscProfile.xml LabelTemplate.Text values embed a VB-style
+        // string-concatenation formula fragment, e.g.
+        // "H=' & SignalConveyingFunction:<AlarmValue>" - the "' & " in the
+        // middle is formula syntax (a string literal's closing quote plus
+        // the "&" concatenation operator), not text meant to be shown. Strip
+        // it so the literal "H=" prefix runs directly into the resolved
+        // value (e.g. "H=100"), not "H=' & 100".
+        const labelTemplateText = rawLabelTemplateText.replace(/'\s*&\s*/g, "");
+        if (!/[<>]/.test(labelTemplateText)) return labelTemplateText;
+        const portStatusHint = extractPortStatusHint(labelTemplateText);
+        // Only ONE failure mode suppresses the whole template (returns null
+        // instead of rendering with the unresolved token silently blanked,
+        // e.g. leaving a dangling "H=' & " from the surrounding literal
+        // text): a "ClassName:<Attr>" role-path with NO matching related
+        // object at all (e.g. an "H=" template whose PIF has no
+        // SignalConveyingFunction with PortStatus StatusHighPort) -
+        // pickRoleChild() returns null - since there's no right answer to
+        // show for that placeholder.
+        //
+        // A bare "<Attr>" whose value isn't present ANYWHERE reachable from
+        // representedId does NOT suppress the template - it just renders as
+        // blank for that one placeholder. Several DiscProfile LabelTemplates
+        // concatenate multiple independent fields into a single line (e.g.
+        // "<ProcessPlantIdentificationCode>-<PlantSystemIdentificationCode>,
+        // <TagType>,<Sequence><TagSuffix>"), and one field genuinely not
+        // being modelled on this instance (e.g. a ClampOn with no
+        // ParentStructure reference, so ProcessPlantIdentificationCode can't
+        // be reached at all) shouldn't blank out the OTHER fields in that
+        // same line that DID resolve (TagType, Sequence, ...). A template
+        // that ends up fully empty falls out naturally anyway, since the
+        // caller filters out any resulting empty-string overlay.
+        //
+        // Once a role-path target IS found, a missing/blank attribute ON IT
+        // likewise does NOT suppress - e.g. the correctly-matched
+        // StatusHighPort SignalConveyingFunction simply not having an
+        // AlarmValue yet still shows its "H=" label (just with nothing
+        // after the "="), since finding the right signal is what matters,
+        // not whether it's been dimensioned. Same for a bare placeholder
+        // that resolves to a property which legitimately exists but holds
+        // an empty string (e.g. DiscProfile/TagSuffix="") - that's a
+        // successful resolution.
+        let unresolved = false;
+        const text = labelTemplateText.replace(/(?:([A-Za-z][A-Za-z0-9_]*):)?<([^<>]+)>/g, (_m, roleName, attrName) => {
+            if (roleName) {
+                const targetId = pickRoleChild(representedId, roleName, roleCounters, portStatusHint);
+                if (targetId === null) { unresolved = true; return ""; }
+                // Direct-only lookup on the specific role child pickRoleChild()
+                // just matched (e.g. the SignalConveyingFunction whose own
+                // PortStatus is StatusHighHighPort) - NOT lookupProperty()'s
+                // wider neighbor search. Once a role-path has picked out one
+                // specific sibling among several same-class children (e.g.
+                // three SignalConveyingFunctions - one per H/HH/L/LL - all
+                // hanging off the same parent), searching neighbors for a
+                // missing attribute would find it on a DIFFERENT sibling
+                // instead (e.g. HH's SignalConveyingFunction has no
+                // AlarmValue of its own, but L's does, and they share the
+                // same parent) - bleeding L's value into HH's label. A
+                // missing attribute on the matched object should read as
+                // blank, not "search elsewhere".
+                return fragmentValueToText(ownProperty(targetId, attrName), "Value");
+            }
+            // A bare placeholder renders blank when unresolved, rather than
+            // suppressing the whole (possibly multi-field) template - see
+            // the comment above.
+            return fragmentValueToText(lookupProperty(representedId, attrName), "Value");
+        });
+        return unresolved ? null : text;
+    }
+
+    // Computes primitive.profileText (from its own Template, if any) right
+    // where each text primitive is created - the DiscProfile-symbol-ownership
+    // check and the Profile/LabelTemplate fallback for Templateless labels
+    // both happen afterwards, in the second pass below, once the full drawn[]
+    // array (including every Profile/SymbolUsage) is available.
+    function attachProfileText(prim) {
+        if (prim && prim.kind === "text") prim.profileText = resolveTemplateFragments(prim.templateFragments);
+        return prim;
     }
 
     // Reads a SignalConveyingFunction conceptual object's DiscProfile
@@ -494,7 +848,25 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         });
     }
 
+    // A RepresentationGroup can be reached two ways: the top-level qsa()
+    // below matches EVERY RepresentationGroup in the document regardless of
+    // nesting depth, while traverseGroup() itself also recurses into each
+    // group's own nested Groups children - which are frequently
+    // RepresentationGroups too (e.g. a multi-part symbol's outer group
+    // containing per-part sub-groups). Without deduplication, a group
+    // nested N levels deep gets traversed once per ancestor level PLUS once
+    // for its own direct qsa() match - e.g. 2 levels of RepresentationGroup
+    // nesting above a symbol produces 3 separate traversals of its content
+    // (the symbol's own qsa() match, plus once via recursion from each
+    // ancestor's qsa() match), silently tripling every SymbolUsage, Label
+    // SymbolUsage, and Text primitive inside it. Tracking already-traversed
+    // nodes here - by DOM node identity, not id (RepresentationGroups don't
+    // reliably carry one) - guarantees each one is only ever processed once,
+    // regardless of how many redundant paths reach it.
+    const visitedGroups = new WeakSet();
     function traverseGroup(groupNode, currentRepresents = null, keyPrefix = "g") {
+        if (visitedGroups.has(groupNode)) return;
+        visitedGroups.add(groupNode);
         // If this group node is itself a Core/Diagram.Label, everything inside it
         // is annotation text and should highlight orange (elementRole "label"),
         // not the primary red used for symbol outlines.
@@ -514,7 +886,7 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
                 directComponentsObjects(el, "Elements").forEach((lel, li) => {
                     const lt = lel.getAttribute("type") || "";
                     if (lt === "Core/Diagram.Text" || lt === "Core/Diagram.LiteralText" || lt === "Core/Diagram.AttributeRepresentation") {
-                        const prim = parsePrimitive(lel, li);
+                        const prim = attachProfileText(parsePrimitive(lel, li));
                         if (prim) drawn.push({ kind: "primitive", primitive: prim, representedId: labelRepresents, elementRole: "label", key: `${keyPrefix}_lbltxt_${i}_${li}` });
                     } else if (lt === "Core/Diagram.ShapeUsage") {
                         pushSymbolUsage(referenceTargets(lel, "Shape")[0] || null, lel, labelRepresents, `${keyPrefix}_lblshape_${i}_${li}`, "label");
@@ -523,7 +895,7 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
                     }
                 });
             } else {
-                const prim = parsePrimitive(el, i);
+                const prim = attachProfileText(parsePrimitive(el, i));
                 if (!prim) return;
                 if (prim.kind === "connectorLine") {
                     // SignalConveyingFunction connector lines (only that exact
@@ -548,6 +920,250 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
     }
 
     qsa(mainDoc, 'Object[type="Core/Diagram.RepresentationGroup"]').forEach((g, i) => traverseGroup(g, null, `rg_${i}`));
+
+    // Second pass — "Profile labels": now that every Profile/SymbolUsage in
+    // the drawing has been collected, mark which label Text primitives
+    // belong to a symbol placed from the loaded DiscProfile.xml (symbol.key
+    // starts with "DiscProfile/"), and for those with no profileText yet
+    // (i.e. their own Text carried no AttributeRepresentation Template),
+    // fall back to the matching symbol variant's own Profile/LabelTemplate.
+    // App.jsx's "Profile labels" checkbox is the sole gate on actually USING
+    // isDiscProfileLabel/profileText at render time — both fields are always
+    // computed and attached here regardless of the checkbox state.
+    const discSymbolByRepresentedId = new Map();
+    drawn.forEach(el => {
+        if (el.kind === "symbolUsage" && el.representedId && el.symbol?.key?.startsWith("DiscProfile/") && !discSymbolByRepresentedId.has(el.representedId)) {
+            discSymbolByRepresentedId.set(el.representedId, { symbol: el.symbol, variant: el.variant });
+        }
+    });
+
+    // Cache of symbol.key -> Set<bare attribute name>, extracted from ALL of
+    // a DiscProfile symbol's own variants' Profile/LabelTemplate.Text
+    // placeholders (e.g. "<ObjectDisplayName>", "SignalConveyingFunction:
+    // <AlarmValue>" -> "AlarmValue") - same placeholder convention as
+    // resolveProfileLabelFallback() below. Mirrors validation.js's PRF-E06
+    // check (parseProfileSymbols()'s labelTemplateAttrs), which flags an
+    // instance TextTemplate AttributeName that the placed symbol's own
+    // catalog doesn't offer at all as a validation issue -
+    // resolveFilteredTemplateFragments() below additionally suppresses that
+    // Fragment's contribution outright for "Profile labels" unchecked,
+    // rather than showing an attribute value the loaded Profile doesn't
+    // consider valid for this symbol (e.g. "ItemTag" referenced for an
+    // object represented by symbol ND0192A, whose own LabelTemplates only
+    // ever reference ObjectDisplayName/NominalDiameterRepresentation/
+    // ValveDataSheet/TrimType/LockMechanism).
+    const labelTemplateAttrsCache = new Map();
+    function labelTemplateAttrsForSymbol(symbol) {
+        if (!symbol) return null;
+        if (labelTemplateAttrsCache.has(symbol.key)) return labelTemplateAttrsCache.get(symbol.key);
+        const attrs = new Set();
+        (symbol.variants || []).forEach(v => (v.labelTemplates || []).forEach(lt => {
+            if (!lt.text) return;
+            const re = /(?:[A-Za-z][A-Za-z0-9_]*:)?<([^<>]+)>/g;
+            let m;
+            while ((m = re.exec(lt.text)) !== null) attrs.add(m[1]);
+        }));
+        labelTemplateAttrsCache.set(symbol.key, attrs);
+        return attrs;
+    }
+
+    // Resolves templateFragments the same way resolveTemplateFragments()
+    // does, except an attr Fragment whose AttributeName isn't one its own
+    // owning object's placed DiscProfile symbol actually offers (per
+    // labelTemplateAttrsForSymbol() above) contributes "" instead of its
+    // resolved value, even though that attribute might well resolve to a
+    // real value elsewhere - it just isn't a valid label attribute for THIS
+    // symbol per the loaded Profile. Only applied when the owning object's
+    // symbol actually defines LabelTemplate placeholders at all - an
+    // unmodelled symbol (no LabelTemplates in this profile) imposes no
+    // restriction, same as PRF-E06's own scoping.
+    function resolveFilteredTemplateFragments(fragments) {
+        if (!fragments || !fragments.length) return null;
+        return fragments.map(f => {
+            if (f.kind === "literal") return f.text || "";
+            if (f.kind === "attr") {
+                const discInfoForFrag = f.objectId ? discSymbolByRepresentedId.get(f.objectId) : null;
+                const allowed = discInfoForFrag ? labelTemplateAttrsForSymbol(discInfoForFrag.symbol) : null;
+                if (allowed && allowed.size) {
+                    const bare = f.attributeName.split("/").pop();
+                    if (!allowed.has(f.attributeName) && !allowed.has(bare)) return "";
+                }
+                return fragmentValueToText(lookupProperty(f.objectId, f.attributeName), f.repType);
+            }
+            return "";
+        }).join("");
+    }
+
+    drawn.forEach(el => {
+        if (el.elementRole !== "label" || el.kind !== "primitive" || el.primitive?.kind !== "text") return;
+        const discInfo = el.representedId ? discSymbolByRepresentedId.get(el.representedId) : null;
+        el.primitive.isDiscProfileLabel = !!discInfo;
+        // Whether there is ANY real attribute-driven backing for this label
+        // at all - either this Text's own Core/Diagram.TextTemplate names at
+        // least one attribute Fragment, or the placed symbol's catalog
+        // defines at least one Profile/LabelTemplate with an "<Attr>"-style
+        // placeholder in its Text. False when there's no Template at all on
+        // either side, OR a Template exists but is purely literal text (no
+        // attribute reference whatsoever) - i.e. this "label" isn't actually
+        // data-driven by the loaded Profile. App.jsx uses this to hide such
+        // a label's literal instance text once a DiscProfile.xml is loaded,
+        // even with "Profile labels" unchecked - a purely-literal label
+        // isn't something the loaded Profile has any say over, so it
+        // shouldn't be shown as if it were a resolved/verified value.
+        const instanceHasAttr = !!(el.primitive.templateFragments && el.primitive.templateFragments.some(f => f.kind === "attr"));
+        // Only the ONE catalog LabelTemplate that would actually be used as
+        // this Text's fallback (labelTemplates[0] - see the "Best effort"
+        // fill below) counts as backing - NOT "does this symbol have ANY
+        // attribute-referencing LabelTemplate anywhere," which would wrongly
+        // treat every label on a DiscProfile symbol as backed just because
+        // some OTHER, unrelated LabelTemplate on that same symbol happens to
+        // reference an attribute.
+        const fallbackTemplateText = discInfo?.variant?.labelTemplates?.[0]?.text;
+        const catalogHasAttr = !!(fallbackTemplateText && /[<>]/.test(fallbackTemplateText));
+        // A Core/Diagram.TextTemplate/AttributeRepresentation is a base
+        // Core.xml feature, not itself DiscProfile-specific - a Text can
+        // carry its own attribute-backed Template (instanceHasAttr) whether
+        // or not the symbol drawing it happens to be sourced from the
+        // loaded DiscProfile.xml catalogue (isDiscProfileLabel) - e.g. a
+        // pipe segment's nominal-diameter Text referencing
+        // NominalDiameterNumericalValueRepresentation directly on itself,
+        // with no DiscProfile SymbolUsage involved at all. Once a
+        // DiscProfile.xml IS loaded, such a Text is just as much under the
+        // Profile's governance as a catalogued symbol's label - it should
+        // resolve from its attribute value, not its literal <Data
+        // property="Text">, exactly the same way. Gated on discDoc being
+        // loaded at all, so behaviour is unchanged when no profile is
+        // loaded (isDiscProfileLabel is already always false in that case).
+        el.primitive.isProfileGoverned = !!discDoc && (el.primitive.isDiscProfileLabel || instanceHasAttr);
+        el.primitive.hasProfileAttributeBacking = !!discDoc && (instanceHasAttr || catalogHasAttr);
+        // Only fall back to the symbol's own Profile/LabelTemplate when this
+        // Text primitive carries NO Template at all - resolveTemplateFragments()
+        // returns null in that case, vs. an actual (possibly empty) STRING
+        // when a Template IS present but one or more of its own placeholders
+        // didn't resolve (e.g. an instance AttributeRepresentation naming an
+        // attribute, like "SPPID: AlarmH", that plain doesn't exist anywhere
+        // reachable from this object - a genuine data gap in the source
+        // file, not a missing Template). Checking profileText for truthiness
+        // instead of this null-vs-string distinction previously treated a
+        // Template that legitimately resolved to "" the same as "no
+        // Template", and silently replaced it with the DiscProfile symbol's
+        // OWN unrelated LabelTemplate (meant for a different Text position
+        // entirely) - showing the wrong content instead of leaving this
+        // Text's already-correct (if occasionally blank) resolution alone.
+        if (!discInfo || el.primitive.profileText !== null) return;
+        // Best effort: a symbol variant may define several LabelTemplates
+        // (e.g. a top + bottom tag label); with only one Text primitive on
+        // this instance to attribute it to, the first template is used.
+        const template = discInfo.variant?.labelTemplates?.[0]?.text;
+        const fallback = resolveProfileLabelFallback(template, el.representedId);
+        if (fallback !== null) el.primitive.profileText = fallback;
+    });
+
+    // Snapshot of profileText as resolved above, BEFORE the suspect-
+    // duplicate-template blanking pass below can zero it out for the
+    // CHECKED-state overlay-preference decision. "Profile labels" unchecked
+    // has nowhere else to get an attribute-resolved value from (labelOverlays
+    // never render when unchecked - see App.jsx SymbolGraphic's
+    // `showProfileLabels &&` gate) so it always uses this raw, un-blanked
+    // resolution rather than the (possibly-blanked) profileText field.
+    // primitive.validRawProfileText is the same resolution, but with any
+    // attr Fragment whose AttributeName isn't valid for the owning object's
+    // placed symbol (per resolveFilteredTemplateFragments() above)
+    // suppressed - "Profile labels" unchecked uses THIS one specifically, so
+    // an invalid-per-profile attribute reference (e.g. "ItemTag" on an
+    // ND0192A-represented object) never shows its resolved value there, even
+    // though App.jsx's CHECKED-state display still uses the unfiltered
+    // profileText.
+    drawn.forEach(el => {
+        if (el.elementRole !== "label" || el.kind !== "primitive" || el.primitive?.kind !== "text") return;
+        el.primitive.rawProfileText = el.primitive.profileText;
+        el.primitive.validRawProfileText = resolveFilteredTemplateFragments(el.primitive.templateFragments);
+    });
+
+    // Some source files export several visually-distinct label Text pieces
+    // (e.g. a plant/system prefix, a tag-type code, and a sequence number,
+    // each its own Core/Diagram.Text at its own position) but mistakenly
+    // give TWO OR MORE of those DIFFERENTLY-POSITIONED pieces the EXACT SAME
+    // Core/Diagram.TextTemplate (same attribute Fragments) - a copy/paste
+    // export defect, not a real "this text repeats the same value" case.
+    // Detected by grouping each representedId's label texts by their
+    // templateFragments' structural signature and checking whether any one
+    // signature shows up at more than one distinct (x, y) position - a
+    // single Text legitimately appearing more than once (e.g. drawn on
+    // multiple sheets/views) always repeats at the SAME position each time,
+    // so that alone doesn't trigger this.
+    const suspectDuplicateTemplateIds = new Set();
+    {
+        const bySignature = new Map(); // representedId -> Map<signature, Set<"x,y">>
+        drawn.forEach(el => {
+            if (el.elementRole !== "label" || el.kind !== "primitive" || el.primitive?.kind !== "text") return;
+            if (!el.primitive.templateFragments || !el.representedId) return;
+            const sig = JSON.stringify(el.primitive.templateFragments);
+            const posKey = `${el.primitive.position?.x},${el.primitive.position?.y}`;
+            if (!bySignature.has(el.representedId)) bySignature.set(el.representedId, new Map());
+            const sigMap = bySignature.get(el.representedId);
+            if (!sigMap.has(sig)) sigMap.set(sig, new Set());
+            sigMap.get(sig).add(posKey);
+        });
+        for (const [representedId, sigMap] of bySignature) {
+            for (const positions of sigMap.values()) {
+                if (positions.size > 1) { suspectDuplicateTemplateIds.add(representedId); break; }
+            }
+        }
+    }
+
+    // Blank out copy/pasted-Template instance texts (see suspectDuplicateTemplateIds
+    // above) so they don't render at all - only relevant now for the
+    // non-catalogued "Profile labels" checked-state case (primitive.
+    // isProfileGoverned via its own TextTemplate, no DiscProfile symbol
+    // involved) and for App.jsx's unchecked-state hasProfileAttributeBacking
+    // path (primitive.rawProfileText/validRawProfileText are captured BEFORE
+    // this runs, so they're unaffected either way). A catalogued symbol's
+    // own Text primitive never shows profileText at all any more when
+    // checked - see the third pass below - so blanking has no effect there.
+    drawn.forEach(el => {
+        if (el.elementRole !== "label" || el.kind !== "primitive" || el.primitive?.kind !== "text") return;
+        if (!el.primitive.templateFragments || !el.representedId) return;
+        if (suspectDuplicateTemplateIds.has(el.representedId)) el.primitive.profileText = "";
+    });
+
+    // Third pass — "Profile labels" symbol overlays: for EVERY DiscProfile-
+    // catalogued symbol placement, synthesize el.labelOverlays from the
+    // symbol's own catalog Profile/LabelTemplate(s) - "Profile labels"
+    // checked always shows the catalog's own LabelTemplate for a catalogued
+    // symbol, never the instance's own Core/Diagram.TextTemplate (see
+    // App.jsx's renderPrimitive(), which shows nothing for a catalogued
+    // symbol's own Text primitive when checked, deferring entirely to this
+    // overlay) - the instance TextTemplate is only ever used as a display
+    // source for a Text that ISN'T tied to any catalogued symbol at all
+    // (primitive.isProfileGoverned via its own attribute Fragment, e.g. a
+    // pipe segment's nominal-diameter Text with no Profile/SymbolUsage
+    // involved). Some DiscProfile symbols (e.g. a "special item number"
+    // balloon, DiscProfile/ND0048) are never given their own Core/
+    // Diagram.Text in the instance drawing at all - their "label" is itself
+    // another placed symbol (the balloon outline) plus a leader PolyLine -
+    // those are covered here too, the same way. App.jsx's SymbolGraphic
+    // renders these (only when "Profile labels" is checked) inside the
+    // symbol's own transformed <g>, using each LabelTemplate's local
+    // Position/Rotation/Alignment/Font/Size/Color exactly as it does for the
+    // symbol's own Primitives.
+    drawn.forEach(el => {
+        if (el.kind !== "symbolUsage" || !el.representedId) return;
+        if (!el.symbol?.key?.startsWith("DiscProfile/")) return;
+        const templates = el.variant?.labelTemplates;
+        if (!templates || !templates.length) return;
+        // Shared across every LabelTemplate for this one symbol placement so
+        // repeated "ClassName:<Attr>" role-path references (e.g. H/HH/L/LL
+        // all referencing SignalConveyingFunction) each pick the next
+        // matching child rather than all resolving to the same one - see
+        // pickRoleChild()/resolveProfileLabelFallback() above.
+        const roleCounters = {};
+        const overlays = templates
+            .map(lt => ({ text: resolveProfileLabelFallback(lt.text, el.representedId, roleCounters), position: lt.position, rotation: lt.rotation, alignment: lt.alignment, font: lt.font, size: lt.size, color: lt.color }))
+            .filter(o => o.text);
+        if (overlays.length) el.labelOverlays = overlays;
+    });
+
     return { elements: drawn, nodePosMap };
 }
 
