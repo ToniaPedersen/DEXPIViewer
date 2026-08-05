@@ -860,6 +860,7 @@ export default function App() {
     const [validationIssues, setValidationIssues] = useState([]);
     const [validationDone, setValidationDone] = useState(false);
     const [validationFilter, setValidationFilter] = useState("All");
+    const [collapsedCodeGroups, setCollapsedCodeGroups] = useState(new Set());
     const [severityConfig, setSeverityConfig] = useState({});
     // Connectivity checkbox: checking it SHOWS the upstream/downstream/group
     // highlight for the selected object; unchecked (the default) hides it.
@@ -1231,6 +1232,23 @@ export default function App() {
 
     const issueCounts = useMemo(() => { const c = { Error: 0, Warning: 0, Info: 0 }; validationIssues.forEach(i => { c[i.severity] = (c[i.severity] || 0) + 1; }); return c; }, [validationIssues]);
     const filteredIssues = useMemo(() => validationFilter === "All" ? validationIssues : validationIssues.filter(i => i.severity === validationFilter), [validationIssues, validationFilter]);
+    const codeGroups = useMemo(() => {
+        const groups = new Map();
+        filteredIssues.forEach((issue, idx) => {
+            const code = issue.ruleId || "(no code)";
+            if (!groups.has(code)) groups.set(code, { code, items: [], severity: issue.severity });
+            const g = groups.get(code);
+            g.items.push({ issue, idx });
+            const order = { Error: 0, Warning: 1, Info: 2 };
+            if (order[issue.severity] < order[g.severity]) g.severity = issue.severity;
+        });
+        return Array.from(groups.values()).sort((a, b) => b.items.length - a.items.length || a.code.localeCompare(b.code));
+    }, [filteredIssues]);
+    function toggleCodeGroup(code) {
+        setCollapsedCodeGroups(prev => { const next = new Set(prev); next.has(code) ? next.delete(code) : next.add(code); return next; });
+    }
+    function expandAllCodeGroups() { setCollapsedCodeGroups(new Set()); }
+    function collapseAllCodeGroups() { setCollapsedCodeGroups(new Set(codeGroups.map(g => g.code))); }
 
     // The overlay is placed in the *drawing's* coordinate space (fullBounds),
     // not raw CSS/screen pixels: rendering it as an <image> inside the same
@@ -1357,72 +1375,94 @@ export default function App() {
                                                 {f}{f !== "All" ? ` (${issueCounts[f]})` : ` (${validationIssues.length})`}
                                             </button>
                                         ))}
+                                        <button style={S.btnSmall} onClick={expandAllCodeGroups}>Expand all</button>
+                                        <button style={S.btnSmall} onClick={collapseAllCodeGroups}>Collapse all</button>
                                         <button style={{ ...S.btnSmall, marginLeft: "auto" }} onClick={() => downloadCSV(validationIssues, `${mainFileName}.csv`)}>CSV</button>
                                     </div>
-                                    {filteredIssues.map((issue, i) => {
-                                        const navId = getNavigableId(issue);
-                                        const isNavable = !!navId;
-                                        const isActive = navId && navId === selectedId;
-                                        const scrollToParent = (parent) => {
-                                            const parentIdx = filteredIssues.findIndex(iss => iss.ruleId === parent.ruleId && iss.objectId === parent.objectId);
-                                            if (parentIdx >= 0) {
-                                                const el = issueCardRefs.current.get(parentIdx);
-                                                if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
-                                            }
-                                            if (parent.objectId && !parent.objectId.startsWith("(")) {
-                                                const pid = parsed?.treeMap?.has(parent.objectId) ? parent.objectId : null;
-                                                if (pid) { handleSelect(pid); setRightTab("issues"); }
-                                            }
-                                        };
-                                        return (
-                                            <div key={i}
-                                                ref={el => { if (el) issueCardRefs.current.set(i, el); else issueCardRefs.current.delete(i); }}
-                                                onClick={() => { if (navId) { handleSelect(navId); setRightTab("issues"); } }}
-                                                style={{ padding: "8px 10px", borderBottom: "1px solid #eef2f6", cursor: isNavable ? "pointer" : "default", borderLeft: isActive ? "3px solid #0969da" : "3px solid transparent", background: isActive ? "#f0f7ff" : "transparent", transition: "background 0.1s" }}
-                                            >
-                                                <div style={{ display: "flex", gap: 5, alignItems: "center", marginBottom: 3 }}>
-                                                    <span style={{ ...S.badge(S.sevColor[issue.severity]) }}>{issue.severity}</span>
-                                                    <span style={{ fontSize: 11, fontFamily: "monospace", color: "#555" }}>{issue.ruleId}</span>
-                                                    {isNavable && <span title="Click to highlight element" style={{ fontSize: 10, color: "#0969da", marginLeft: 2 }}>⊕</span>}
-                                                    <span style={{ fontSize: 10, color: "#888", marginLeft: "auto" }}>{issue.profileSource}</span>
+                                    {(() => {
+                                        const renderIssueCard = (issue, i) => {
+                                            const navId = getNavigableId(issue);
+                                            const isNavable = !!navId;
+                                            const isActive = navId && navId === selectedId;
+                                            const scrollToParent = (parent) => {
+                                                const parentIdx = filteredIssues.findIndex(iss => iss.ruleId === parent.ruleId && iss.objectId === parent.objectId);
+                                                if (parentIdx >= 0) {
+                                                    const el = issueCardRefs.current.get(parentIdx);
+                                                    if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+                                                }
+                                                if (parent.objectId && !parent.objectId.startsWith("(")) {
+                                                    const pid = parsed?.treeMap?.has(parent.objectId) ? parent.objectId : null;
+                                                    if (pid) { handleSelect(pid); setRightTab("issues"); }
+                                                }
+                                            };
+                                            return (
+                                                <div key={i}
+                                                    ref={el => { if (el) issueCardRefs.current.set(i, el); else issueCardRefs.current.delete(i); }}
+                                                    onClick={() => { if (navId) { handleSelect(navId); setRightTab("issues"); } }}
+                                                    style={{ padding: "8px 10px", borderBottom: "1px solid #eef2f6", cursor: isNavable ? "pointer" : "default", borderLeft: isActive ? "3px solid #0969da" : "3px solid transparent", background: isActive ? "#f0f7ff" : "transparent", transition: "background 0.1s" }}
+                                                >
+                                                    <div style={{ display: "flex", gap: 5, alignItems: "center", marginBottom: 3 }}>
+                                                        <span style={{ ...S.badge(S.sevColor[issue.severity]) }}>{issue.severity}</span>
+                                                        <span style={{ fontSize: 11, fontFamily: "monospace", color: "#555" }}>{issue.ruleId}</span>
+                                                        {isNavable && <span title="Click to highlight element" style={{ fontSize: 10, color: "#0969da", marginLeft: 2 }}>⊕</span>}
+                                                        <span style={{ fontSize: 10, color: "#888", marginLeft: "auto" }}>{issue.profileSource}</span>
+                                                    </div>
+                                                    <div style={{ fontSize: 12, color: "#333", marginBottom: 2 }}>{issue.description}</div>
+                                                    {issue.objectId && !issue.objectId.startsWith("(") && (
+                                                        <div style={{ fontSize: 11, color: isNavable ? "#0969da" : "#57606a", fontFamily: "monospace" }}>
+                                                            {isNavable && !issue.visualContextId ? "↳ " : ""}{issue.objectId}
+                                                            {!isNavable && <span style={{ color: "#cf222e", marginLeft: 4 }} title="No graphical representation found">⚠ no symbol</span>}
+                                                        </div>
+                                                    )}
+                                                    {issue.visualContextId && (
+                                                        <div
+                                                            onClick={e => { e.stopPropagation(); handleSelect(issue.visualContextId); setRightTab("issues"); }}
+                                                            style={{ fontSize: 11, color: "#0969da", fontFamily: "monospace", marginTop: 2, cursor: "pointer" }}
+                                                            title="Click to highlight nearest graphical ancestor in the drawing"
+                                                        >
+                                                            ↳ nearest symbol: {issue.visualContextId}
+                                                        </div>
+                                                    )}
+                                                    {issue.causedBy && issue.causedBy.length > 0 && (
+                                                        <div style={{ marginTop: 4, paddingTop: 4, borderTop: "1px dashed #d0d7de" }}>
+                                                            {issue.causedBy.map((parent, pi) => (
+                                                                <div key={pi}
+                                                                    onClick={e => { e.stopPropagation(); scrollToParent(parent); }}
+                                                                    style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer", color: "#8250df", fontSize: 11 }}
+                                                                    title={parent.description}
+                                                                >
+                                                                    <span>↑ root cause:</span>
+                                                                    <span style={{ fontFamily: "monospace", fontWeight: 600 }}>{parent.ruleId}</span>
+                                                                    {parent.objectId && !parent.objectId.startsWith("(") && (
+                                                                        <span style={{ fontFamily: "monospace", color: "#57606a" }}>on {parent.objectId}</span>
+                                                                    )}
+                                                                </div>
+                                                            ))}
+                                                        </div>
+                                                    )}
+                                                    {issue.suggestedCorrection && <div style={{ fontSize: 11, color: "#0969da", marginTop: 2 }}>Suggestion: {issue.suggestedCorrection}</div>}
                                                 </div>
-                                                <div style={{ fontSize: 12, color: "#333", marginBottom: 2 }}>{issue.description}</div>
-                                                {issue.objectId && !issue.objectId.startsWith("(") && (
-                                                    <div style={{ fontSize: 11, color: isNavable ? "#0969da" : "#57606a", fontFamily: "monospace" }}>
-                                                        {isNavable && !issue.visualContextId ? "↳ " : ""}{issue.objectId}
-                                                        {!isNavable && <span style={{ color: "#cf222e", marginLeft: 4 }} title="No graphical representation found">⚠ no symbol</span>}
-                                                    </div>
-                                                )}
-                                                {issue.visualContextId && (
+                                            );
+                                        };
+
+                                        return codeGroups.map(group => {
+                                            const isCollapsed = collapsedCodeGroups.has(group.code);
+                                            return (
+                                                <div key={group.code}>
                                                     <div
-                                                        onClick={e => { e.stopPropagation(); handleSelect(issue.visualContextId); setRightTab("issues"); }}
-                                                        style={{ fontSize: 11, color: "#0969da", fontFamily: "monospace", marginTop: 2, cursor: "pointer" }}
-                                                        title="Click to highlight nearest graphical ancestor in the drawing"
+                                                        onClick={() => toggleCodeGroup(group.code)}
+                                                        style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 10px", background: "#f6f8fa", borderBottom: "1px solid #eef2f6", cursor: "pointer", position: "sticky", top: 0, zIndex: 1 }}
                                                     >
-                                                        ↳ nearest symbol: {issue.visualContextId}
+                                                        <span style={{ fontSize: 10, color: "#57606a", width: 10, display: "inline-block" }}>{isCollapsed ? "▶" : "▼"}</span>
+                                                        <span style={{ ...S.badge(S.sevColor[group.severity]) }}>{group.severity}</span>
+                                                        <span style={{ fontSize: 11, fontFamily: "monospace", fontWeight: 600, color: "#333" }}>{group.code}</span>
+                                                        <span style={{ fontSize: 11, color: "#888", marginLeft: "auto" }}>{group.items.length}</span>
                                                     </div>
-                                                )}
-                                                {issue.causedBy && issue.causedBy.length > 0 && (
-                                                    <div style={{ marginTop: 4, paddingTop: 4, borderTop: "1px dashed #d0d7de" }}>
-                                                        {issue.causedBy.map((parent, pi) => (
-                                                            <div key={pi}
-                                                                onClick={e => { e.stopPropagation(); scrollToParent(parent); }}
-                                                                style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer", color: "#8250df", fontSize: 11 }}
-                                                                title={parent.description}
-                                                            >
-                                                                <span>↑ root cause:</span>
-                                                                <span style={{ fontFamily: "monospace", fontWeight: 600 }}>{parent.ruleId}</span>
-                                                                {parent.objectId && !parent.objectId.startsWith("(") && (
-                                                                    <span style={{ fontFamily: "monospace", color: "#57606a" }}>on {parent.objectId}</span>
-                                                                )}
-                                                            </div>
-                                                        ))}
-                                                    </div>
-                                                )}
-                                                {issue.suggestedCorrection && <div style={{ fontSize: 11, color: "#0969da", marginTop: 2 }}>Suggestion: {issue.suggestedCorrection}</div>}
-                                            </div>
-                                        );
-                                    })}
+                                                    {!isCollapsed && group.items.map(({ issue, idx }) => renderIssueCard(issue, idx))}
+                                                </div>
+                                            );
+                                        });
+                                    })()}
                                     {filteredIssues.length === 0 && <div style={{ padding: 16, color: "#888", fontSize: 13 }}>No {validationFilter !== "All" ? validationFilter.toLowerCase() + " " : ""}issues found.</div>}
                                 </>
                             )}
