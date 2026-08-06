@@ -7,6 +7,50 @@ import {
 } from "./dexpiParser.js";
 import { jsPDF } from "jspdf";
 
+// ---------- BG image per-file default placement (scale / X / Y) -------------
+// Keyed by drawing identity (drawing number when known, else the loaded file
+// name) and persisted in localStorage, so re-opening the same drawing + BG
+// image later reapplies the placement the user dialed in last time instead
+// of always resetting to the auto-fit (scale 1, offset 0,0).
+const BG_DEFAULTS_STORAGE_KEY = "dexpiviewer.bgImageDefaults.v1";
+
+function loadAllBgDefaults() {
+    try {
+        const raw = localStorage.getItem(BG_DEFAULTS_STORAGE_KEY);
+        return raw ? JSON.parse(raw) : {};
+    } catch {
+        return {};
+    }
+}
+
+function getBgDefault(fileKey) {
+    if (!fileKey) return null;
+    const all = loadAllBgDefaults();
+    return all[fileKey] || null;
+}
+
+function setBgDefault(fileKey, placement) {
+    if (!fileKey) return;
+    try {
+        const all = loadAllBgDefaults();
+        all[fileKey] = placement;
+        localStorage.setItem(BG_DEFAULTS_STORAGE_KEY, JSON.stringify(all));
+    } catch {
+        // localStorage unavailable (private browsing, quota, etc.) - silently skip persistence
+    }
+}
+
+function clearBgDefault(fileKey) {
+    if (!fileKey) return;
+    try {
+        const all = loadAllBgDefaults();
+        delete all[fileKey];
+        localStorage.setItem(BG_DEFAULTS_STORAGE_KEY, JSON.stringify(all));
+    } catch {
+        // ignore
+    }
+}
+
 // ---------- Data value formatting --------------------------------------------
 
 /**
@@ -856,6 +900,9 @@ export default function App() {
     const [panStart, setPanStart] = useState(null);
     const [bgImage, setBgImage] = useState(null);
     const [showBgControls, setShowBgControls] = useState(false);
+    // Bumped whenever a per-file BG placement default is saved/cleared, purely
+    // to force hasBgDefaultForCurrentFile (below) to re-read localStorage.
+    const [bgDefaultsVersion, setBgDefaultsVersion] = useState(0);
     const [profiles, setProfiles] = useState([]);
     const [validationIssues, setValidationIssues] = useState([]);
     const [validationDone, setValidationDone] = useState(false);
@@ -1005,8 +1052,42 @@ export default function App() {
         setProfiles(prev => [...prev, { name, xml, constraints }]);
         e.target.value = "";
     }
+    // Identity used to key saved BG image placements: the drawing number when
+    // known (stable across re-exports/revisions of the same drawing file),
+    // falling back to the loaded XML file name.
+    function currentBgFileKey() {
+        return parsed?.meta?.drawingName || mainFileFullName || mainFileName || null;
+    }
+
+    function saveCurrentBgAsDefault() {
+        const fileKey = currentBgFileKey();
+        if (!fileKey || !bgImage) return;
+        setBgDefault(fileKey, { scale: bgImage.scale, offsetX: bgImage.offsetX, offsetY: bgImage.offsetY });
+        setBgDefaultsVersion(v => v + 1);
+    }
+
+    function clearCurrentBgDefault() {
+        clearBgDefault(currentBgFileKey());
+        setBgDefaultsVersion(v => v + 1);
+    }
+
+    // Whether a saved placement default already exists for whichever drawing
+    // is currently loaded - drives the "Clear Default" button and the label
+    // on "Save as Default".
+    // bgDefaultsVersion is a deliberate cache-buster in the deps array below:
+    // it isn't read inside the memo, it just forces a re-read of localStorage
+    // after saveCurrentBgAsDefault/clearCurrentBgDefault run. (Same
+    // "unnecessary dependency" lint warning shape as the existing viewBox
+    // effect further down - left as a warning, not suppressed, to match.)
+    const hasBgDefaultForCurrentFile = useMemo(
+        () => !!getBgDefault(parsed?.meta?.drawingName || mainFileFullName || mainFileName || null),
+        [parsed, mainFileFullName, mainFileName, bgDefaultsVersion]
+    );
+
     async function handleBgFile(e) {
         const file = e.target.files?.[0]; if (!file) return;
+        const fileKey = currentBgFileKey();
+        const saved = getBgDefault(fileKey);
         const reader = new FileReader();
         reader.onload = ev => {
             const src = ev.target.result;
@@ -1016,12 +1097,18 @@ export default function App() {
             const probe = new Image();
             probe.onload = () => {
                 setBgImage({
-                    src, opacity: 0.4, scale: 1, offsetX: 0, offsetY: 0, visible: true,
+                    src, opacity: 0.4,
+                    scale: saved?.scale ?? 1, offsetX: saved?.offsetX ?? 0, offsetY: saved?.offsetY ?? 0,
+                    visible: true,
                     naturalWidth: probe.naturalWidth, naturalHeight: probe.naturalHeight,
                 });
             };
             probe.onerror = () => {
-                setBgImage({ src, opacity: 0.4, scale: 1, offsetX: 0, offsetY: 0, visible: true, naturalWidth: 0, naturalHeight: 0 });
+                setBgImage({
+                    src, opacity: 0.4,
+                    scale: saved?.scale ?? 1, offsetX: saved?.offsetX ?? 0, offsetY: saved?.offsetY ?? 0,
+                    visible: true, naturalWidth: 0, naturalHeight: 0,
+                });
             };
             probe.src = src;
         };
@@ -1599,6 +1686,17 @@ export default function App() {
                             <input type="number" step={Math.max(0.01, boundsH / 500)} value={bgImage.offsetY} onChange={e => { const v = parseFloat(e.target.value); if (!Number.isNaN(v)) setBgImage(b => ({ ...b, offsetY: v })); }} style={S.numBoxWide} title="Y offset, in drawing units, from the auto-fit position" />
                         </label>
                         <button style={S.btnSmall} onClick={() => setBgImage(b => ({ ...b, scale: 1, offsetX: 0, offsetY: 0 }))} title="Reset to the auto-fit (centered, aspect-correct) placement">Reset fit</button>
+                        <button
+                            style={{ ...S.btnSmall, background: "#eaf2ff", borderColor: "#0969da", color: "#0969da" }}
+                            onClick={saveCurrentBgAsDefault}
+                            disabled={!currentBgFileKey()}
+                            title="Remember the current Scale / X / Y for this drawing, so the next BG image loaded for it starts at this placement instead of the auto-fit"
+                        >
+                            {hasBgDefaultForCurrentFile ? "★ Update Default" : "☆ Save as Default"}
+                        </button>
+                        {hasBgDefaultForCurrentFile && (
+                            <button style={S.btnSmall} onClick={clearCurrentBgDefault} title="Forget the saved placement default for this drawing">Clear Default</button>
+                        )}
                         <button style={{ ...S.btnSmall, color: "#cf222e" }} onClick={() => { setBgImage(null); setShowBgControls(false); }}>Remove</button>
                     </div>
                 )}
