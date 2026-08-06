@@ -7,47 +7,159 @@ import {
 } from "./dexpiParser.js";
 import { jsPDF } from "jspdf";
 
-// ---------- BG image per-file default placement (scale / X / Y) -------------
-// Keyed by drawing identity (drawing number when known, else the loaded file
-// name) and persisted in localStorage, so re-opening the same drawing + BG
-// image later reapplies the placement the user dialed in last time instead
-// of always resetting to the auto-fit (scale 1, offset 0,0).
-const BG_DEFAULTS_STORAGE_KEY = "dexpiviewer.bgImageDefaults.v1";
+// ---------- BG image default placement (embedded in the PNG itself) --------
+// The saved default placement ({scale, offsetX, offsetY}) is written
+// directly into the loaded PNG file's own metadata, as a standard tEXt
+// ancillary chunk - not into localStorage. This means the default travels
+// with the image file: opening it on a different machine, browser, or
+// profile still applies the saved placement, and there's no separate
+// per-browser store to keep in sync or lose. The tradeoff (see the UI below)
+// is that a browser app can't rewrite a file already on disk in place, so
+// "saving" the default produces new PNG bytes in memory that the user then
+// downloads as a fresh file. Only PNG supports this (the chunk format below
+// is PNG-specific); other image types can be used as a BG image as before,
+// they just can't carry a saved default.
+const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+const PNG_PLACEMENT_KEYWORD = "dexpi:bgPlacement";
 
-function loadAllBgDefaults() {
-    try {
-        const raw = localStorage.getItem(BG_DEFAULTS_STORAGE_KEY);
-        return raw ? JSON.parse(raw) : {};
-    } catch {
-        return {};
+function isPngBytes(bytes) {
+    if (!bytes || bytes.length < 8) return false;
+    return PNG_SIGNATURE.every((b, i) => bytes[i] === b);
+}
+
+function png_concat(...arrays) {
+    const total = arrays.reduce((n, a) => n + a.length, 0);
+    const out = new Uint8Array(total);
+    let pos = 0;
+    arrays.forEach(a => { out.set(a, pos); pos += a.length; });
+    return out;
+}
+
+// Standard PNG CRC-32 (ISO 3309 / ITU-T V.42), computed over a chunk's own
+// type + data bytes, per the PNG spec - required on every chunk we write so
+// PNG-conformant readers (including this app's own probe Image() load, and
+// any other image viewer) don't reject the file as corrupt.
+const PNG_CRC_TABLE = (() => {
+    const table = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+        let c = n;
+        for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+        table[n] = c >>> 0;
     }
+    return table;
+})();
+function png_crc32(bytes) {
+    let c = 0xffffffff;
+    for (let i = 0; i < bytes.length; i++) c = PNG_CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+}
+function png_u32be(n) {
+    return new Uint8Array([(n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff]);
+}
+function png_readU32be(bytes, offset) {
+    return ((bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3]) >>> 0;
 }
 
-function getBgDefault(fileKey) {
-    if (!fileKey) return null;
-    const all = loadAllBgDefaults();
-    return all[fileKey] || null;
-}
-
-function setBgDefault(fileKey, placement) {
-    if (!fileKey) return;
-    try {
-        const all = loadAllBgDefaults();
-        all[fileKey] = placement;
-        localStorage.setItem(BG_DEFAULTS_STORAGE_KEY, JSON.stringify(all));
-    } catch {
-        // localStorage unavailable (private browsing, quota, etc.) - silently skip persistence
+// Walks a PNG byte array's chunk structure, returning
+// [{ type, dataStart, dataLength, chunkStart, chunkEnd }, ...] in file
+// order (chunkStart/chunkEnd bound the WHOLE chunk - length+type+data+crc -
+// so callers can splice bytes in/out at those boundaries directly). Stops
+// at IEND, or early on any truncated/malformed chunk header rather than
+// throwing - callers treat "no chunks found" the same as "not a PNG".
+function png_readChunks(bytes) {
+    const chunks = [];
+    let offset = 8; // past the 8-byte signature
+    while (offset + 8 <= bytes.length) {
+        const length = png_readU32be(bytes, offset);
+        const type = String.fromCharCode(bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7]);
+        const dataStart = offset + 8;
+        const dataEnd = dataStart + length;
+        const chunkEnd = dataEnd + 4; // + CRC
+        if (chunkEnd > bytes.length) break;
+        chunks.push({ type, dataStart, dataLength: length, chunkStart: offset, chunkEnd });
+        offset = chunkEnd;
+        if (type === "IEND") break;
     }
+    return chunks;
 }
 
-function clearBgDefault(fileKey) {
-    if (!fileKey) return;
+// Decodes a tEXt chunk's "Keyword\0Text" payload (Latin-1, per the PNG
+// spec's tEXt encoding - ASCII-safe for the plain-JSON payload written by
+// png_buildTextChunk below).
+function png_decodeTextChunk(bytes, chunk) {
+    const data = bytes.subarray(chunk.dataStart, chunk.dataStart + chunk.dataLength);
+    const nul = data.indexOf(0);
+    if (nul < 0) return null;
+    const keyword = String.fromCharCode(...data.subarray(0, nul));
+    const text = String.fromCharCode(...data.subarray(nul + 1));
+    return { keyword, text };
+}
+
+function png_buildTextChunk(keyword, text) {
+    const kwBytes = Uint8Array.from(keyword, ch => ch.charCodeAt(0));
+    const txtBytes = Uint8Array.from(text, ch => ch.charCodeAt(0));
+    const typeBytes = Uint8Array.from("tEXt", ch => ch.charCodeAt(0));
+    const data = png_concat(kwBytes, new Uint8Array([0]), txtBytes);
+    const crc = png_crc32(png_concat(typeBytes, data));
+    return png_concat(png_u32be(data.length), typeBytes, data, png_u32be(crc));
+}
+
+// Returns new PNG bytes with any existing placement tEXt chunk removed -
+// used both standalone (Clear Default) and as the first step of writing a
+// fresh one (write always strips-then-reinserts, so there's never more than
+// one placement chunk in the file).
+function png_stripPlacementChunk(bytes) {
+    const chunks = png_readChunks(bytes);
+    const keep = chunks.filter(c => {
+        if (c.type !== "tEXt") return true;
+        const kv = png_decodeTextChunk(bytes, c);
+        return !(kv && kv.keyword === PNG_PLACEMENT_KEYWORD);
+    });
+    const parts = [bytes.subarray(0, 8)];
+    keep.forEach(c => parts.push(bytes.subarray(c.chunkStart, c.chunkEnd)));
+    return png_concat(...parts);
+}
+
+// Returns new PNG bytes with the given {scale, offsetX, offsetY} written in
+// as a tEXt chunk immediately before IEND. Never mutates the input bytes.
+// Throws if the input isn't a well-formed PNG (callers only call this after
+// isPngBytes() has already gated on the file being a PNG).
+function writePngEmbeddedPlacement(bytes, placement) {
+    const stripped = png_stripPlacementChunk(bytes);
+    const chunks = png_readChunks(stripped);
+    if (!chunks.some(c => c.type === "IEND")) throw new Error("Not a valid PNG (no IEND chunk found).");
+    const newChunk = png_buildTextChunk(PNG_PLACEMENT_KEYWORD, JSON.stringify({
+        scale: placement.scale, offsetX: placement.offsetX, offsetY: placement.offsetY,
+    }));
+    const parts = [stripped.subarray(0, 8)];
+    chunks.forEach(c => {
+        if (c.type === "IEND") parts.push(newChunk);
+        parts.push(stripped.subarray(c.chunkStart, c.chunkEnd));
+    });
+    return png_concat(...parts);
+}
+
+// Reads the saved BG placement (if any) embedded in a PNG's own tEXt
+// metadata - returns {scale, offsetX, offsetY} or null (not a PNG, no such
+// chunk, or a malformed payload). Every failure mode degrades to "no saved
+// default" rather than throwing, so a corrupt/foreign tEXt chunk never
+// breaks loading the image itself.
+function readPngEmbeddedPlacement(bytes) {
     try {
-        const all = loadAllBgDefaults();
-        delete all[fileKey];
-        localStorage.setItem(BG_DEFAULTS_STORAGE_KEY, JSON.stringify(all));
+        if (!isPngBytes(bytes)) return null;
+        for (const chunk of png_readChunks(bytes)) {
+            if (chunk.type !== "tEXt") continue;
+            const kv = png_decodeTextChunk(bytes, chunk);
+            if (!kv || kv.keyword !== PNG_PLACEMENT_KEYWORD) continue;
+            const parsedPlacement = JSON.parse(kv.text);
+            if (parsedPlacement && Number.isFinite(parsedPlacement.scale) && Number.isFinite(parsedPlacement.offsetX) && Number.isFinite(parsedPlacement.offsetY)) {
+                return { scale: parsedPlacement.scale, offsetX: parsedPlacement.offsetX, offsetY: parsedPlacement.offsetY };
+            }
+            return null;
+        }
+        return null;
     } catch {
-        // ignore
+        return null;
     }
 }
 
@@ -900,9 +1012,6 @@ export default function App() {
     const [panStart, setPanStart] = useState(null);
     const [bgImage, setBgImage] = useState(null);
     const [showBgControls, setShowBgControls] = useState(false);
-    // Bumped whenever a per-file BG placement default is saved/cleared, purely
-    // to force hasBgDefaultForCurrentFile (below) to re-read localStorage.
-    const [bgDefaultsVersion, setBgDefaultsVersion] = useState(0);
     const [profiles, setProfiles] = useState([]);
     const [validationIssues, setValidationIssues] = useState([]);
     const [validationDone, setValidationDone] = useState(false);
@@ -952,6 +1061,10 @@ export default function App() {
     const discInputRef = useRef(null);
     const profileInputRef = useRef(null);
     const bgInputRef = useRef(null);
+    // Object URL for the currently loaded BG image (see handleBgFile below) -
+    // revoked whenever it's replaced or the component unmounts, since object
+    // URLs otherwise leak for the life of the page.
+    const bgObjectUrlRef = useRef(null);
     const issueCardRefs = useRef(new Map()); // index → DOM element for validation list scroll
     const svgViewportRef = useRef(null);
     const svgElRef = useRef(null);
@@ -1052,68 +1165,75 @@ export default function App() {
         setProfiles(prev => [...prev, { name, xml, constraints }]);
         e.target.value = "";
     }
-    // Identity used to key saved BG image placements: the drawing number when
-    // known (stable across re-exports/revisions of the same drawing file),
-    // falling back to the loaded XML file name.
-    function currentBgFileKey() {
-        return parsed?.meta?.drawingName || mainFileFullName || mainFileName || null;
-    }
-
-    function saveCurrentBgAsDefault() {
-        const fileKey = currentBgFileKey();
-        if (!fileKey || !bgImage) return;
-        setBgDefault(fileKey, { scale: bgImage.scale, offsetX: bgImage.offsetX, offsetY: bgImage.offsetY });
-        setBgDefaultsVersion(v => v + 1);
-    }
-
-    function clearCurrentBgDefault() {
-        clearBgDefault(currentBgFileKey());
-        setBgDefaultsVersion(v => v + 1);
-    }
-
-    // Whether a saved placement default already exists for whichever drawing
-    // is currently loaded - drives the "Clear Default" button and the label
-    // on "Save as Default".
-    // bgDefaultsVersion is a deliberate cache-buster in the deps array below:
-    // it isn't read inside the memo, it just forces a re-read of localStorage
-    // after saveCurrentBgAsDefault/clearCurrentBgDefault run. (Same
-    // "unnecessary dependency" lint warning shape as the existing viewBox
-    // effect further down - left as a warning, not suppressed, to match.)
-    const hasBgDefaultForCurrentFile = useMemo(
-        () => !!getBgDefault(parsed?.meta?.drawingName || mainFileFullName || mainFileName || null),
-        [parsed, mainFileFullName, mainFileName, bgDefaultsVersion]
-    );
-
     async function handleBgFile(e) {
         const file = e.target.files?.[0]; if (!file) return;
-        const fileKey = currentBgFileKey();
-        const saved = getBgDefault(fileKey);
-        const reader = new FileReader();
-        reader.onload = ev => {
-            const src = ev.target.result;
+        try {
+            const bytes = new Uint8Array(await file.arrayBuffer());
+            const isPng = isPngBytes(bytes);
+            // Look for a placement embedded in this PNG's own metadata (see
+            // readPngEmbeddedPlacement above) and use it in place of the
+            // auto-fit values (scale 1, offset 0,0) when present. Non-PNG
+            // images, or a PNG with no such chunk, fall back to auto-fit.
+            const embedded = isPng ? readPngEmbeddedPlacement(bytes) : null;
+            const placement = embedded || { scale: 1, offsetX: 0, offsetY: 0 };
+
+            if (bgObjectUrlRef.current) URL.revokeObjectURL(bgObjectUrlRef.current);
+            const src = URL.createObjectURL(new Blob([bytes], { type: file.type || (isPng ? "image/png" : "") }));
+            bgObjectUrlRef.current = src;
+
             // Load the raw pixel dimensions so the overlay can be fit into the
             // drawing's coordinate space (fullBounds) preserving aspect ratio,
             // instead of guessing a scale in unrelated CSS-pixel units.
             const probe = new Image();
-            probe.onload = () => {
-                setBgImage({
-                    src, opacity: 0.4,
-                    scale: saved?.scale ?? 1, offsetX: saved?.offsetX ?? 0, offsetY: saved?.offsetY ?? 0,
-                    visible: true,
-                    naturalWidth: probe.naturalWidth, naturalHeight: probe.naturalHeight,
-                });
+            const base = {
+                src, opacity: 0.4, scale: placement.scale, offsetX: placement.offsetX, offsetY: placement.offsetY, visible: true,
+                // sourceBytes/isPng/fileName/embeddedPlacement support the
+                // Download-with-placement/Clear-default controls below - see
+                // downloadBgPlacementPng()/clearBgDefault().
+                sourceBytes: bytes, isPng, fileName: file.name, embeddedPlacement: embedded,
             };
-            probe.onerror = () => {
-                setBgImage({
-                    src, opacity: 0.4,
-                    scale: saved?.scale ?? 1, offsetX: saved?.offsetX ?? 0, offsetY: saved?.offsetY ?? 0,
-                    visible: true, naturalWidth: 0, naturalHeight: 0,
-                });
-            };
+            probe.onload = () => setBgImage({ ...base, naturalWidth: probe.naturalWidth, naturalHeight: probe.naturalHeight });
+            probe.onerror = () => setBgImage({ ...base, naturalWidth: 0, naturalHeight: 0 });
             probe.src = src;
-        };
-        reader.readAsDataURL(file);
+        } catch (err) {
+            alert("Could not read the selected image: " + (err.message || String(err)));
+        }
         e.target.value = "";
+    }
+
+    // Embeds the current Scale/X/Y directly into a copy of the loaded PNG's
+    // bytes and immediately downloads it. The originally-selected file on
+    // disk is never modified, since a browser app has no way to do that -
+    // this always hands the user a new file instead.
+    function downloadBgPlacementPng() {
+        if (!bgImage?.isPng || !bgImage.sourceBytes) return;
+        try {
+            const placement = { scale: bgImage.scale, offsetX: bgImage.offsetX, offsetY: bgImage.offsetY };
+            const updated = writePngEmbeddedPlacement(bgImage.sourceBytes, placement);
+            const blob = new Blob([updated], { type: "image/png" });
+            const base = (bgImage.fileName || "background").replace(/\.png$/i, "");
+            downloadBlob(blob, `${base}-placement.png`);
+            setBgImage(b => b && ({ ...b, sourceBytes: updated, embeddedPlacement: placement }));
+        } catch (err) {
+            alert("Could not save the placement into the PNG: " + (err.message || String(err)));
+        }
+    }
+
+    // Removes the embedded placement from the in-memory PNG bytes and
+    // immediately downloads the result. Never touches the currently
+    // displayed placement (scale/offsetX/offsetY) - only affects what a
+    // future load of the downloaded file would apply.
+    function clearBgDefault() {
+        if (!bgImage?.isPng || !bgImage.sourceBytes) return;
+        try {
+            const updated = png_stripPlacementChunk(bgImage.sourceBytes);
+            const blob = new Blob([updated], { type: "image/png" });
+            const base = (bgImage.fileName || "background").replace(/\.png$/i, "");
+            downloadBlob(blob, `${base}-placement.png`);
+            setBgImage(b => b && ({ ...b, sourceBytes: updated, embeddedPlacement: null }));
+        } catch (err) {
+            alert("Could not clear the embedded placement: " + (err.message || String(err)));
+        }
     }
 
     // Export: rasterizes exactly what's currently on screen inside the SVG
@@ -1323,6 +1443,14 @@ export default function App() {
         window.addEventListener("keydown", onKeyDown);
         window.addEventListener("keyup", onKeyUp);
         return () => { window.removeEventListener("keydown", onKeyDown); window.removeEventListener("keyup", onKeyUp); };
+    }, []);
+
+    // Revokes the current BG image object URL (see handleBgFile) when the
+    // component unmounts, so it isn't leaked for the life of the page. Each
+    // handleBgFile call already revoke the previous one on replacement, this
+    // only covers the final one still outstanding on unmount.
+    useEffect(() => {
+        return () => { if (bgObjectUrlRef.current) URL.revokeObjectURL(bgObjectUrlRef.current); };
     }, []);
 
     function updateSeverity(ruleId, config) {
@@ -1686,18 +1814,27 @@ export default function App() {
                             <input type="number" step={Math.max(0.01, boundsH / 500)} value={bgImage.offsetY} onChange={e => { const v = parseFloat(e.target.value); if (!Number.isNaN(v)) setBgImage(b => ({ ...b, offsetY: v })); }} style={S.numBoxWide} title="Y offset, in drawing units, from the auto-fit position" />
                         </label>
                         <button style={S.btnSmall} onClick={() => setBgImage(b => ({ ...b, scale: 1, offsetX: 0, offsetY: 0 }))} title="Reset to the auto-fit (centered, aspect-correct) placement">Reset fit</button>
+                        {/* Embed this PNG's current placement into a downloaded copy so a
+                            future load of it starts pre-aligned - see
+                            downloadBgPlacementPng()/clearBgDefault() above. Only PNG files
+                            support an embedded default (the chunk format is PNG-specific);
+                            other image types leave this disabled. */}
                         <button
-                            style={{ ...S.btnSmall, background: "#eaf2ff", borderColor: "#0969da", color: "#0969da" }}
-                            onClick={saveCurrentBgAsDefault}
-                            disabled={!currentBgFileKey()}
-                            title="Remember the current Scale / X / Y for this drawing, so the next BG image loaded for it starts at this placement instead of the auto-fit"
+                            style={{ ...S.btnSmall, borderColor: "#0969da", color: "#0969da" }}
+                            disabled={!bgImage.isPng}
+                            onClick={downloadBgPlacementPng}
+                            title={bgImage.isPng
+                                ? "Embed the current Scale / X / Y into a copy of this PNG and download it, so the next time this image is loaded it starts at this placement instead of the auto-fit - the original file you selected is left untouched"
+                                : "Only PNG images support an embedded placement default - this file isn't a PNG"}
                         >
-                            {hasBgDefaultForCurrentFile ? "★ Update Default" : "☆ Save as Default"}
+                            ⬇ Download PNG with placement
                         </button>
-                        {hasBgDefaultForCurrentFile && (
-                            <button style={S.btnSmall} onClick={clearCurrentBgDefault} title="Forget the saved placement default for this drawing">Clear Default</button>
+                        {bgImage.isPng && bgImage.embeddedPlacement && (
+                            <button style={S.btnSmall} onClick={clearBgDefault} title="Download a copy of this PNG with the saved placement default removed">
+                                Clear Default
+                            </button>
                         )}
-                        <button style={{ ...S.btnSmall, color: "#cf222e" }} onClick={() => { setBgImage(null); setShowBgControls(false); }}>Remove</button>
+                        <button style={{ ...S.btnSmall, color: "#cf222e" }} onClick={() => { if (bgObjectUrlRef.current) { URL.revokeObjectURL(bgObjectUrlRef.current); bgObjectUrlRef.current = null; } setBgImage(null); setShowBgControls(false); }}>Remove</button>
                     </div>
                 )}
 

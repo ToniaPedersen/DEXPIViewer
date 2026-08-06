@@ -197,9 +197,19 @@ Click **BG Image** to overlay a reference image behind the P&ID drawing. Once on
 | Scale | Uniform scale factor applied to the auto-fit size (native aspect ratio is always preserved) |
 | X / Y | Offset, in drawing units, from the auto-fit (centered) position — not screen pixels, so the range scales with the drawing's own size |
 | Reset fit | Sets scale back to 1 and X/Y back to 0, returning to the auto-fit (centered, aspect-correct) placement |
+| ⬇ Download PNG with placement | PNG only. Embeds the current Scale / X / Y directly into a copy of the loaded PNG's own file metadata and downloads it. The original file you selected is left untouched — this always hands you a new file. |
+| Clear Default | Shown only once the loaded PNG carries an embedded placement. Downloads a copy of the PNG with that embedded placement removed. |
 | Remove | Clear the background image |
 
 The image is placed inside the same coordinate space as the drawing, so it pans and zooms in lockstep with it — it stays aligned at any zoom level, not just the level it was set up at.
+
+#### Saving and reloading a placement
+
+Unlike the other BG Controls, the placement isn't kept in the browser — it travels with the image file itself. Once you've dialed in the Scale/X/Y for a PNG, click **⬇ Download PNG with placement** to save it: the values are written into a small text chunk embedded in the PNG's own bytes, alongside the pixel data.
+
+The next time that downloaded PNG is loaded as a BG image — in this app, on another machine, or in a different browser — the embedded Scale/X/Y is read automatically and applied immediately, instead of falling back to the auto-fit placement. No extra step is needed; it just works the way opening any other file with saved settings would.
+
+Only PNG files support an embedded placement (the file format used for the underlying metadata chunk is PNG-specific). Other image types can still be used as a BG image, but their placement resets to auto-fit each time they're reloaded and the download/clear-default buttons stay disabled for them.
 
 ### 5.8 Exporting the Drawing
 
@@ -508,4 +518,7 @@ Use **Data → From Text/CSV** in Excel and select UTF-8 encoding.
 The file may reference profile symbols that are not loaded. Load the appropriate `DiscProfile.xml` (and FL0 profile if needed) — the parser re-runs automatically when a new profile is added.
 
 **Background image does not align with the drawing**
-The image is auto-fit (centered, aspect-correct) into the drawing extents on load and rendered inside the same coordinate space as the drawing, so it stays aligned at any pan/zoom level. Use the Scale and X/Y controls in BG Controls, or click **Reset fit** to snap back to the auto-fit placement — offsets are in drawing units, not screen pixels.
+The image is auto-fit (centered, aspect-correct) into the drawing extents on load and rendered inside the same coordinate space as the drawing, so it stays aligned at any pan/zoom level. Use the Scale and X/Y controls in BG Controls, or click **Reset fit** to snap back to the auto-fit placement — offsets are in drawing units, not screen pixels. If you're reloading a PNG you've previously aligned, make sure you're loading the copy downloaded via **⬇ Download PNG with placement** (see 5.7) — the original file you first selected was never modified and has no embedded placement.
+
+**Background image placement resets every time I reopen the file**
+Only PNG images can carry a saved placement, and only once you've explicitly downloaded a copy with it embedded (5.7). Reopening the original, unmodified file — or a non-PNG image — always starts at the auto-fit placement, by design.
