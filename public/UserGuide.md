@@ -241,6 +241,20 @@ Once a DiscProfile.xml is loaded, a **Profile labels** checkbox appears in the c
 
 Text driven by a `TextTemplate`/`LabelTemplate` always renders at its true absolute size regardless of the symbol's own placement scale, and reads left-to-right or bottom-to-top rather than upside-down or right-to-left.
 
+### 5.11 Draw Order — Send to Back
+
+Symbols and lines are drawn in the order they appear in the file, and whichever one paints last sits on top — both visually and for click handling. When two objects overlap (for example a large composite symbol drawn over smaller items nested or positioned underneath it), the top one intercepts every click, making the item(s) beneath it impossible to select directly in the drawing.
+
+To work around this:
+
+1. Select the covering object (in the drawing or the topology tree).
+2. In the right panel's **Object** tab, click **⇩ Send to Back** next to the object ID (only shown when the selection has a graphical Symbol Usage). This moves every graphic belonging to that object behind everything else in the drawing.
+3. The item(s) that were hidden underneath are now on top and can be clicked normally.
+
+The button toggles to **↺ Restore order** for any object currently sent to back, so you can undo it individually. A **Reset Z-Order (n)** button also appears in the centre toolbar whenever one or more objects have been sent to back, letting you restore the original draw order for all of them at once.
+
+> **Note:** This only changes the on-screen draw/click order for the current session — it is not written back to the DEXPI XML file, and resets automatically whenever a new file is loaded.
+
 ---
 
 ## 6. Right Panel — Object Details
@@ -259,6 +273,8 @@ Text driven by a `TextTemplate`/`LabelTemplate` always renders at its true absol
 | Sub-Components | Children of this object — click any to navigate to it |
 | Symbol Usage | For each graphical symbol placement representing this object: its Symbol reference (e.g. `ND0006`), Scale X, Scale Y, Is Mirrored, and Rotation |
 | Label SymbolUsage | Same fields as Symbol Usage, shown separately for any symbol placement that sits inside a `Core/Diagram.Label` group (e.g. a special-item-number balloon) rather than the object's own body |
+
+Whenever the selection has a Symbol Usage or Label SymbolUsage, a **Send to Back** button appears next to the Object ID — see section 5.11, "Draw Order — Send to Back," in the [Centre Panel](#5-centre-panel-p-id-drawing) chapter for details on using it to select items hidden behind an overlapping symbol.
 
 ### 6.2 Connections Tab
 

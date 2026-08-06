@@ -886,6 +886,20 @@ export default function App() {
     const [showProfileLabels, setShowProfileLabels] = useState(false);
     const [spaceDown, setSpaceDown] = useState(false);
     const [exporting, setExporting] = useState(false);
+    // Draw-order overrides: representedIds whose graphic(s) the user has sent
+    // to the back of the paint order. Elements paint in array order (later =
+    // on top), so a symbol that visually/interactively covers overlapping or
+    // nested items - blocking clicks on whatever is underneath - can be
+    // pushed behind everything else via "Send to Back" in the Object panel.
+    const [sentToBackIds, setSentToBackIds] = useState(new Set());
+    const toggleSendToBack = (id) => {
+        if (!id) return;
+        setSentToBackIds(prev => {
+            const next = new Set(prev);
+            next.has(id) ? next.delete(id) : next.add(id);
+            return next;
+        });
+    };
 
     const mainInputRef = useRef(null);
     const discInputRef = useRef(null);
@@ -929,6 +943,23 @@ export default function App() {
         return parsed.connectivityMap.get(selectedId) || { upstream: new Set(), downstream: new Set(), group: new Set() };
     }, [showConnectivity, selectedId, parsed]);
 
+    // Drawing paint order, adjusted for any "Send to Back" overrides: every
+    // graphic element whose representedId is in sentToBackIds is moved ahead
+    // of everything else (stable within each group), so it paints first and
+    // therefore sits visually and interactively *behind* the rest of the
+    // drawing - exposing whatever it was overlapping for clicking/selection.
+    const orderedGraphicsElements = useMemo(() => {
+        const elements = parsed?.graphics?.elements;
+        if (!elements) return [];
+        if (sentToBackIds.size === 0) return elements;
+        const back = [];
+        const rest = [];
+        for (const el of elements) {
+            (el.representedId && sentToBackIds.has(el.representedId) ? back : rest).push(el);
+        }
+        return back.concat(rest);
+    }, [parsed, sentToBackIds]);
+
     // Whether a DiscProfile.xml is loaded decides the parsing behavior -
     // there's no separate mode to pick: no profile loaded means "internal",
     // a profile loaded means "with profile", full stop.
@@ -944,6 +975,7 @@ export default function App() {
             setViewBox({ x: b.minX, y: b.minY, w: Math.max(100, b.maxX - b.minX), h: Math.max(100, b.maxY - b.minY) });
             setParseError("");
             setValidationIssues([]); setValidationDone(false);
+            setSentToBackIds(new Set());
         } catch (e) { setParseError(e.message || String(e)); }
     }
 
@@ -1504,6 +1536,11 @@ export default function App() {
                     </div>
                     <div style={{ display: "flex", gap: 5, flexWrap: "wrap", alignItems: "center" }}>
                         <button style={S.btn} onClick={() => { if (!parsed) return; const b = boundsFromElements(parsed.graphics); setFullBounds(b); setViewBox({ x: b.minX, y: b.minY, w: b.maxX - b.minX, h: b.maxY - b.minY }); }} title="Fit drawing to window">Fit</button>
+                        {sentToBackIds.size > 0 && (
+                            <button style={{ ...S.btn, background: "#eaf2ff", borderColor: "#0969da", color: "#0969da" }} onClick={() => setSentToBackIds(new Set())} title={`Restore normal draw order for ${sentToBackIds.size} object(s) sent to back`}>
+                                Reset Z-Order ({sentToBackIds.size})
+                            </button>
+                        )}
                         <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "#57606a" }} title="Connector/centerline stroke width as a percentage of its original width. 100% = unchanged; raise it to bulk up thin lines to match a BG reference image's line weight.">
                             Line Boost
                             <input type="number" min={1} step={1} value={lineBoostPct} onChange={e => { const v = parseFloat(e.target.value); if (!Number.isNaN(v) && v > 0) setLineBoostPct(v); }} style={S.numBox} title="Line width, as a percentage of its original width" />
@@ -1587,7 +1624,7 @@ export default function App() {
                                 <rect x={bgPlacement.x} y={bgPlacement.y} width={bgPlacement.width} height={bgPlacement.height} fill={BG_TINT_COLOR} style={{ mixBlendMode: "color" }} />
                             </g>
                         )}
-                        {parsed?.graphics.elements.map(el => {
+                        {orderedGraphicsElements.map(el => {
                             const isSelected = !!el.representedId && selectedRepresentedIds.has(el.representedId);
                             const ch = connectivityHighlight;
                             const connColor = el.representedId ? (ch.upstream.has(el.representedId) ? "#0969da" : ch.downstream.has(el.representedId) ? "#1a7f37" : ch.group.has(el.representedId) ? "#8250df" : null) : null;
@@ -1643,6 +1680,18 @@ export default function App() {
                                     <div style={{ fontWeight: 600, marginBottom: 4 }}>{selectedNode?.label || "No selection"}</div>
                                     <div style={{ fontSize: 12, color: "#57606a" }}>{selectedNode?.type || ""}</div>
                                     {selectedNode?.objectId && <div style={{ marginTop: 6, fontSize: 12, fontFamily: "monospace", wordBreak: "break-all" }}>{selectedNode.objectId}</div>}
+                                    {(selectedSymbolUsages.length > 0 || selectedLabelSymbolUsages.length > 0) && (
+                                        <div style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 6 }}>
+                                            <button
+                                                style={{ ...S.btnSmall, background: sentToBackIds.has(selectedId) ? "#eaf2ff" : "white", borderColor: sentToBackIds.has(selectedId) ? "#0969da" : "#c7ced6", color: sentToBackIds.has(selectedId) ? "#0969da" : "#111" }}
+                                                title="Move this object's symbol behind everything else in the drawing, so overlapping or nested items underneath it become clickable/selectable"
+                                                onClick={() => toggleSendToBack(selectedId)}
+                                            >
+                                                {sentToBackIds.has(selectedId) ? "↺ Restore order" : "⇩ Send to Back"}
+                                            </button>
+                                            {sentToBackIds.has(selectedId) && <span style={{ fontSize: 11, color: "#0969da" }}>Sent to back</span>}
+                                        </div>
+                                    )}
                                     {selectedNode?.persistentIdentifiers?.length > 0 && (
                                         <div style={{ marginTop: 10 }}>
                                             <div style={{ fontWeight: 600, fontSize: 12, marginBottom: 4 }}>Persistent Identifiers</div>
