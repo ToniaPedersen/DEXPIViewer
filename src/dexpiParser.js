@@ -233,13 +233,29 @@ export function referenceTargets(node, property = null) {
         .flatMap(r => (r.getAttribute("objects") || "").split(/\s+/).filter(Boolean).map(v => v.startsWith("#") ? v.slice(1) : v));
 }
 
-// Parse a SymbolVariant Condition string like "ValvePosition = 'NC'" or "PlugState='Open'"
-// Returns { attributeName, value } or null for unconditional (default) variants.
-function parseVariantCondition(condStr) {
-    if (!condStr || typeof condStr !== "string") return null;
-    const m = condStr.trim().match(/^([A-Za-z][A-Za-z0-9_/]*)[\s]*=[\s]*'([^']*)'$/);
-    if (!m) return null;
-    return { attributeName: m[1], value: m[2] };
+// Parse a SymbolVariant's Condition, e.g. (real DiscProfile.xml structure):
+//   <Components property="Condition">
+//     <Object type="Profile/PropertyValueCondition">
+//       <Data property="Property"><String>DiscProfile.InformationModel.OperatedValveExtension.ValvePosition</String></Data>
+//       <Data property="Value"><String>DiscProfile.InformationModel.ValvePosition.NormallyClose</String></Data>
+//     </Object>
+//   </Components>
+// Returns { attributeName, literalValue } (bare local names, e.g.
+// "ValvePosition" / "NormallyClose") or null for unconditional (default)
+// variants, or if the condition object is malformed. `Value` is normally a
+// plain dotted String naming the enumeration literal, but a DataReference is
+// tolerated too in case a profile encodes it that way instead.
+function parsePropertyValueCondition(conditionObj) {
+    if (!conditionObj) return null;
+    const propRaw = valueFromData(conditionObj, "Property");
+    const valRaw  = valueFromData(conditionObj, "Value");
+    if (typeof propRaw !== "string" || !propRaw.trim()) return null;
+    const attributeName = propRaw.split(/[./]/).pop();
+    let literalValue = null;
+    if (typeof valRaw === "string" && valRaw.trim()) literalValue = valRaw.split(/[./]/).pop();
+    else if (valRaw?.kind === "DataReference") literalValue = valRaw.value.split(/[./]/).pop();
+    if (!attributeName || !literalValue) return null;
+    return { attributeName, literalValue };
 }
 
 export function parseSymbolCatalogue(discDoc) {
@@ -249,14 +265,17 @@ export function parseSymbolCatalogue(discDoc) {
         const name = obj.getAttribute("name") || obj.getAttribute("id") || "";
         const symbolKey = `DiscProfile/${name}`;
         const variants = directComponentsObjects(obj, "Variants").map((variant, i) => {
-            const condRaw = valueFromData(variant, "Condition");
+            // Condition (if any) lives under Components[property="Condition"] as a
+            // single Profile/PropertyValueCondition Object — see
+            // parsePropertyValueCondition() above.
+            const conditionObj = directComponentsObjects(variant, "Condition")[0] || null;
             return {
                 key: `${symbolKey}_${i}`, name: variant.getAttribute("name") || `${name}_${i}`,
                 minX: numberFromData(variant, "MinX", 0), minY: numberFromData(variant, "MinY", 0),
                 maxX: numberFromData(variant, "MaxX", 0), maxY: numberFromData(variant, "MaxY", 0),
                 primitives: directComponentsObjects(variant, "Primitives").map(parsePrimitive).filter(Boolean),
                 variantNumber: intFromData(variant, "VariantNumber", i),
-                condition: typeof condRaw === "string" ? parseVariantCondition(condRaw) : null,
+                condition: parsePropertyValueCondition(conditionObj),
                 // Profile/LabelTemplate entries (Data property="Text", e.g.
                 // "<ObjectDisplayName>" or "<SpecialItemNumber>") defined for
                 // this symbol variant in the DiscProfile — used as a
@@ -287,22 +306,6 @@ export function parseSymbolCatalogue(discDoc) {
             };
         });
         map.set(symbolKey, { key: symbolKey, name, variants });
-    });
-    return map;
-}
-
-// Build a map from EnumerationLiteral name → MetaData/symbol short-code.
-// Used when evaluating SymbolVariant conditions against DataReference property values.
-// e.g. "NormallyClose" → "NC", "NormallyOpen" → "NO", "Open" → "Open"
-export function parseEnumLiteralSymbols(discDoc) {
-    const map = new Map();
-    if (!discDoc) return map;
-    qsa(discDoc, "EnumerationLiteral").forEach(el => {
-        const name = el.getAttribute("name");
-        if (!name) return;
-        const sym = valueFromData(el, "MetaData/symbol");
-        if (typeof sym === "string" && sym) map.set(name, sym);
-        else map.set(name, name); // fall back to literal name itself
     });
     return map;
 }
@@ -435,10 +438,6 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
     const nodePosMap = parseNodePositionsById(mainDoc);
     const drawn = [];
 
-    // Build enum literal → short-symbol map for condition evaluation
-    // e.g. "NormallyClose" → "NC"
-    const enumLiteralSymbols = parseEnumLiteralSymbols(discDoc);
-
     // Build objectId → Map<propertyName, rawDataValue> for condition evaluation,
     // and objectId → type (used by signalConveyingTypeFor() below to restrict
     // the decoration to exactly SignalConveyingFunction, excluding its
@@ -495,8 +494,8 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
     // Resolve a raw Data value (plain string, or a DataReference to an
     // enumeration literal) down to its bare name - used for the signal-
     // conveying lookup below, which needs the full representation name
-    // (e.g. "ElectricalSignalConveying"), unlike conditionValue()'s
-    // abbreviated-symbol lookup used for SymbolVariant conditions.
+    // (e.g. "ElectricalSignalConveying"), unlike instanceLiteralValue()'s
+    // bare-literal-name resolution used for SymbolVariant conditions.
     function rawStringValue(raw) {
         if (raw === null || raw === undefined) return null;
         if (typeof raw === "string") return raw;
@@ -783,22 +782,27 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         return rawStringValue(raw);
     }
 
-    // Resolve a raw property value (string or DataReference) to the short symbol code
-    // used in variant Condition strings.
-    function conditionValue(rawVal) {
+    // Resolve a raw instance property value (plain String, or a DataReference
+    // to an enumeration literal) down to its bare literal name, e.g. a
+    // DataReference data="DiscProfile/InformationModel.ValvePosition.NormallyClose"
+    // → "NormallyClose" — the same bare form parsePropertyValueCondition()
+    // extracts from the profile's own Condition.Value string, so the two can
+    // be compared directly without any abbreviation/short-code layer.
+    function instanceLiteralValue(rawVal) {
         if (rawVal === null || rawVal === undefined) return null;
-        if (typeof rawVal === "string") return rawVal;
-        if (rawVal?.kind === "DataReference") {
-            // Extract the last segment: "DiscProfile/InformationModel.ValvePosition.NormallyClose"
-            // → literalName "NormallyClose" → symbol "NC"
-            const literalName = rawVal.value.split(".").pop().split("/").pop();
-            return enumLiteralSymbols.get(literalName) ?? literalName;
-        }
+        if (typeof rawVal === "string") return rawVal.split(/[./]/).pop();
+        if (rawVal?.kind === "DataReference") return rawVal.value.split(/[./]/).pop();
         return String(rawVal);
     }
 
     // Select the best matching SymbolVariant for the given conceptual object.
-    // Evaluates each conditional variant's condition against the object's properties.
+    // Evaluates each conditional variant's Profile/PropertyValueCondition
+    // (attributeName/literalValue, from parsePropertyValueCondition() in
+    // parseSymbolCatalogue() above) against the object's own properties -
+    // e.g. a WedgeGateValve instance whose ValvePosition attribute resolves
+    // to the literal "NormallyClose" picks the variant whose Condition names
+    // Property "...OperatedValveExtension.ValvePosition" and Value
+    // "...ValvePosition.NormallyClose" (DiscProfile.xml's ND0012 Variant 1).
     // Falls back to the unconditional variant (variantNumber 0 / no condition) if none match.
     function pickVariant(symbol, representedId) {
         if (!symbol?.variants?.length) return null;
@@ -809,14 +813,15 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         // Try conditional variants first (those with a parsed condition)
         for (const variant of symbol.variants) {
             if (!variant.condition) continue;
-            const { attributeName, value: expectedValue } = variant.condition;
+            const { attributeName, literalValue: expectedValue } = variant.condition;
             // Try common property-name prefixes: DiscProfile/, bare name, or plant-prefixed
             const rawVal = props.get(`DiscProfile/${attributeName}`)
                 ?? props.get(attributeName)
                 ?? props.get(`Plant/Piping.${attributeName}`)
+                ?? props.get(`Plant/Instrumentation.${attributeName}`)
                 ?? null;
             if (rawVal === null) continue;
-            if (conditionValue(rawVal) === expectedValue) return variant;
+            if (instanceLiteralValue(rawVal) === expectedValue) return variant;
         }
 
         // No condition matched — return the default (unconditional) variant, or first as fallback

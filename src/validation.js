@@ -1896,12 +1896,76 @@ function parseProfileSymbols(profileXml) {
  *             instrument) does not align with any profile-defined connection
  *             point of the placed symbol, within CONNECTION_MARGIN_X/Y_PCT.
  */
-// Return the "category" prefix of a normalised DEXPI type, e.g.
-//   "Plant.ProcessEquipment.CentrifugalPump" → "Plant.ProcessEquipment"
-//   "DiscProfile.InformationModel.Foo"       → "DiscProfile.InformationModel"
-function typeCategory(normType) {
-    const parts = normType.split(".");
-    return parts.length >= 2 ? parts.slice(0, 2).join(".") : normType;
+// ─── Profile Class Hierarchy (for PRF-E04 Sub-rule B) ────────────────────────
+//
+// Extracts classSuffix → superSuffix pairs from a profile's own ConcreteClass /
+// AbstractClass declarations (their `superTypes` attribute), e.g. the DISC
+// profile's "ShellAndFixedTubeHeatExchanger" ConcreteClass declares
+// superTypes="Plant/ProcessEquipment.HeatExchanger", yielding the pair
+// ["ShellAndFixedTubeHeatExchanger", "HeatExchanger"]. Cached per profile XML
+// string since validateSymbolRules() may be invoked once per loaded profile.
+const _profileClassPairsCache = new Map();
+function extractProfileClassPairs(profileXml) {
+    if (_profileClassPairsCache.has(profileXml)) return _profileClassPairsCache.get(profileXml);
+    const pairs = [];
+    if (profileXml) {
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(profileXml, "application/xml");
+        if (!doc.querySelector("parsererror")) {
+            ["ConcreteClass", "AbstractClass"].forEach(tag => {
+                doc.querySelectorAll(tag).forEach(cls => {
+                    const rawName = cls.getAttribute("name") || "";
+                    if (!rawName) return;
+                    const suffix = rawName.split(/[.\/]/).pop();
+                    const supers = (cls.getAttribute("superTypes") || "").trim();
+                    if (!supers) return;
+                    supers.split(/\s+/).forEach(s => {
+                        const ss = s.split(/[.\/]/).pop();
+                        if (ss) pairs.push([suffix, ss]);
+                    });
+                });
+            });
+        }
+    }
+    _profileClassPairsCache.set(profileXml, pairs);
+    return pairs;
+}
+
+// Combines the base Plant/Process meta-model hierarchy with every loaded
+// profile's own class hierarchy (profile-redeclared/extended subclasses such
+// as DiscProfile's "ShellAndFixedTubeHeatExchanger" or "ProcessSafetyFunction")
+// into a single classSuffix → Set<superSuffix> map.
+function buildProfileClassHierarchy(profileXmlList, baseHierarchyPairs) {
+    const hierarchy = new Map();
+    for (const [cls, sup] of baseHierarchyPairs) {
+        if (!hierarchy.has(cls)) hierarchy.set(cls, new Set());
+        hierarchy.get(cls).add(sup);
+    }
+    for (const profileXml of profileXmlList) {
+        for (const [cls, sup] of extractProfileClassPairs(profileXml)) {
+            if (!hierarchy.has(cls)) hierarchy.set(cls, new Set());
+            hierarchy.get(cls).add(sup);
+        }
+    }
+    return hierarchy;
+}
+
+// BFS up the class hierarchy: is `childSuffix` the same as, or a (transitive)
+// subclass of, `ancestorSuffix`?
+function isDescendantOrSelf(hierarchy, childSuffix, ancestorSuffix) {
+    if (childSuffix === ancestorSuffix) return true;
+    const seen = new Set([childSuffix]);
+    const queue = [childSuffix];
+    while (queue.length) {
+        const cur = queue.shift();
+        const supers = hierarchy.get(cur);
+        if (!supers) continue;
+        for (const s of supers) {
+            if (s === ancestorSuffix) return true;
+            if (!seen.has(s)) { seen.add(s); queue.push(s); }
+        }
+    }
+    return false;
 }
 
 export function validateSymbolRules(mainXml, profileXml, profileName, severityConfig, allProfileXmlStrings = []) {
@@ -1923,6 +1987,16 @@ export function validateSymbolRules(mainXml, profileXml, profileName, severityCo
     const parser = new DOMParser();
     const doc = parser.parseFromString(mainXml, "application/xml");
     if (doc.querySelector("parsererror")) return issues;
+
+    // Combined class hierarchy (base Plant/Process meta-model + every loaded
+    // profile's own ConcreteClass/AbstractClass superTypes) — used by PRF-E04
+    // Sub-rule B below to check whether a placed symbol's declared usage
+    // type(s) and the represented object's actual type are related by true
+    // subclass/superclass inheritance, rather than a coarse "same top-level
+    // category" guess.
+    const modelName = detectMetaModel(doc);
+    const baseHierarchyPairs = modelName === "Process" ? PROCESS_HIERARCHY : PLANT_HIERARCHY;
+    const classHierarchy = buildProfileClassHierarchy([profileXml, ...allProfileXmlStrings], baseHierarchyPairs);
 
     // Build id → type map for all model objects
     const objectTypes = new Map();
@@ -2079,36 +2153,44 @@ export function validateSymbolRules(mainXml, profileXml, profileName, severityCo
             // Skip decorator / label symbols (usage entirely Core.Diagram.*).
             const isDecorator = dexpiUsages.length > 0 && dexpiUsages.every(at => at.startsWith("Core.Diagram."));
             if (!isDecorator && dexpiUsages.length > 0) {
-                const isAllowed = dexpiUsages.some(at => at === normModelType);
+                const modelSuffix = normModelType.split(".").pop();
+                // Allowed when: (a) an exact type-string match, or (b) the model
+                // type and one of the symbol's declared usage types are related
+                // by true class-hierarchy inheritance in either direction. This
+                // covers both directions of legitimate fallback — e.g. a generic
+                // Nozzle object using a symbol declared only for its AccessNozzle
+                // subtype, or a ProcessSafetyFunction object (which has no symbols
+                // of its own) using a symbol declared for its ProcessInstrumentationFunction
+                // supertype — while correctly REJECTING sibling-class swaps, such
+                // as a TubularHeatExchanger-typed object using a symbol whose
+                // profile usage is the unrelated sibling subclass
+                // ShellAndFixedTubeHeatExchanger (both are distinct subclasses of
+                // HeatExchanger, so neither is an ancestor of the other).
+                const isAllowed = dexpiUsages.some(at => {
+                    if (at === normModelType) return true;
+                    const atSuffix = at.split(".").pop();
+                    if (atSuffix === modelSuffix) return true;
+                    return isDescendantOrSelf(classHierarchy, modelSuffix, atSuffix) ||
+                           isDescendantOrSelf(classHierarchy, atSuffix, modelSuffix);
+                });
                 if (!isAllowed) {
-                    // Rule 1 – only flag when the profile defines at least one dedicated
-                    // symbol for this model type. If none exist, the object legitimately
-                    // inherits symbols from a parent/base type (e.g. ProcessSafetyFunction
-                    // has no own symbols and uses ProcessInstrumentationFunction symbols).
-                    const profileHasSymbolsForType = typeToSymbols.has(normModelType);
-
-                    // Rule 2 – within the same top-level category (e.g. Plant.ProcessEquipment)
-                    // subtype symbol usage is acceptable (e.g. Nozzle using an AccessNozzle symbol).
-                    const modelCat    = typeCategory(normModelType);
-                    const symCatMatch = dexpiUsages.some(at => typeCategory(at) === modelCat);
-
-                    if (profileHasSymbolsForType && !symCatMatch) {
-                        const sev = resolveSeverity("PRF-E04", severityConfig);
-                        const validSymbols = [...(typeToSymbols.get(normModelType) || [])].join(", ");
-                        issues.push({
-                            objectId:    representsId || "(unknown)",
-                            objectType:  modelType,
-                            ruleId:      "PRF-E04",
-                            severity:    sev.level,
-                            score:       sev.score,
-                            description: `Symbol '${symName}' (allowed for: ${dexpiUsages.join(", ")}) is used to represent ` +
-                                         `'${representsId}' of type '${modelType}'. ` +
-                                         `Symbols permitted for this type: ${validSymbols || "(none defined)"}.`,
-                            location:    representsId ? `//*[@id='${representsId}']` : "/",
-                            profileSource: profileName,
-                            suggestedCorrection: `Replace symbol '${symName}' with one of: ${validSymbols || "a symbol permitted for '" + normModelType + "'."}.`,
-                        });
-                    }
+                    const sev = resolveSeverity("PRF-E04", severityConfig);
+                    const validSymbols = [...(typeToSymbols.get(normModelType) || [])].join(", ");
+                    issues.push({
+                        objectId:    representsId || "(unknown)",
+                        objectType:  modelType,
+                        ruleId:      "PRF-E04",
+                        severity:    sev.level,
+                        score:       sev.score,
+                        description: `Symbol '${symName}' (allowed for: ${dexpiUsages.join(", ")}) is used to represent ` +
+                                     `'${representsId}' of type '${modelType}'. Neither an exact match nor a subclass/` +
+                                     `superclass relationship exists between '${modelSuffix}' and the symbol's permitted ` +
+                                     `type(s) per the profile's class model. ` +
+                                     `Symbols permitted for this type: ${validSymbols || "(none defined)"}.`,
+                        location:    representsId ? `//*[@id='${representsId}']` : "/",
+                        profileSource: profileName,
+                        suggestedCorrection: `Replace symbol '${symName}' with one of: ${validSymbols || "a symbol permitted for '" + normModelType + "'."}, or correct the object's class type to match the symbol used.`,
+                    });
                 }
             }
         }
