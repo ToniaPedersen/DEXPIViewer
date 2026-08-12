@@ -144,13 +144,15 @@ The `DEXPI Example Files/` folder contains the DISC DEXPI example files (bluepri
 
 The `ValidationErrTestFiles/` folder contains files that deliberately trigger specific validation rules, used for testing rule coverage.
 
+Equinor also freely provides DEXPI 2.0 files for both P&ID and SCD (System Control Diagrams) through the Databricks `equinor_asa_p_id_and_scd_of_huldra` volume — see [Data sharing - Equinor](https://www.equinor.com/energy/data-sharing).
+
 ---
 
 ## Contributing
 
 Contributions are welcome. Please open an issue before submitting a pull request for significant changes.
 
-By contributing you agree that your contributions are licensed under the same Apache 2.0 terms as the rest of the project.
+By contributing you agree that your contributions are licensed under the same MIT terms as the rest of the project.
 
 ---
 
