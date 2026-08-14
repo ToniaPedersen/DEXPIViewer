@@ -4,8 +4,9 @@ genMetaModel.py — Generate src/metaModel.js from the DEXPI 2.0 meta-model XML 
 
 Usage (from the project root):
     python3 scripts/genMetaModel.py > src/metaModel.js
+    python3 scripts/genMetaModel.py /path/to/DEXPI/xml > src/metaModel.js
 
-Input files (from the "DEXPI Standard and Profile" folder):
+Input files (from the project's DEXPI/xml folder by default):
     Core.xml    — shared base classes (Diagram, PhysicalQuantities, identifiers, etc.)
     Plant.xml   — P&ID-specific classes (equipment, piping, instruments, etc.)
     Process.xml — PFD/PBD-specific classes (process connections, activities, etc.)
@@ -17,18 +18,28 @@ Output:
         PROCESS_HIERARCHY — inheritance pairs for the Process model (Core + Process)
         PROCESS_PROPS     — property declarations for the Process model
 
-Property entry format: "name:L:U"
-    name = property name (unqualified local name)
-    L    = lower bound integer (0 = optional, 1+ = required, minimum count)
-    U    = upper bound string  ("1" = at most one allowed, "" = unbounded)
+Property entry format:
+    DataProperty:                        "name:L:U"
+    CompositionProperty / ReferenceProperty: "name:L:U:T"
+        name = property name (unqualified local name)
+        L    = lower bound integer (0 = optional, 1+ = required, minimum count)
+        U    = upper bound string  ("1" = at most one allowed, "" = unbounded)
+        T    = target class suffix — the class (or abstract class) suffix named by
+               the property's <ClassReference type="..."/> (possibly nested inside
+               a <BoundClass> wrapper for generic/parameterised properties). This is
+               the type (or supertype) that any object placed in this Components/
+               References slot must be an instance of, per the DEXPI meta model.
+               Empty string if no ClassReference could be found (should not occur
+               for well-formed CompositionProperty/ReferenceProperty declarations).
 
 Each class row is: [classSuffix, dataCsv, compositionCsv, referenceCsv]
-    where each csv is a pipe-separated list of "name:L:U" entries for that
-    property kind (DataProperty | CompositionProperty | ReferenceProperty).
+    where each csv is a pipe-separated list of entries for that property kind
+    (DataProperty | CompositionProperty | ReferenceProperty).
 
 Inheritance is NOT pre-computed here — only direct (declared) properties are
 emitted. The runtime buildMetaModelLookup() in validation.js performs a fixpoint
-propagation to fold inherited properties into each class's entry.
+propagation to fold inherited properties (including target types) into each
+class's entry.
 
 Why class suffixes?
     The meta-model XML uses fully qualified names like "Plant/ProcessEquipment.Pump"
@@ -39,13 +50,16 @@ Why class suffixes?
     This lets validation.js look up a class by the tail of its type string.
 """
 
-import xml.etree.ElementTree as ET, sys
-from collections import defaultdict
+import xml.etree.ElementTree as ET, sys, os
 
 # ── Path configuration ────────────────────────────────────────────────────────
-# Absolute path to the folder containing Core.xml, Plant.xml, Process.xml.
-# Adjust if you run this script from a different working directory or environment.
-MODELS = "/sessions/friendly-zen-heisenberg/mnt/DEXPIViewer/DEXPI Standard and Profile"
+# Folder containing Core.xml, Plant.xml, Process.xml. Defaults to the
+# DEXPI/xml folder shipped in this repo (relative to this script's location),
+# so the generator works out of the box on any checkout. Override with an
+# explicit path as the first CLI argument if needed.
+MODELS = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "DEXPI", "xml"
+)
 
 
 # ── Name helpers ──────────────────────────────────────────────────────────────
@@ -80,6 +94,23 @@ def resolve_supertypes(raw_supers_str):
         if s:
             result.append(suffix(s))
     return result
+
+
+def target_suffix(prop_el):
+    """Find the target class suffix for a CompositionProperty/ReferenceProperty.
+
+    The target is declared as a <ClassReference type="..."/> child. For simple
+    properties this is a direct child; for generic/parameterised properties
+    (e.g. Process.xml's QualifiedValue-bound properties) it is nested inside a
+    <BoundClass> wrapper. We search all descendants (not just direct children)
+    and take the first ClassReference found — every CompositionProperty and
+    ReferenceProperty in Core/Plant/Process.xml has exactly one.
+    """
+    for cr in prop_el.iter("ClassReference"):
+        t = cr.get("type", "")
+        if t:
+            return suffix(t)
+    return ""
 
 
 # ── XML parser ────────────────────────────────────────────────────────────────
@@ -143,13 +174,16 @@ def parse_xml(path):
             lo = int(child.get("lower", "0"))          # default: optional (0)
             up = "1" if child.get("upper") == "1" else ""  # "" = unbounded
 
-            # Compact encoding: "PropertyName:lowerBound:upperBound"
-            # Examples: "TagName:0:1", "Context:1:1", "Impellers:0:"
-            entry = f"{pname}:{lo}:{up}"
-
-            if child.tag == "DataProperty":          d_props.append(entry)
-            elif child.tag == "CompositionProperty": c_props.append(entry)
-            elif child.tag == "ReferenceProperty":   r_props.append(entry)
+            if child.tag == "DataProperty":
+                # Compact encoding: "PropertyName:lowerBound:upperBound"
+                # Examples: "TagName:0:1", "Context:1:1", "Impellers:0:"
+                d_props.append(f"{pname}:{lo}:{up}")
+            elif child.tag in ("CompositionProperty", "ReferenceProperty"):
+                # Compact encoding: "PropertyName:lowerBound:upperBound:targetSuffix"
+                # Example: "Items:0::PipingNetworkSegmentItem"
+                entry = f"{pname}:{lo}:{up}:{target_suffix(child)}"
+                if child.tag == "CompositionProperty": c_props.append(entry)
+                else:                                  r_props.append(entry)
             # Other child tags (Constraint, Documentation, etc.) are ignored.
 
         # Only record the class if it has at least one property — classes with
@@ -274,11 +308,12 @@ for cls, d, c, r in pl_rows:
         print(f"CHECK PersistentIdentifier: d={d}", file=sys.stderr)
 
 # ── Emit JavaScript ───────────────────────────────────────────────────────────
-js = f"""// Auto-generated from Core.xml + Plant.xml + Process.xml
+js = f"""// Auto-generated from Core.xml + Plant.xml + Process.xml (DEXPI/xml folder)
 // Regenerate: python3 scripts/genMetaModel.py > src/metaModel.js
 // Format: hierarchy = [[classSuffix, superSuffix], ...]
 //         props     = [[classSuffix, dataCsv, compCsv, refCsv], ...]
-// Property entry: "name:L:U"  L=lower (int), U="1" bounded or "" unbounded.
+// Data property entry:                  "name:L:U"    L=lower (int), U="1" bounded or "" unbounded.
+// Composition/Reference property entry: "name:L:U:T"  T=target class suffix (ClassReference type).
 // Direct declarations only; inheritance computed at runtime in validation.js.
 
 export const PLANT_HIERARCHY = {js_pairs(pl_pairs)};

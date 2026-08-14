@@ -8,7 +8,7 @@ A browser-based viewer and validation engine for [DEXPI 2.0](https://dexpi.org) 
 
 ## About
 
-This tool was developed by **[Tonia Pedersen](https://github.com/toniapedersen)** at **[Draga AS](https://draga.no)** and contributed freely to the DEXPI ecosystem as open source infrastructure for the industry.
+This tool was developed by **[Tonia Pedersen](https://github.com/toniapedersen)** at **[Draga AS](https://draga.sg)** and contributed freely to the DEXPI ecosystem as open source infrastructure for the industry.
 
 It is intended to serve as a reference implementation for DEXPI 2.0 file parsing, graphical rendering, and validation — providing the community with a working, well-documented baseline that any tool vendor, operator, or EPC can build on.
 
@@ -21,7 +21,7 @@ It is intended to serve as a reference implementation for DEXPI 2.0 file parsing
 - **Topology tree** — full structured view of the DEXPI object model with search, expand/collapse, and issue indicators
 - **Object details** — data properties, references, referenced-by, parent and sub-components for any selected object
 - **Connectivity map** — upstream/downstream/group tracing for piping and instrumentation networks
-- **Validation engine** — 35 named rules across six rule families (VAL, ERR, VAX, VAE, PRF-E, PRF) covering XML well-formedness, schema compliance, structural integrity, engineering semantics, and DISC profile conformance; additional dynamic per-property profile rules generated from loaded profiles
+- **Validation engine** — 34 named rules across six rule families (VAL, ERR, VAX, VAE, PRF-E, PRF) covering XML well-formedness, schema compliance, structural integrity, engineering semantics, and DISC profile conformance; additional dynamic per-property profile rules generated from loaded profiles
 - **Profile support** — load and validate against DISC profile files; stacked profiles with precedence rules; cross-profile symbol and attribute inheritance (attributes granted via `ClassExtension` or `DataProperty` inheritance in a base profile are honoured by all profiles that build on it)
 - **Severity configuration** — per-rule severity overrides; export/import as JSON
 - **CSV export** — full validation report as CSV for integration into QA workflows
@@ -49,23 +49,23 @@ It is intended to serve as a reference implementation for DEXPI 2.0 file parsing
 | ERR-E04  | Error           | Unknown attribute on an Object element |
 | ERR-E05  | Error           | Object missing mandatory `type` attribute |
 | ERR-E06  | Error           | Value in typed element (`Double`, `Integer`, `Boolean`, etc.) fails type check |
-| ERR-E07  | Error / Warning | Object type not in the DEXPI 2.0 Plant Meta Model registry |
-| ERR-E08  | Error           | Object placed under an incompatible `Components` property for its type |
+| ERR-E07  | Error           | Object type not in the DEXPI 2.0 Plant/Process Meta Model registry; or a Data/Components/References property name, required-property, or cardinality rule is violated per the meta model (including inherited properties) |
+| ERR-E08  | Error           | Object placed under a `Components` property whose declared target class (per the Plant/Process Meta Model's `CompositionProperty`/`ClassReference`, including profile-declared subclasses) does not match the object's type or a subtype of it |
 | ERR-E10  | Error           | Duplicate `id` attribute — two or more objects share the same ID |
 | ERR-E11  | Error           | Duplicate `PersistentIdentifier` value across objects |
 | ERR-E12  | Error           | `OperatedValveReference.Valve` references a non-valve type |
 | ERR-E15  | Error           | `PlantMetaData` element is absent from the file |
 | ERR-E16  | Error           | Graphical `Represents` reference points to a non-existent model object |
 | ERR-E17  | Error           | Important equipment/valve/connector has no `RepresentationGroup` (orphaned model object) |
-| ERR-E18  | Error           | Attribute used on an element whose class does not allow it per the loaded profile's `PropertyConstraint` definitions; cross-profile class-model inheritance (`ClassExtension`, `DataProperty`) is honoured before raising |
-| ERR-E19  | Error           | Attribute appears more times than the upper cardinality allows per the loaded profile |
+| ERR-E18  | Error           | Attribute used on an element whose class does not allow it per the loaded profile's `PropertyConstraint` definitions (or, absent a profile, per the base DEXPI 2.0 meta model); cross-profile class-model inheritance (`ClassExtension`, `DataProperty`) is honoured before raising |
+| ERR-E19  | Error           | Attribute appears more times than the upper cardinality allows per the loaded profile (or the base DEXPI 2.0 meta model) |
+| ERR-E20  | Error           | A `Core/Diagram.TextTemplate`'s `AttributeName` doesn't resolve to a value reachable from the owning object, per the DEXPI 2.0 meta model |
 
 ### VAX — Structural / Topology Validation (DEXPI XML)
 
 | Rule    | Default | Description |
 |---------|---------|-------------|
 | VAX-001 | Warning | `ActuatingSystem` contains no `ControlledActuator` |
-| VAX-002 | Warning | `OperatedValveReference` points to a non-valve type |
 | VAX-003 | Warning | `PipingNetworkSystem` contains no `PipingNetworkSegment`; or `InstrumentationLoopFunction` contains no `ProcessInstrumentationFunction` |
 | VAX-004 | Warning | `PipingNode` is not referenced by any connection (orphaned node) |
 | VAX-005 | Info    | `PipingNetworkSegment` has no connections defined |

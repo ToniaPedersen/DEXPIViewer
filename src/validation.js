@@ -1,5 +1,6 @@
 // DEXPI Verificator – Validation Engine
-// Implements: VAL-001..005, VAX-001..005, VAE-001..006, PRF-001..007, ERR-E01..E20, RPT-001..004
+// Implements: VAL-001..005, VAX-001, VAX-003..005, VAE-001..006, PRF-001..007, ERR-E01..E20, RPT-001..004
+// (VAX-002 removed: duplicated ERR-E12's OperatedValveReference.Valve target-type check.)
 
 import { DEXPI_ALL_TYPES, DEXPI_STD_PREFIXES as _DEXPI_STD_PREFIXES } from "./dexpiTypes.js";
 // Auto-generated meta-model data for Plant (P&ID) and Process (PFD/PBD).
@@ -21,7 +22,6 @@ export const DEFAULT_SEVERITIES = {
     "VAL-004": { level: "Info",    score: 1 },
     "VAL-005": { level: "Error",   score: 3 },
     "VAX-001": { level: "Warning", score: 2 },
-    "VAX-002": { level: "Warning", score: 2 },
     "VAX-003": { level: "Warning", score: 2 },
     "VAX-004": { level: "Warning", score: 2 },
     "VAX-005": { level: "Info",    score: 1 },
@@ -32,10 +32,28 @@ export const DEFAULT_SEVERITIES = {
     "VAE-005": { level: "Warning", score: 2 },
     "VAE-006": { level: "Warning", score: 2 },
     "PRF":     { level: "Warning", score: 2 },
+    // ERR-E** — DEXPI_XML_Schema.xsd / container-structure checks (E01-E06, E10,
+    // E11, E15-E17) and Plant/Process meta-model checks (E07, E08, E12, E18-E20)
+    // are all treated as hard errors: a file that violates the XML schema or the
+    // Plant/Process model is not a valid DEXPI 2.0 file, regardless of which of
+    // the two categories the specific rule falls into.
     "ERR-E01": { level: "Error",   score: 3 },
+    "ERR-E02": { level: "Error",   score: 3 },
+    "ERR-E03": { level: "Error",   score: 3 },
+    "ERR-E04": { level: "Error",   score: 3 },
+    "ERR-E05": { level: "Error",   score: 3 },
+    "ERR-E06": { level: "Error",   score: 3 },
+    "ERR-E07": { level: "Error",   score: 3 },
+    "ERR-E08": { level: "Error",   score: 3 },
+    "ERR-E10": { level: "Error",   score: 3 },
+    "ERR-E11": { level: "Error",   score: 3 },
+    "ERR-E12": { level: "Error",   score: 3 },
+    "ERR-E15": { level: "Error",   score: 3 },
+    "ERR-E16": { level: "Error",   score: 3 },
+    "ERR-E17": { level: "Error",   score: 3 },
     "ERR-E18": { level: "Error",   score: 3 },
     "ERR-E19": { level: "Error",   score: 3 },
-    "ERR-E20": { level: "Warning", score: 2 },
+    "ERR-E20": { level: "Error",   score: 3 },
     "ERR":     { level: "Error",   score: 3 },
     "PRF-E01": { level: "Error",   score: 3 },
     "PRF-E02": { level: "Error",   score: 3 },
@@ -80,17 +98,24 @@ function getDataText(obj, property) {
 //   dm: Map<propName,{lo,up}>,    // multiplicity for Data props
 //   cm: Map<propName,{lo,up}>,    // multiplicity for Components props
 //   rm: Map<propName,{lo,up}>,    // multiplicity for References props
+//   ct: Map<propName,targetSuffix>, // required child/target class for Components props
+//   rt: Map<propName,targetSuffix>, // required target class for References props
 // }
 // lo = lower bound (int), up = upper bound (int) or null (unbounded).
+// targetSuffix = the class (or abstract class) suffix an object placed in that
+// Components/References slot must be an instance-or-subtype of, per the
+// meta-model's <ClassReference type="..."/> declaration for that property.
 // Inheritance is computed once via fixpoint and cached.
 
 function buildMetaModelLookup(hierarchyPairs, propRows) {
-    // Parse "name:L:U" entries from a pipe-separated CSV string.
-    // Returns { set: Set<name>, mul: Map<name,{lo,up}> }
+    // Parse "name:L:U" (Data) or "name:L:U:T" (Components/References) entries
+    // from a pipe-separated CSV string.
+    // Returns { set: Set<name>, mul: Map<name,{lo,up}>, target: Map<name,targetSuffix> }
     function parsePropCsv(csv) {
         const set = new Set();
         const mul = new Map();
-        if (!csv) return { set, mul };
+        const target = new Map();
+        if (!csv) return { set, mul, target };
         for (const entry of csv.split("|")) {
             if (!entry) continue;
             const parts = entry.split(":");
@@ -98,10 +123,12 @@ function buildMetaModelLookup(hierarchyPairs, propRows) {
             if (!name) continue;
             const lo = parts.length > 1 && parts[1] !== "" ? parseInt(parts[1], 10) : 0;
             const up = parts.length > 2 ? (parts[2] === "" ? null : parseInt(parts[2], 10)) : null;
+            const t  = parts.length > 3 ? parts[3] : "";
             set.add(name);
             mul.set(name, { lo, up });
+            if (t) target.set(name, t);
         }
-        return { set, mul };
+        return { set, mul, target };
     }
 
     const hier = new Map();
@@ -117,13 +144,13 @@ function buildMetaModelLookup(hierarchyPairs, propRows) {
         const rp = parsePropCsv(rcsv);
         direct.set(cls, {
             d: dp.set, dm: dp.mul,
-            c: cp.set, cm: cp.mul,
-            r: rp.set, rm: rp.mul,
+            c: cp.set, cm: cp.mul, ct: cp.target,
+            r: rp.set, rm: rp.mul, rt: rp.target,
         });
     }
 
-    // Fixpoint: propagate parent props (names + multiplicity) to subclasses.
-    // Child's own declaration takes precedence over inherited one.
+    // Fixpoint: propagate parent props (names + multiplicity + target type) to
+    // subclasses. Child's own declaration takes precedence over inherited one.
     let changed = true;
     while (changed) {
         changed = false;
@@ -131,19 +158,20 @@ function buildMetaModelLookup(hierarchyPairs, propRows) {
             if (!direct.has(cls)) {
                 direct.set(cls, {
                     d: new Set(), dm: new Map(),
-                    c: new Set(), cm: new Map(),
-                    r: new Set(), rm: new Map(),
+                    c: new Set(), cm: new Map(), ct: new Map(),
+                    r: new Set(), rm: new Map(), rt: new Map(),
                 });
             }
             const entry = direct.get(cls);
             for (const sup of supers) {
                 const supEntry = direct.get(sup);
                 if (!supEntry) continue;
-                for (const [k, mk] of [["d","dm"], ["c","cm"], ["r","rm"]]) {
+                for (const [k, mk, tk] of [["d","dm",null], ["c","cm","ct"], ["r","rm","rt"]]) {
                     for (const [prop, mul] of supEntry[mk]) {
                         if (!entry[k].has(prop)) {
                             entry[k].add(prop);
                             entry[mk].set(prop, mul);
+                            if (tk && supEntry[tk].has(prop)) entry[tk].set(prop, supEntry[tk].get(prop));
                             changed = true;
                         }
                     }
@@ -287,16 +315,6 @@ function isKnownTypePrefix(t) {
     return t.startsWith("Core/") || t.startsWith("Plant/") || t.startsWith("Profile/");
 }
 
-const PARENT_PROP_RULES = {
-    "actuatingsystems":         ["ActuatingSystem"],
-    "pipingnetworksystems":     ["PipingNetworkSystem"],
-    "pipingnetworksegments":    ["PipingNetworkSegment"],
-    "processplants":            ["ProcessPlant"],
-    "plantsystems":             ["PlantSystem"],
-    "instrumentationfunctions": ["InstrumentationFunction","ProcessInstrumentationFunction","ProcessSafetyFunction"],
-    "controlledactuator":       ["ControlledActuator"],
-};
-
 const EQUIPMENT_TYPES_FOR_E17 = [
     "Pump","Compressor","HeatExchanger","Vessel","Tank","Heater","Cooler",
     "Filter","Separator","Column","Reactor","Turbine","Blower","Fan",
@@ -306,7 +324,7 @@ const EQUIPMENT_TYPES_FOR_E17 = [
     "FlowInSignalOffPageConnector","FlowOutSignalOffPageConnector","Note",
 ];
 
-export function runXmlSchemaValidation(mainXml, flatTree, severityConfig, externalValidIds = new Set(), profileTypes = new Set(), profileExtProps = new Set()) {
+export function runXmlSchemaValidation(mainXml, flatTree, severityConfig, externalValidIds = new Set(), profileTypes = new Set(), profileExtProps = new Set(), compositionMap = null) {
     const issues = [];
     const parser = new DOMParser();
     const doc = parser.parseFromString(mainXml, "application/xml");
@@ -330,9 +348,20 @@ export function runXmlSchemaValidation(mainXml, flatTree, severityConfig, extern
     const lineNumberMap = new Map();
     // Build referencedId → line-number map for objects="..." attributes (used by ERR-E12 etc.)
     const refLineMap = new Map();
+    // Build "objectId::tagName::propertyName" → line-number map, scoped to the
+    // specific Object each Data/Components/References element belongs to (via a
+    // simple <Object>/</Object> nesting stack). Used by ERR-E07 so a reported
+    // issue points at the actual offending property line (e.g. the line with
+    // <Components property="SignalConnectors">), not just the containing
+    // object's own opening-tag line.
+    const propertyLineMap = new Map();
     {
         const xmlLines = mainXml.split("\n");
         const refRe = /\bobjects=["']([^"']+)["']/g;
+        const objOpenRe = /<Object\b([^>]*?)(\/)?>/;
+        const idAttrRe = /\bid=["']([^"']+)["']/;
+        const propTagRe = /<(Components|Data|References)\b[^>]*\bproperty=["']([^"']+)["']/;
+        const objStack = []; // ids ("" = anonymous) of currently-open <Object> ancestors
         xmlLines.forEach((line, i) => {
             // Match id="..." or id='...' anywhere on the line
             const m = line.match(/\bid=["']([^"']+)["']/);
@@ -346,6 +375,31 @@ export function runXmlSchemaValidation(mainXml, flatTree, severityConfig, extern
                     if (id && !refLineMap.has(id)) refLineMap.set(id, i + 1);
                 });
             }
+
+            // Record this line against the innermost currently-open object, using
+            // the stack state as it stood BEFORE any Object open/close on this same
+            // line (a property tag never shares a line with an Object open/close
+            // in this XML format, but this ordering is defensive either way).
+            const propTag = line.match(propTagRe);
+            if (propTag) {
+                const ownerId = objStack.length ? objStack[objStack.length - 1] : "";
+                if (ownerId) {
+                    const key = `${ownerId}::${propTag[1]}::${propTag[2]}`;
+                    if (!propertyLineMap.has(key)) propertyLineMap.set(key, i + 1);
+                }
+            }
+
+            // Maintain the Object-nesting stack.
+            const objOpen = line.match(objOpenRe);
+            if (objOpen) {
+                const selfClosing = !!objOpen[2];
+                if (!selfClosing) {
+                    const idm = objOpen[1].match(idAttrRe);
+                    objStack.push(idm ? idm[1] : "");
+                }
+                // self-closing <Object .../> has no children — nothing to push
+            }
+            if (/<\/Object>/.test(line)) objStack.pop();
         });
     }
 
@@ -545,6 +599,10 @@ export function runXmlSchemaValidation(mainXml, flatTree, severityConfig, extern
                     if (!set || set.has(local)) continue;
 
                     const propSev = resolveSeverity("ERR-E07", severityConfig);
+                    // Point at the specific offending property line (e.g. the
+                    // <Components property="SignalConnectors"> line) rather than
+                    // just the containing object's own opening-tag line.
+                    const propLine = propertyLineMap.get(`${objId}::${child.tagName}::${local}`);
                     issues.push({
                         objectId: objId, objectType: t, ruleId: "ERR-E07",
                         severity: propSev.level, score: propSev.score,
@@ -552,7 +610,8 @@ export function runXmlSchemaValidation(mainXml, flatTree, severityConfig, extern
                                      `If this is a profile extension, use a namespaced form (e.g. 'DiscProfile/${prop}').`,
                         location: loc,
                         profileSource: "Base",
-                        suggestedCorrection: `Check the property name against the DEXPI 2.0 ${modelName} Meta Model, or prefix it with the profile namespace.`
+                        suggestedCorrection: `Check the property name against the DEXPI 2.0 ${modelName} Meta Model, or prefix it with the profile namespace.`,
+                        ...(propLine !== undefined ? { lineNumber: propLine } : {}),
                     });
                 }
             });
@@ -618,13 +677,15 @@ export function runXmlSchemaValidation(mainXml, flatTree, severityConfig, extern
 
                         // (b) Bounded but duplicated (up = 1, count > 1)
                         if (mul.up !== null && count > mul.up) {
+                            const propLine = propertyLineMap.get(`${objId}::${tagName}::${propName}`);
                             issues.push({
                                 objectId: objId, objectType: t, ruleId: "ERR-E07",
                                 severity: sev.level, score: sev.score,
                                 description: `${tagName} property '${propName}' on '${t}' appears ${count} time(s) ` +
                                     `but the DEXPI 2.0 ${modelName} Meta Model allows at most ${mul.up}.`,
                                 location: loc, profileSource: "Base",
-                                suggestedCorrection: `Remove the duplicate ${tagName} '${propName}' entry, keeping only one.`
+                                suggestedCorrection: `Remove the duplicate ${tagName} '${propName}' entry, keeping only one.`,
+                                ...(propLine !== undefined ? { lineNumber: propLine } : {}),
                             });
                         }
                     }
@@ -633,18 +694,41 @@ export function runXmlSchemaValidation(mainXml, flatTree, severityConfig, extern
         }
     }
 
-    // ERR-E08: Object placed under incompatible parent Components property
-    doc.querySelectorAll("Components").forEach(comp => {
-        const parentProp = (comp.getAttribute("property") || "").toLowerCase();
-        const rule = PARENT_PROP_RULES[parentProp];
-        if (!rule) return;
-        for (const child of comp.children) {
-            if (child.tagName !== "Object") continue;
-            const childType = child.getAttribute("type") || "";
-            if (!childType) continue;
-            const childSuffix = childType.split(".").pop();
-            const compatible = rule.some(r => childSuffix.includes(r) || childType.includes(r));
-            if (!compatible) {
+    // ERR-E08: Object placed under incompatible parent Components property.
+    // Schema-driven: for every Components[@property=P] under an Object of type T,
+    // resolve the required child/target class (ClassReference) that the DEXPI 2.0
+    // meta model (plus any loaded profile's own class model) declares for P on T
+    // - by direct declaration or inheritance - and flag any child Object whose own
+    // type is not that class or a (transitive) subtype of it. This generalises the
+    // old hardcoded, name-only PARENT_PROP_RULES table to the full Plant/Process
+    // meta model, and also catches composition properties whose target type is
+    // known but simply has never been hand-curated into a rule table.
+    if (compositionMap) {
+        const localPropName = p => (p || "").split(/[.\/]/).pop();
+        doc.querySelectorAll("Components").forEach(comp => {
+            const parentObj = comp.parentElement;
+            if (!parentObj || parentObj.tagName !== "Object") return;
+            const parentType = parentObj.getAttribute("type") || "";
+            if (!parentType) return;
+            const parentSuffix = parentType.split(/[.\/]/).pop();
+            const propLocal = localPropName(comp.getAttribute("property") || "");
+            if (!propLocal) return;
+
+            const clsEntry = compositionMap.classComposition.get(parentSuffix);
+            const propEntry = clsEntry ? clsEntry.get(propLocal) : null;
+            // No known declaration for this (class, property) combination — either
+            // it's genuinely invalid (already reported by ERR-E07's property-name
+            // check) or it's a profile extension property with no target on record.
+            // Nothing further to check here without a target type.
+            if (!propEntry || !propEntry.target) return;
+
+            for (const child of comp.children) {
+                if (child.tagName !== "Object") continue;
+                const childType = child.getAttribute("type") || "";
+                if (!childType) continue;
+                const childSuffix = childType.split(/[.\/]/).pop();
+                if (isSubtypeOrSelf(childSuffix, propEntry.target, compositionMap.closure)) continue;
+
                 const childId = child.getAttribute("id") || "(no id)";
                 const directRep = childId !== "(no id)" && representedIds.has(childId);
                 const visualContextId = directRep ? null : findNearestRepAncestor(child);
@@ -652,15 +736,15 @@ export function runXmlSchemaValidation(mainXml, flatTree, severityConfig, extern
                 issues.push({
                     objectId: childId, objectType: childType, ruleId: "ERR-E08",
                     severity: sev.level, score: sev.score,
-                    description: `Object of type '${childType}' is placed under Components[@property='${comp.getAttribute("property")}'], which does not permit this type per the Plant Meta Model.`,
+                    description: `Object of type '${childType}' is placed under Components[@property='${comp.getAttribute("property")}'] of '${parentType}', but the DEXPI 2.0 Plant Meta Model requires this property's items to be of type '${propEntry.target}' (or a subtype). '${childSuffix}' is not compatible.`,
                     location: childId !== "(no id)" ? `//*[@id='${childId}']` : `//Components[@property='${comp.getAttribute("property")}']`,
                     profileSource: "Base",
-                    suggestedCorrection: `Move this object to the correct parent property for type '${childType}'.`,
+                    suggestedCorrection: `Move this object to the correct parent property for type '${childType}', or verify '${childType}' is the intended class here.`,
                     ...(visualContextId ? { visualContextId } : {}),
                 });
             }
-        }
-    });
+        });
+    }
 
     // ERR-E10: Duplicate id attributes
     const idCounts = new Map();
@@ -894,7 +978,6 @@ export function runXmlSchemaValidation(mainXml, flatTree, severityConfig, extern
 
 export function runStructuralValidation(flatTree, severityConfig) {
     const issues = [];
-    const treeMap = new Map(flatTree.filter(n => n.objectId).map(n => [n.objectId, n]));
 
     // Build set of PipingNode IDs referenced by connections
     const connectedNodeIds = new Set();
@@ -967,25 +1050,9 @@ export function runStructuralValidation(flatTree, severityConfig) {
             }
         }
 
-        // VAX-002: OperatedValveReference target should be a valve type
-        if (node.edgeLabel && node.edgeLabel.toLowerCase().includes("operatedvalve")) {
-            node.refs.forEach(ref => {
-                ref.objects.forEach(targetId => {
-                    const target = treeMap.get(targetId);
-                    if (target && !target.type.toLowerCase().includes("valve")) {
-                        const sev = resolveSeverity("VAX-002", severityConfig);
-                        issues.push({
-                            objectId: node.objectId || "(no id)", objectType: node.type, ruleId: "VAX-002",
-                            severity: sev.level, score: sev.score,
-                            description: `OperatedValveReference points to '${targetId}' (type '${target.type}') which is not a valve type.`,
-                            location: `${loc}/References[@property='${ref.property}']`,
-                            profileSource: "Base",
-                            suggestedCorrection: "The reference should point to an OperatedValve or subtype."
-                        });
-                    }
-                });
-            });
-        }
+        // (VAX-002 removed — duplicated ERR-E12's OperatedValveReference.Valve
+        // target-type check, less precisely, since it inspected every reference
+        // on the node instead of just the "Valve" property. ERR-E12 covers this.)
 
         // VAX-004: PipingNode orphan check
         if (typeSuffix === "PipingNode" && node.objectId && !connectedNodeIds.has(node.objectId)) {
@@ -1200,132 +1267,19 @@ export function runEngineeringValidation(flatTree, severityConfig) {
     return issues;
 }
 
-// ─── Built-in DEXPI 2.0 Model Attribute Validation (ERR-E18, ERR-E19) ───────
-//
-// Validates attribute usage against the DEXPI 2.0 Plant/Core metamodel.
-// These rules come from the DEXPI model itself (Plant.xml / Core.xml), not from
-// loaded profile files. They cover cases where:
-//   ERR-E18 – an attribute is used on an element class that the DEXPI model
-//              does not associate with that attribute (wrong class).
-//   ERR-E19 – an attribute appears more times than the metamodel cardinality
-//              permits on a given element.
-//
-// Rules are keyed by the LOCAL property name (strip "DiscProfile/" etc. prefixes)
-// so they match regardless of how the namespace is encoded in the file.
-//
-// allowedPackages: the node type must start with one of these package prefixes
-//                  (e.g. "Plant/Piping" matches "Plant/Piping.PipingNetworkSegment").
-// allowedSuffixes: the node type's last segment must be one of these class names.
-// maxCount:        maximum occurrences on a single element (null = unlimited).
-
-const DEXPI_BUILT_IN_ATTRIBUTE_RULES = {
-    // HeatTracingType is a PipingNetworkSystem / PipingNetworkSegment extension.
-    // It is NOT defined for instrumentation types such as ProcessInstrumentationFunction.
-    "HeatTracingType": {
-        allowedPackages: ["Plant/Piping"],
-        maxCount: null,
-    },
-    // PlantMetaData attributes are [0..1] per the DEXPI 2.0 Diagram model.
-    "CreatorName": {
-        allowedSuffixes: ["PlantMetaData"],
-        maxCount: 1,
-    },
-    "DrawingName": {
-        allowedSuffixes: ["PlantMetaData"],
-        maxCount: 1,
-    },
-    "DrawingNumber": {
-        allowedSuffixes: ["PlantMetaData"],
-        maxCount: 1,
-    },
-};
-
-export function runBuiltInAttributeValidation(flatTree, severityConfig, profileAttrMap = new Map()) {
-    const issues = [];
-
-    // Does nodeType satisfy the rule's allowed-class constraint?
-    function typeAllowed(nodeType, rule) {
-        if (!nodeType) return false;
-        if (rule.allowedPackages) {
-            for (const pkg of rule.allowedPackages) {
-                if (nodeType.startsWith(pkg + ".") ||
-                    nodeType.startsWith(pkg + "/") ||
-                    nodeType === pkg) return true;
-            }
-        }
-        if (rule.allowedSuffixes) {
-            const suffix = nodeType.split(/[./]/).pop();
-            if (rule.allowedSuffixes.includes(suffix)) return true;
-        }
-        return false;
-    }
-
-    for (const node of flatTree) {
-        if (!node.type || !node.data || node.data.length === 0) continue;
-
-        // Count occurrences of each property on this node
-        const propCounts = new Map();
-        for (const d of node.data) {
-            const p = d.property;
-            if (p) propCounts.set(p, (propCounts.get(p) || 0) + 1);
-        }
-
-        for (const [prop, count] of propCounts) {
-            // Match by local name so "DiscProfile/HeatTracingType" and "HeatTracingType" both hit the same rule
-            const localProp = prop.split("/").pop().split(".").pop();
-            const rule = DEXPI_BUILT_IN_ATTRIBUTE_RULES[localProp] ?? DEXPI_BUILT_IN_ATTRIBUTE_RULES[prop];
-            if (!rule) continue;
-
-            const loc = node.objectId ? `//*[@id='${node.objectId}']` : `(type: ${node.type})`;
-
-            if (!typeAllowed(node.type, rule)) {
-                // A loaded profile's own class model (ClassExtension/ConcreteClass
-                // DataProperty declarations - see buildProfileAttributeMap() below)
-                // can legitimately extend a class with an attribute this hardcoded,
-                // profile-independent DEXPI 2.0 rule doesn't otherwise know about -
-                // e.g. a DiscProfile.xml NozzleExtension granting HeatTracingType to
-                // Nozzle, even though the base DEXPI 2.0 model only defines it for
-                // Plant/Piping.* types. Such a grant takes precedence over this
-                // built-in rule entirely for that class - no issue is raised.
-                const nodeSuffix = (node.type || "").split(/[.\/]/).pop();
-                if (profileAttrMap.has(localProp) && profileAttrMap.get(localProp).has(nodeSuffix)) continue;
-                // ERR-E18: attribute not allowed on this element class per DEXPI 2.0 model
-                const allowed = [
-                    ...(rule.allowedPackages || []).map(p => `${p}.*`),
-                    ...(rule.allowedSuffixes || []),
-                ].join(", ");
-                const sev = resolveSeverity("ERR-E18", severityConfig);
-                issues.push({
-                    objectId: node.objectId || "(no id)",
-                    objectType: node.type,
-                    ruleId: "ERR-E18",
-                    severity: sev.level, score: sev.score,
-                    description: `Attribute '${prop}' is not defined for class '${node.type}' in the DEXPI 2.0 model. ` +
-                                 `It is only allowed on: ${allowed}.`,
-                    location: loc,
-                    profileSource: "DEXPI 2.0",
-                    suggestedCorrection: `Remove attribute '${prop}' from this element, or verify the element class is correct.`,
-                });
-            } else if (rule.maxCount !== null && count > rule.maxCount) {
-                // ERR-E19: attribute count exceeds metamodel upper cardinality
-                const sev = resolveSeverity("ERR-E19", severityConfig);
-                issues.push({
-                    objectId: node.objectId || "(no id)",
-                    objectType: node.type,
-                    ruleId: "ERR-E19",
-                    severity: sev.level, score: sev.score,
-                    description: `Attribute '${prop}' appears ${count} time(s) on '${node.type}' ` +
-                                 `but the DEXPI 2.0 model allows at most ${rule.maxCount}.`,
-                    location: loc,
-                    profileSource: "DEXPI 2.0",
-                    suggestedCorrection: `Reduce '${prop}' occurrences to at most ${rule.maxCount} on this element.`,
-                });
-            }
-        }
-    }
-
-    return issues;
-}
+// (Built-in DEXPI 2.0 Model Attribute Validation, formerly here as
+// DEXPI_BUILT_IN_ATTRIBUTE_RULES / runBuiltInAttributeValidation, has been
+// removed. It hand-maintained a small hardcoded table of 4 properties
+// (HeatTracingType, CreatorName, DrawingName, DrawingNumber) duplicating what
+// ERR-E07 already derives generically from the auto-generated Plant/Process
+// meta-model (src/metaModel.js, from Core.xml/Plant.xml/Process.xml) — for
+// every Data property on every class, not just these 4 — including the same
+// "not defined for class" and cardinality checks. The hardcoded table was
+// also stale: it restricted HeatTracingType to "Plant/Piping.*", but the real
+// meta-model also grants it to Plant/Instrumentation.OfflineMeasuringElement,
+// so it would have flagged a legitimate use as an error. ERR-E07 alone (plus
+// any loaded profile's own PropertyConstraint-driven ERR-E18/E19 checks, see
+// runAttributeConstraintValidation below) now covers this ground correctly.)
 
 // ─── Profile Class-Model Attribute Map ───────────────────────────────────────
 //
@@ -1462,6 +1416,158 @@ function buildProfileAttributeMap(profileXmlList) {
     }
 
     return attrToTypes; // Map<attrLocal, Set<typeSuffix>>
+}
+
+// ─── Profile Class-Model Composition Map ─────────────────────────────────────
+//
+// Generalises ERR-E08 (parent/child containment) the same way buildProfileAttributeMap()
+// generalises ERR-E18 for attributes: builds, per document meta-model (Plant or
+// Process), a full class hierarchy (base meta-model + any profile-declared
+// ConcreteClass/AbstractClass/ClassExtension superTypes) together with a map of
+// which CompositionProperty names each class allows and what target class
+// (ClassReference type) each one requires - including inherited declarations
+// and declarations added purely by a loaded profile (e.g. a DiscProfile
+// ClassExtension that legitimately adds a new Components slot to a base class).
+//
+// Returns:
+//   { hierarchy, closure, classComposition }
+//     hierarchy        — Map<classSuffix, Set<directSuperSuffix>>
+//     closure           — Map<classSuffix, Set<selfAndAllAncestorSuffixes>>
+//     classComposition — Map<classSuffix, Map<propName, {target, lo, up}>>
+//
+function buildProfileCompositionMap(hierarchyPairs, propRows, profileXmlList) {
+    const hierarchy = new Map();
+    for (const [cls, sup] of hierarchyPairs) {
+        if (!hierarchy.has(cls)) hierarchy.set(cls, new Set());
+        hierarchy.get(cls).add(sup);
+    }
+
+    // classSuffix → Map<propName, {target, lo, up}>, direct (non-inherited) declarations only.
+    const classComposition = new Map();
+    function addDirect(cls, name, target, lo, up) {
+        if (!name) return;
+        if (!classComposition.has(cls)) classComposition.set(cls, new Map());
+        classComposition.get(cls).set(name, { target: target || "", lo, up });
+    }
+
+    // Seed from the base meta-model's own direct CompositionProperty declarations
+    // (propRows = PLANT_PROPS or PROCESS_PROPS, whichever matches the document).
+    for (const [cls, , ccsv] of propRows) {
+        if (!ccsv) continue;
+        for (const entry of ccsv.split("|")) {
+            if (!entry) continue;
+            const parts = entry.split(":");
+            const name = parts[0];
+            const lo = parts.length > 1 && parts[1] !== "" ? parseInt(parts[1], 10) : 0;
+            const up = parts.length > 2 ? (parts[2] === "" ? null : parseInt(parts[2], 10)) : null;
+            const target = parts.length > 3 ? parts[3] : "";
+            addDirect(cls, name, target, lo, up);
+        }
+    }
+
+    const parser = new DOMParser();
+    for (const profileXml of profileXmlList) {
+        if (!profileXml) continue;
+        const doc = parser.parseFromString(profileXml, "application/xml");
+        if (doc.querySelector("parsererror")) continue;
+
+        function readComposition(cls, keySuffix) {
+            // Only direct children so nested class defs (if any) aren't picked up.
+            for (const child of cls.children ? Array.from(cls.children) : []) {
+                if (child.tagName !== "CompositionProperty") continue;
+                const name = child.getAttribute("name") || "";
+                const loc  = name.split(/[.\/]/).pop();
+                if (!loc) continue;
+                const lo = parseInt(child.getAttribute("lower") || "0", 10);
+                const up = child.getAttribute("upper") === "1" ? 1 : null;
+                const classRef = child.querySelector("ClassReference") ||
+                    Array.from(child.getElementsByTagName ? child.getElementsByTagName("ClassReference") : []).find(() => true);
+                const targetRaw = classRef ? (classRef.getAttribute("type") || "") : "";
+                const target = targetRaw.split(/[.\/]/).pop();
+                addDirect(keySuffix, loc, target, lo, up);
+            }
+        }
+
+        // ConcreteClass / AbstractClass — profile-declared classes and their own hierarchy edges.
+        ["ConcreteClass", "AbstractClass"].forEach(tag => {
+            Array.from(doc.getElementsByTagName(tag)).forEach(cls => {
+                const rawName = cls.getAttribute("name") || "";
+                if (!rawName) return;
+                const suffix = rawName.split(/[.\/]/).pop();
+                const supers = (cls.getAttribute("superTypes") || "").trim();
+                if (supers) {
+                    if (!hierarchy.has(suffix)) hierarchy.set(suffix, new Set());
+                    supers.split(/\s+/).forEach(s => {
+                        const ss = s.split(/[.\/]/).pop();
+                        if (ss) hierarchy.get(suffix).add(ss);
+                    });
+                }
+                readComposition(cls, suffix);
+            });
+        });
+
+        // ClassExtension — key on the baseType suffix (the class being extended),
+        // so a new Components slot legitimately propagates to that class and its subclasses.
+        Array.from(doc.getElementsByTagName("ClassExtension")).forEach(cls => {
+            const baseType = cls.getAttribute("baseType") || "";
+            if (!baseType) return;
+            const suffix = baseType.split(/[.\/]/).pop();
+            readComposition(cls, suffix);
+        });
+    }
+
+    // Fixpoint: propagate parent composition entries to subclasses (child's own
+    // declaration for the same property name takes precedence over inherited one).
+    let changed = true;
+    while (changed) {
+        changed = false;
+        for (const [cls, supers] of hierarchy) {
+            if (!classComposition.has(cls)) classComposition.set(cls, new Map());
+            const entry = classComposition.get(cls);
+            for (const sup of supers) {
+                const supEntry = classComposition.get(sup);
+                if (!supEntry) continue;
+                for (const [name, info] of supEntry) {
+                    if (!entry.has(name)) {
+                        entry.set(name, info);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Ancestor closure (self + all transitive supertypes), used to check whether
+    // a child object's type satisfies a composition property's required target type.
+    const closure = new Map();
+    function ancestorsOf(cls) {
+        if (!closure.has(cls)) closure.set(cls, new Set([cls]));
+        return closure.get(cls);
+    }
+    changed = true;
+    while (changed) {
+        changed = false;
+        for (const [cls, supers] of hierarchy) {
+            const set = ancestorsOf(cls);
+            for (const sup of supers) {
+                if (!set.has(sup)) { set.add(sup); changed = true; }
+                for (const a of ancestorsOf(sup)) {
+                    if (!set.has(a)) { set.add(a); changed = true; }
+                }
+            }
+        }
+    }
+
+    return { hierarchy, closure, classComposition };
+}
+
+// Is `childSuffix` the same type as, or a (transitive) subtype of, `targetSuffix`?
+function isSubtypeOrSelf(childSuffix, targetSuffix, closure) {
+    if (!childSuffix || !targetSuffix) return true; // insufficient info — don't flag
+    if (childSuffix === targetSuffix) return true;
+    const anc = closure.get(childSuffix);
+    if (!anc) return true; // unknown class — handled elsewhere, don't double-flag here
+    return anc.has(targetSuffix);
 }
 
 // ─── Attribute Constraint Validation (ERR-E18, ERR-E19) ─────────────────────
@@ -2080,6 +2186,21 @@ export function validateSymbolRules(mainXml, profileXml, profileName, severityCo
         return { representsId: null, repGroupEl: null };
     }
 
+    // A single RepresentationGroup can legitimately contain more than one
+    // Profile/SymbolUsage sibling (e.g. a composite symbol built from several
+    // sub-symbols, or a duplicated placement in the source data) that all
+    // resolve to the same represented model object (representsId) via
+    // findRepresentsAncestor(). PRF-E04 Sub-rule A/B and PRF-E06 below check
+    // properties of the (representsId, symName) pair itself — not of the
+    // individual SymbolUsage placement — so re-running them once per sibling
+    // re-emits byte-identical issues. This set tracks which (rule, key) pairs
+    // have already been fully checked so each is only evaluated once, while
+    // still reporting once per genuinely distinct underlying problem (e.g.
+    // three separate broken AttributeRepresentation Fragments on the same
+    // object still produce three PRF-E06 issues — just not multiplied by the
+    // number of sibling SymbolUsages that happen to share that symbol).
+    const checkedOnce = new Set();
+
     // Inspect every Profile/SymbolUsage in the drawing
     doc.querySelectorAll('Object[type="Profile/SymbolUsage"]').forEach(su => {
         // Symbol name: "DiscProfile/PE037A" → strip prefix → "PE037A"
@@ -2097,6 +2218,9 @@ export function validateSymbolRules(mainXml, profileXml, profileName, severityCo
         if (symName && !allKnownSymbols.has(symName)) {
             // Walk up to find context (best-effort; may be null for orphaned usages)
             const { representsId: qId } = findRepresentsAncestor(su);
+            const dedupKeyA = `E04A::${qId || "(unknown)"}::${symName}`;
+            if (checkedOnce.has(dedupKeyA)) return;
+            checkedOnce.add(dedupKeyA);
             const qType = qId ? (objectTypes.get(qId) || "") : "";
             const sev = resolveSeverity("PRF-E04", severityConfig);
             issues.push({
@@ -2141,8 +2265,11 @@ export function validateSymbolRules(mainXml, profileXml, profileName, severityCo
         const normModelType = modelType.replace(/\//g, ".");
 
         // ── PRF-E04 Sub-rule B: symbol's allowed types must match the model type ─
+        const dedupKeyB = `E04B::${representsId || "(unknown)"}::${symName}`;
+        const alreadyCheckedB = checkedOnce.has(dedupKeyB);
+        checkedOnce.add(dedupKeyB);
         const allowedTypes = symbolUsage.get(symName);
-        if (modelType && allowedTypes && allowedTypes.length > 0) {
+        if (!alreadyCheckedB && modelType && allowedTypes && allowedTypes.length > 0) {
             // Only consider usages that are valid DEXPI type strings (dot-separated namespaced
             // types). File-path usages (e.g. "\Piping\Valves\...sym") from non-standard profiles
             // are not comparable to DEXPI type strings and are skipped.
@@ -2208,8 +2335,11 @@ export function validateSymbolRules(mainXml, profileXml, profileName, severityCo
         // placeholder at all — a symbol with none simply isn't modelled for this
         // check and shouldn't produce false positives.
         {
+            const dedupKeyE06 = `E06::${representsId || "(unknown)"}::${symName}`;
+            const alreadyCheckedE06 = checkedOnce.has(dedupKeyE06);
+            checkedOnce.add(dedupKeyE06);
             const allowedAttrs = labelTemplateAttrs.get(symName);
-            if (allowedAttrs && allowedAttrs.size && representsId) {
+            if (!alreadyCheckedE06 && allowedAttrs && allowedAttrs.size && representsId) {
                 const usedAttrs = attrRepsByTargetId.get(representsId) || [];
                 usedAttrs.forEach(attrName => {
                     const bare = attrName.split("/").pop();
@@ -2708,7 +2838,25 @@ export function runFullValidation({ mainXml, flatTree, profiles, severityConfig,
         });
     });
 
-    allIssues.push(...runXmlSchemaValidation(mainXml, flatTree, severityConfig, externalValidIds, profileTypes, profileExtProps));
+    // Schema-driven composition (parent/child containment) map for ERR-E08 —
+    // combines the base DEXPI 2.0 meta model (Plant or Process, whichever this
+    // document uses) with any loaded profile's own class model (ClassExtension /
+    // ConcreteClass CompositionProperty declarations), so a profile-declared type
+    // like a DiscProfile valve subclass is correctly recognised as a subtype of
+    // its base Plant/Piping class when checking containment compatibility.
+    const compositionModelName = (() => {
+        try {
+            const doc = new DOMParser().parseFromString(mainXml, "application/xml");
+            return detectMetaModel(doc);
+        } catch { return "Unknown"; }
+    })();
+    const compositionMap = buildProfileCompositionMap(
+        compositionModelName === "Process" ? PROCESS_HIERARCHY : PLANT_HIERARCHY,
+        compositionModelName === "Process" ? PROCESS_PROPS     : PLANT_PROPS,
+        allProfileXmls.map(p => p.xml).filter(Boolean)
+    );
+
+    allIssues.push(...runXmlSchemaValidation(mainXml, flatTree, severityConfig, externalValidIds, profileTypes, profileExtProps, compositionMap));
     // Every attribute name ANY loaded profile's own LabelTemplate catalog
     // recognises anywhere, across every symbol - see
     // collectProfileLabelTemplateAttrNames() and runTextTemplateAttributeValidation() (ERR-E20).
@@ -2730,15 +2878,11 @@ export function runFullValidation({ mainXml, flatTree, profiles, severityConfig,
     // (not gated on any Profile/PropertyConstraint existing) since a
     // ClassExtension alone is enough to legitimately grant an attribute to a
     // class. Plant.xml hierarchy is pre-seeded inside buildProfileAttributeMap
-    // via PLANT_CLASS_SUPERTYPES — no need to pass Plant.xml raw text. Used
-    // both by the hardcoded built-in DEXPI 2.0 rules below (ERR-E18/E19) and
-    // by the profile PropertyConstraint-driven check further down.
+    // via PLANT_CLASS_SUPERTYPES — no need to pass Plant.xml raw text. Used by
+    // the profile PropertyConstraint-driven ERR-E18/E19 check further down, so
+    // a profile ClassExtension grant is honoured even when no explicit
+    // PropertyConstraint entry covers a given class/attribute combination.
     const profileAttrMap = buildProfileAttributeMap(allProfileXmlStrings);
-
-    // ERR-E18 / ERR-E19 from the DEXPI 2.0 metamodel — runs without any profile
-    // loaded, but a loaded profile's own class model (profileAttrMap) can still
-    // override/extend it (see runBuiltInAttributeValidation()).
-    allIssues.push(...runBuiltInAttributeValidation(flatTree, severityConfig, profileAttrMap));
 
     if (profiles.length > 0) {
         const profileSets = profiles.map(p => ({ name: p.name, constraints: p.constraints }));
@@ -2774,9 +2918,37 @@ export function runFullValidation({ mainXml, flatTree, profiles, severityConfig,
             allConstraints.push(...parseProfileConstraints(discXml, discXmlName));
         }
         if (allConstraints.length > 0) {
-            // profileAttrMap built once, above, and shared with runBuiltInAttributeValidation.
             allIssues.push(...runAttributeConstraintValidation(flatTree, allConstraints, severityConfig, profileAttrMap));
         }
+    }
+
+    // ── Post-processing: stamp line numbers onto every remaining issue ──────────
+    // Several rule-producing functions (validateSymbolRules/PRF-E04/E05/E06,
+    // runAttributeConstraintValidation/ERR-E18/E19, runStructuralValidation/VAX,
+    // runEngineeringValidation/VAE, etc.) don't set `lineNumber` themselves —
+    // only runBaseValidation and a couple of ERR-E** rules do. Rather than thread
+    // a line-number map through every one of those functions, do one final pass
+    // here over the combined result: for any issue still missing a lineNumber,
+    // find the line matching the error best for that element — the first
+    // occurrence of `id="<objectId>"` in the source XML — and stamp it there.
+    {
+        const lineNumberMap = new Map(); // id -> first line number it appears on
+        const xmlLines = mainXml.split("\n");
+        const idRe = /\bid=["']([^"']+)["']/;
+        for (let i = 0; i < xmlLines.length; i++) {
+            const m = xmlLines[i].match(idRe);
+            if (m && !lineNumberMap.has(m[1])) lineNumberMap.set(m[1], i + 1);
+        }
+        allIssues.forEach(iss => {
+            if (iss.lineNumber !== undefined) return; // already set by its own rule
+            const id = iss.objectId;
+            if (!id || id.startsWith("(")) return;
+            // Some issues report multiple ids as a comma-separated list (e.g. ERR-E11) —
+            // use the first one's line as the representative location.
+            const firstId = id.split(",")[0].trim();
+            const ln = lineNumberMap.get(id) || lineNumberMap.get(firstId);
+            if (ln) iss.lineNumber = ln;
+        });
     }
 
     return allIssues;

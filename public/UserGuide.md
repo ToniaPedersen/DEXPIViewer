@@ -334,14 +334,13 @@ Rules marked **Profile required** only fire when at least one profile XML has be
 | ERR-E17 | Error | Important equipment, valve, or connector has no `RepresentationGroup` (orphaned model object). | |
 | ERR-E18 | Error | Attribute used on a class that does not allow it per the loaded profile's `PropertyConstraint` definitions. | ✓ |
 | ERR-E19 | Error | Attribute appears more times than the upper cardinality allows per the loaded profile. | ✓ |
-| ERR-E20 | Warning | A `Core/Diagram.TextTemplate`'s `AttributeName` doesn't resolve to a value anywhere reachable from the owning object (direct property, or a nested/related object up to two hops out). Skipped when the loaded profile itself recognises the attribute name somewhere in its own LabelTemplate catalogue, since such attributes are legitimately optional. | |
+| ERR-E20 | Error | A `Core/Diagram.TextTemplate`'s `AttributeName` doesn't resolve to a value anywhere reachable from the owning object (direct property, or a nested/related object up to two hops out). Skipped when the loaded profile itself recognises the attribute name somewhere in its own LabelTemplate catalogue, since such attributes are legitimately optional. | |
 
 ### VAX — Structural / Topology Validation
 
 | Rule | Default | Description | Profile required |
 |------|---------|-------------|:---:|
 | VAX-001 | Warning | `ActuatingSystem` contains no `ControlledActuator`. | |
-| VAX-002 | Warning | `OperatedValveReference` points to a non-valve type. | |
 | VAX-003 | Warning | `PipingNetworkSystem` contains no `PipingNetworkSegment`; or `InstrumentationLoopFunction` contains no `ProcessInstrumentationFunction`. | |
 | VAX-004 | Warning | `PipingNode` is not referenced by any connection (orphaned node). | |
 | VAX-005 | Info | `PipingNetworkSegment` has no connections defined. | |

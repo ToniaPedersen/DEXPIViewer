@@ -1651,6 +1651,11 @@ export default function App() {
                                                     <div style={{ display: "flex", gap: 5, alignItems: "center", marginBottom: 3 }}>
                                                         <span style={{ ...S.badge(S.sevColor[issue.severity]) }}>{issue.severity}</span>
                                                         <span style={{ fontSize: 11, fontFamily: "monospace", color: "#555" }}>{issue.ruleId}</span>
+                                                        {issue.lineNumber != null && (
+                                                            <span title={`Line ${issue.lineNumber} in the source XML`} style={{ fontSize: 10, fontFamily: "monospace", color: "#57606a", background: "#f6f8fa", border: "1px solid #eef2f6", borderRadius: 3, padding: "0 4px" }}>
+                                                                L{issue.lineNumber}
+                                                            </span>
+                                                        )}
                                                         {isNavable && <span title="Click to highlight element" style={{ fontSize: 10, color: "#0969da", marginLeft: 2 }}>⊕</span>}
                                                         <span style={{ fontSize: 10, color: "#888", marginLeft: "auto" }}>{issue.profileSource}</span>
                                                     </div>
