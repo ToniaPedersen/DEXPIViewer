@@ -159,3 +159,8 @@ By contributing you agree that your contributions are licensed under the same MI
 ## About DEXPI
 
 [DEXPI](https://dexpi.org) (Data EXchange in the Process Industry) is the open industry standard for intelligent P&ID exchange, enabling interoperability between engineering tools across the process industry.
+
+
+## Important Note
+
+Validation results are provided to assist review and should be independently verified. This tool is being used by me in a current DEXPI project and is under active development. Rules are being updated regularly during the project — results may change between updates.
