@@ -53,8 +53,6 @@ All processing happens locally in the browser — no data is sent to any server.
 
 In the left panel, click **Load DEXPI XML** and select a DEXPI 2.0 XML file. The drawing renders immediately in the centre panel and the topology tree populates in the left panel.
 
-The drawing number and title from `PlantMetaData` are shown above the drawing in the centre toolbar.
-
 ### 2.3 Profile Modes
 
 Two load modes are available at the top of the left panel:
@@ -193,7 +191,7 @@ Click **BG Image** to overlay a reference image behind the P&ID drawing. Once on
 | Control | Description |
 |---------|-------------|
 | Visible | Toggle the overlay on or off |
-| Opacity | 0–1 |
+| Blend | -1 to 1. Centered (0) shows the BG image and the DEXPI drawing both fully visible. Drag right to fade out the BG image; drag left to fade out the DEXPI drawing. |
 | Scale | Uniform scale factor applied to the auto-fit size (native aspect ratio is always preserved) |
 | X / Y | Offset, in drawing units, from the auto-fit (centered) position — not screen pixels, so the range scales with the drawing's own size |
 | Reset fit | Sets scale back to 1 and X/Y back to 0, returning to the auto-fit (centered, aspect-correct) placement |

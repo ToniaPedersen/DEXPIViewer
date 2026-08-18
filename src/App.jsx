@@ -1186,7 +1186,7 @@ export default function App() {
             // instead of guessing a scale in unrelated CSS-pixel units.
             const probe = new Image();
             const base = {
-                src, opacity: 0.4, scale: placement.scale, offsetX: placement.offsetX, offsetY: placement.offsetY, visible: true,
+                src, opacity: 0, scale: placement.scale, offsetX: placement.offsetX, offsetY: placement.offsetY, visible: true,
                 // sourceBytes/isPng/fileName/embeddedPlacement support the
                 // Download-with-placement/Clear-default controls below - see
                 // downloadBgPlacementPng()/clearBgDefault().
@@ -1750,10 +1750,6 @@ export default function App() {
             {/* CENTER PANEL */}
             <div style={{ position: "relative", overflow: "hidden", background: "#f8fafc", display: "flex", flexDirection: "column" }}>
                 <div style={{ ...S.toolbar, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{parsed?.meta?.drawingNumber || ""}</div>
-                        <div style={{ fontSize: 12, color: "#57606a" }}>{parsed?.meta?.drawingName || ""}{parsed?.meta?.subtitle ? ` - ${parsed.meta.subtitle}` : ""}</div>
-                    </div>
                     <div style={{ display: "flex", gap: 5, flexWrap: "wrap", alignItems: "center" }}>
                         <button style={S.btn} onClick={() => { if (!parsed) return; const b = boundsFromElements(parsed.graphics); setFullBounds(b); setViewBox({ x: b.minX, y: b.minY, w: b.maxX - b.minX, h: b.maxY - b.minY }); }} title="Fit drawing to window">Fit</button>
                         {sentToBackIds.size > 0 && (
@@ -1798,10 +1794,9 @@ export default function App() {
                         <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
                             <input type="checkbox" checked={bgImage.visible} onChange={e => setBgImage(b => ({ ...b, visible: e.target.checked }))} /> Visible
                         </label>
-                        <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                            Opacity
-                            <input type="range" min={0} max={1} step={0.05} value={bgImage.opacity} onChange={e => setBgImage(b => ({ ...b, opacity: parseFloat(e.target.value) }))} style={{ width: 70 }} />
-                            <input type="number" min={0} max={1} step={0.01} value={bgImage.opacity} onChange={e => { const v = parseFloat(e.target.value); if (!Number.isNaN(v)) setBgImage(b => ({ ...b, opacity: Math.min(1, Math.max(0, v)) })); }} style={S.numBox} title="Opacity (0-1)" />
+                        <label style={{ display: "flex", alignItems: "center", gap: 4 }} title="Centered: BG image and DEXPI drawing both fully visible. Drag right to fade out the BG image; drag left to fade out the DEXPI drawing.">
+                            Blend
+                            <input type="range" min={-1} max={1} step={0.05} value={bgImage.opacity} onChange={e => setBgImage(b => ({ ...b, opacity: parseFloat(e.target.value) }))} style={{ width: 70 }} />
                         </label>
                         <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
                             Scale
@@ -1859,18 +1854,20 @@ export default function App() {
                 >
                     <svg ref={svgElRef} viewBox={`${viewBox.x} ${viewBox.y} ${viewBox.w} ${viewBox.h}`} width="100%" height="100%" style={{ display: "block" }} onAuxClick={e => e.preventDefault()}>
                         {bgImage && bgPlacement && (
-                            <g style={{ display: bgImage.visible ? "inline" : "none", opacity: bgImage.opacity, pointerEvents: "none" }}>
+                            <g style={{ display: bgImage.visible ? "inline" : "none", opacity: bgImage.opacity > 0 ? Math.max(0, 1 - bgImage.opacity) : 1, pointerEvents: "none" }}>
                                 <image href={bgImage.src} x={bgPlacement.x} y={bgPlacement.y} width={bgPlacement.width} height={bgPlacement.height} preserveAspectRatio="none" />
                                 <rect x={bgPlacement.x} y={bgPlacement.y} width={bgPlacement.width} height={bgPlacement.height} fill={BG_TINT_COLOR} style={{ mixBlendMode: "color" }} />
                             </g>
                         )}
-                        {orderedGraphicsElements.map(el => {
-                            const isSelected = !!el.representedId && selectedRepresentedIds.has(el.representedId);
-                            const ch = connectivityHighlight;
-                            const connColor = el.representedId ? (ch.upstream.has(el.representedId) ? "#0969da" : ch.downstream.has(el.representedId) ? "#1a7f37" : ch.group.has(el.representedId) ? "#8250df" : null) : null;
-                            if (el.kind === "symbolUsage") return <SymbolGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} boostPct={lineBoostPct} boostSymbolOutlines={boostSymbolOutlines} showProfileLabels={showProfileLabels} />;
-                            return <PrimitiveGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} nodePosMap={parsed.graphics.nodePosMap} boostPct={lineBoostPct} boostSymbolOutlines={boostSymbolOutlines} showProfileLabels={showProfileLabels} />;
-                        })}
+                        <g style={{ opacity: bgImage && bgImage.opacity < 0 ? Math.max(0, 1 + bgImage.opacity) : 1 }}>
+                            {orderedGraphicsElements.map(el => {
+                                const isSelected = !!el.representedId && selectedRepresentedIds.has(el.representedId);
+                                const ch = connectivityHighlight;
+                                const connColor = el.representedId ? (ch.upstream.has(el.representedId) ? "#0969da" : ch.downstream.has(el.representedId) ? "#1a7f37" : ch.group.has(el.representedId) ? "#8250df" : null) : null;
+                                if (el.kind === "symbolUsage") return <SymbolGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} boostPct={lineBoostPct} boostSymbolOutlines={boostSymbolOutlines} showProfileLabels={showProfileLabels} />;
+                                return <PrimitiveGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} nodePosMap={parsed.graphics.nodePosMap} boostPct={lineBoostPct} boostSymbolOutlines={boostSymbolOutlines} showProfileLabels={showProfileLabels} />;
+                            })}
+                        </g>
                         {/* Heat-trace overlays – rendered on top, only when a DISC profile is loaded */}
                         {parsed?.heatTraceSet?.size > 0 && parsed.graphics.elements.map(el => {
                             // Never draw heat-trace overlays on label or annotation elements
