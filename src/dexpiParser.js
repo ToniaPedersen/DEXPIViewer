@@ -1002,7 +1002,41 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
     drawn.forEach(el => {
         if (el.elementRole !== "label" || el.kind !== "primitive" || el.primitive?.kind !== "text") return;
         const discInfo = el.representedId ? discSymbolByRepresentedId.get(el.representedId) : null;
-        el.primitive.isDiscProfileLabel = !!discInfo;
+        // A Core/Note's own LocalNoteIdentifier/NoteText labels carry their
+        // own AttributeRepresentation Template (see parseTextTemplateFragments())
+        // purely as a base Core.xml feature - a Note is never placed as a
+        // DiscProfile/Profile.SymbolUsage and never appears in any Profile's
+        // symbol catalogue, so it has no "Profile labels" story at all. Two
+        // shapes of "this Text is really about a Note" both need catching:
+        //  (a) the Text's OWN Represents points straight at the Note (the
+        //      note-block entry itself, e.g. the "1. <NoteText>" pair drawn
+        //      in the drawing's note list) - representedId is the Note.
+        //  (b) a "NOTE <n>" reference flag drawn right next to the equipment
+        //      it annotates (e.g. beside a PressureVessel's own symbol) -
+        //      this Text has no Represents of its own, so it inherits the
+        //      *equipment's* representedId from its enclosing Group instead
+        //      (see traverseGroup()), even though its AttributeRepresentation
+        //      Fragment explicitly names the Note as the attribute's Object.
+        //      Since it shares representedId with the equipment, and that
+        //      equipment is very often placed as a DiscProfile catalog
+        //      symbol, discInfo/isDiscProfileLabel below would otherwise be
+        //      true for it too - the same "belongs to a catalogued symbol"
+        //      rule meant for the equipment's own tag/attribute labels.
+        // Without this guard, instanceHasAttr below would make
+        // isProfileGoverned (case a) or isDiscProfileLabel (case b) true
+        // whenever a DiscProfile.xml is loaded, and the Note reference would
+        // go blank when "Profile labels" is checked (both flags are checked
+        // in App.jsx's CHECKED-state rule) and, lacking real catalog backing,
+        // sometimes when unchecked too - i.e. loading a Profile, or toggling
+        // the checkbox, would make Notes and their equipment-side reference
+        // flags disappear even though nothing about them is Profile-governed.
+        // Treating either shape as never profile-governed keeps both showing
+        // their literal text in every state.
+        const referencesNoteObject = !!(el.primitive.templateFragments && el.primitive.templateFragments.some(
+            f => f.kind === "attr" && f.objectId && objectTypeMap.get(f.objectId) === "Core/Note"
+        ));
+        const representsNote = referencesNoteObject || (el.representedId && objectTypeMap.get(el.representedId) === "Core/Note");
+        el.primitive.isDiscProfileLabel = !!discInfo && !representsNote;
         // Whether there is ANY real attribute-driven backing for this label
         // at all - either this Text's own Core/Diagram.TextTemplate names at
         // least one attribute Fragment, or the placed symbol's catalog
@@ -1039,8 +1073,8 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         // property="Text">, exactly the same way. Gated on discDoc being
         // loaded at all, so behaviour is unchanged when no profile is
         // loaded (isDiscProfileLabel is already always false in that case).
-        el.primitive.isProfileGoverned = !!discDoc && (el.primitive.isDiscProfileLabel || instanceHasAttr);
-        el.primitive.hasProfileAttributeBacking = !!discDoc && (instanceHasAttr || catalogHasAttr);
+        el.primitive.isProfileGoverned = !representsNote && !!discDoc && (el.primitive.isDiscProfileLabel || instanceHasAttr);
+        el.primitive.hasProfileAttributeBacking = !representsNote && !!discDoc && (instanceHasAttr || catalogHasAttr);
         // Only fall back to the symbol's own Profile/LabelTemplate when this
         // Text primitive carries NO Template at all - resolveTemplateFragments()
         // returns null in that case, vs. an actual (possibly empty) STRING
@@ -1500,6 +1534,15 @@ export function boundsFromElements(graphics) {
         } else if (el.primitive?.kind === "rect") {
             visit({ x: el.primitive.center.x - el.primitive.width / 2, y: el.primitive.center.y - el.primitive.height / 2 });
             visit({ x: el.primitive.center.x + el.primitive.width / 2, y: el.primitive.center.y + el.primitive.height / 2 });
+        } else if (el.primitive?.kind === "text") {
+            // Notes/annotations (e.g. Core/Note labels) are frequently placed
+            // in a note block away from any piping/equipment geometry, so a
+            // Text primitive's own position must count toward the drawing's
+            // fit-to-view bounds too - otherwise such labels can fall outside
+            // both the initial auto-fit view AND the pan-clamp range in
+            // App.jsx's clampViewBox() (which is itself derived from these
+            // bounds), making them impossible to see even by scrolling.
+            visit(el.primitive.position);
         }
     });
     if (minX === Infinity) return { minX: 0, minY: 0, maxX: 1000, maxY: 1000 };
