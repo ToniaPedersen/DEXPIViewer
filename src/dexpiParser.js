@@ -1277,7 +1277,14 @@ const DEXPI_BUILTIN_HT_ELIGIBLE = new Set([
  *   (a) the profile defines a ConcreteClass that is a subclass of an eligible
  *       type (handles custom / vendor profile extensions); or
  *   (b) the profile has a Profile/PropertyConstraint whose Property contains
- *       "HeatTracingType" pointing at a ConstrainedType not in the built-in set.
+ *       "HeatTracingType" pointing at a ConstrainedType not in the built-in set; or
+ *   (c) the profile defines a ClassExtension (DISC's "add a property straight
+ *       onto an existing base class" mechanism, distinct from ConcreteClass
+ *       subclassing - see e.g. DiscProfile.xml's ProcessInstrumentationFunction-
+ *       Extension, baseType="Plant/Instrumentation.ProcessInstrumentationFunction")
+ *       whose own DataProperty children include "HeatTracingType" - the
+ *       ClassExtension's baseType itself becomes eligible, since instances are
+ *       still serialized under the base type name, not the extension's name.
  *
  * Non-eligible types break the instance-level inheritance chain: a
  * PipingNetworkSegment's HeatTracingType does NOT propagate to (e.g.) an
@@ -1317,6 +1324,24 @@ function buildHtEligibility(discDoc) {
             });
             if (prop?.includes("HeatTracingType") && constrainedType) {
                 const suffix = constrainedType.split(/[./]/).pop();
+                if (suffix) eligible.add(suffix);
+            }
+        });
+
+        // (c) Honour ClassExtension elements that add HeatTracingType
+        // directly onto an existing base class (e.g. ProcessInstrumentation-
+        // FunctionExtension on Plant/Instrumentation.ProcessInstrumentation-
+        // Function) - instances still serialize under the base type name,
+        // so it's the baseType that must become eligible, not the extension.
+        discDoc.querySelectorAll("ClassExtension").forEach(ext => {
+            const baseType = ext.getAttribute("baseType");
+            if (!baseType) return;
+            const hasHT = Array.from(ext.children).some(child =>
+                child.tagName === "DataProperty" &&
+                (child.getAttribute("name") === "HeatTracingType" || child.getAttribute("name") === "DiscProfile/HeatTracingType")
+            );
+            if (hasHT) {
+                const suffix = baseType.split(/[./]/).pop();
                 if (suffix) eligible.add(suffix);
             }
         });

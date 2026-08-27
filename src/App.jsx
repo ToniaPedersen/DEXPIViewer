@@ -685,6 +685,7 @@ const HT_COLOR  = "#e06000";
 const HT_DASH   = "6 2 6 2";  // dash-dash pattern
 const HT_SW     = 0.6;         // stroke width (SVG units)
 const HT_OFF    = 1.5;         // offset distance (~1 pt) from pipe / symbol edge
+const HT_PIF_OFF = 1.0;        // offset distance (1mm) outside a PIF symbol's own outline
 const HT_THRESH = 0.15;        // |sin| or |cos| threshold for axis-alignment (~8.6 deg)
 
 /**
@@ -780,20 +781,20 @@ function HeatTraceSymbol({ el }) {
 }
 
 /**
- * Heat trace dashed rectangle drawn 1 pt outside a PIF symbol bounding box,
+ * Heat trace dashed rectangle drawn 1mm outside a PIF symbol bounding box,
  * in local symbol coordinates so it rotates with the symbol.
  */
 /**
  * Heat trace overlay for ProcessInstrumentationFunction.
  * Traces the actual outer boundary primitives of the symbol (circle, ellipse,
- * polygon) expanded 1 pt outward, so it follows the real symbol shape rather
+ * polygon) expanded 1mm outward, so it follows the real symbol shape rather
  * than a bounding-box rectangle.  Internal detail polylines are skipped.
  * Falls back to a bounding-box rect when no boundary primitive is found.
  */
 function HeatTracePIF({ el }) {
     const mirror = el.isMirrored ? -1 : 1;
     const transform = `translate(${el.position.x} ${el.position.y}) rotate(${el.rotation}) scale(${el.scaleX * mirror} ${el.scaleY})`;
-    const pad = 1.5;
+    const pad = HT_PIF_OFF; // 1mm outside the symbol's outline
 
     const overlays = [];
     (el.variant.primitives || []).forEach((p, i) => {
@@ -826,7 +827,7 @@ function HeatTracePIF({ el }) {
     });
 
     if (overlays.length === 0) {
-        // Fallback: simple rect 1 pt outside bounding box
+        // Fallback: simple rect 1mm outside bounding box
         const x = Math.min(el.variant.minX, el.variant.maxX) - pad;
         const y = Math.min(el.variant.minY, el.variant.maxY) - pad;
         const w = Math.abs(el.variant.maxX - el.variant.minX) + pad * 2;
