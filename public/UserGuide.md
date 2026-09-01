@@ -99,6 +99,13 @@ All three panels can be collapsed by clicking the arrow button (`<` / `>`) at th
 
 ## 4. Left Panel
 
+Below the file-loading buttons and the loaded Profile filename, a **Go to** field lets you jump straight to a drawing-coordinate point instead of hunting for it by panning and zooming:
+
+1. Paste or type a coordinate pair as `x, y` (e.g. `281.402440417167, 454.852545971671`) — a space or `;` between the numbers also works.
+2. Click **Go**, or press **Enter** in the field.
+
+The centre panel pans and zooms to center that point in the view (at the current zoom level) and drops an orange crosshair marker on it. Click **Clear** to remove the marker. Coordinates are in the drawing's own native units — the same coordinate space used throughout the app (e.g. the BG Image X/Y offsets in 5.7) — not screen pixels. The **Go** button is disabled until a DEXPI XML file is loaded.
+
 ### 4.1 Topology Tab
 
 The Topology tab shows the full DEXPI object model as an expandable tree, organised by containment (e.g. `PlantModel` → `PipingNetworkSystem` → `PipingNetworkSegment`).
@@ -148,6 +155,7 @@ The centre panel renders the DEXPI drawing graphically from the XML data. Symbol
 | Zoom | Scroll the mouse wheel over the drawing (zooms toward the cursor) |
 | Pan | Hold **Space** and drag |
 | Fit to window | Click the **Fit** button in the centre toolbar |
+| Jump to a coordinate | **Go to** field in the left panel — enter `x, y` and click **Go** (see section 4, above) |
 | Export view | Click **Save PNG** / **Save PDF** in the centre toolbar (see 5.8, below) |
 
 ### 5.2 Selecting Objects
@@ -190,7 +198,6 @@ Click **BG Image** to overlay a reference image behind the P&ID drawing. Once on
 
 | Control | Description |
 |---------|-------------|
-| Visible | Toggle the overlay on or off |
 | Blend | -1 to 1. Centered (0) shows the BG image and the DEXPI drawing both fully visible. Drag right to fade out the BG image; drag left to fade out the DEXPI drawing. |
 | Scale | Uniform scale factor applied to the auto-fit size (native aspect ratio is always preserved) |
 | X / Y | Offset, in drawing units, from the auto-fit (centered) position — not screen pixels, so the range scales with the drawing's own size |

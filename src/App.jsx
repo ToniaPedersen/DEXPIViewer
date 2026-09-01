@@ -1013,6 +1013,14 @@ export default function App() {
     const [panStart, setPanStart] = useState(null);
     const [bgImage, setBgImage] = useState(null);
     const [showBgControls, setShowBgControls] = useState(false);
+    // "Go to X/Y": lets the user paste/type a drawing-coordinate point (e.g.
+    // "281.402440417167, 454.852545971671") and jump the view there instead
+    // of hunting for it by panning/zooming. goToInput holds the raw text
+    // field; goToMarker (once a jump succeeds) is the drawing point a
+    // crosshair is drawn at, in the same coordinate space as viewBox/
+    // fullBounds - see the crosshair <g> rendered on top of the SVG below.
+    const [goToInput, setGoToInput] = useState("");
+    const [goToMarker, setGoToMarker] = useState(null);
     const [profiles, setProfiles] = useState([]);
     const [validationIssues, setValidationIssues] = useState([]);
     const [validationDone, setValidationDone] = useState(false);
@@ -1438,6 +1446,20 @@ export default function App() {
         return () => el.removeEventListener("wheel", onWheel);
     }, [fullBounds]);
 
+    // Center the view on a user-typed drawing-coordinate point, keeping the
+    // current zoom level, and drop a crosshair marker there so it's easy to
+    // spot. Coordinates are in the drawing's own native units (same space as
+    // fullBounds/viewBox) - not screen pixels.
+    function goToPoint() {
+        const parts = goToInput.trim().split(/[,;\s]+/).filter(Boolean);
+        if (parts.length !== 2) return;
+        const x = parseFloat(parts[0]);
+        const y = parseFloat(parts[1]);
+        if (Number.isNaN(x) || Number.isNaN(y)) return;
+        setViewBox(v => clampViewBox({ x: x - v.w / 2, y: y - v.h / 2, w: v.w, h: v.h }, fullBounds));
+        setGoToMarker({ x, y });
+    }
+
     useEffect(() => {
         const onKeyDown = e => { if (e.code === "Space" && e.target === document.body) { e.preventDefault(); setSpaceDown(true); } };
         const onKeyUp   = e => { if (e.code === "Space") { setSpaceDown(false); setIsPanning(false); setPanStart(null); } };
@@ -1570,6 +1592,12 @@ export default function App() {
                                 <button style={{ ...S.btnDanger, padding: "1px 6px", flexShrink: 0 }} title="Remove profile (revert to internal)" onClick={clearDiscProfile}>x</button>
                             </div>
                         )}
+                        <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "#57606a", marginTop: 8 }} title="Center the drawing view on a drawing-coordinate point (same units as the drawing itself) and mark it with a crosshair. Paste as 'x, y', e.g. 281.402440417167, 454.852545971671">
+                            Go to
+                            <input type="text" value={goToInput} onChange={e => setGoToInput(e.target.value)} onKeyDown={e => { if (e.key === "Enter") goToPoint(); }} style={{ ...S.numBoxWide, width: 150 }} placeholder="x, y" />
+                            <button style={S.btnSmall} disabled={!parsed} onClick={goToPoint} title="Center the view on the X/Y point above">Go</button>
+                            {goToMarker && <button style={S.btnSmall} onClick={() => setGoToMarker(null)} title="Remove the crosshair marker">Clear</button>}
+                        </label>
                         {parsed && <button style={{ ...S.btnPrimary, marginTop: 8, width: "100%" }} onClick={runValidation}>Run Validation</button>}
                         {validationDone && (
                             <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
@@ -1792,9 +1820,6 @@ export default function App() {
 
                 {bgImage && showBgControls && (
                     <div style={{ padding: "6px 12px", borderBottom: "1px solid #d0d7de", background: "#f6f8fa", display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center", fontSize: 12 }}>
-                        <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                            <input type="checkbox" checked={bgImage.visible} onChange={e => setBgImage(b => ({ ...b, visible: e.target.checked }))} /> Visible
-                        </label>
                         <label style={{ display: "flex", alignItems: "center", gap: 4 }} title="Centered: BG image and DEXPI drawing both fully visible. Drag right to fade out the BG image; drag left to fade out the DEXPI drawing.">
                             Blend
                             <input type="range" min={-1} max={1} step={0.05} value={bgImage.opacity} onChange={e => setBgImage(b => ({ ...b, opacity: parseFloat(e.target.value) }))} style={{ width: 70 }} />
@@ -1869,6 +1894,16 @@ export default function App() {
                                 return <PrimitiveGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} nodePosMap={parsed.graphics.nodePosMap} boostPct={lineBoostPct} boostSymbolOutlines={boostSymbolOutlines} showProfileLabels={showProfileLabels} />;
                             })}
                         </g>
+                        {goToMarker && (() => {
+                            const r = Math.max(viewBox.w, viewBox.h) * 0.015;
+                            return (
+                                <g style={{ pointerEvents: "none" }}>
+                                    <circle cx={goToMarker.x} cy={goToMarker.y} r={r} fill="none" stroke="#e8590c" strokeWidth={r * 0.18} />
+                                    <line x1={goToMarker.x - r * 1.8} y1={goToMarker.y} x2={goToMarker.x + r * 1.8} y2={goToMarker.y} stroke="#e8590c" strokeWidth={r * 0.18} />
+                                    <line x1={goToMarker.x} y1={goToMarker.y - r * 1.8} x2={goToMarker.x} y2={goToMarker.y + r * 1.8} stroke="#e8590c" strokeWidth={r * 0.18} />
+                                </g>
+                            );
+                        })()}
                         {/* Heat-trace overlays – rendered on top, only when a DISC profile is loaded */}
                         {parsed?.heatTraceSet?.size > 0 && parsed.graphics.elements.map(el => {
                             // Never draw heat-trace overlays on label or annotation elements
