@@ -358,7 +358,15 @@ export function parseInternalShapeCatalogue(mainDoc) {
 }
 
 export function parseNodePositionsById(mainDoc) {
-    const map = new Map();
+    // Two maps over the same PipingNodePosition/InstrumentationNodePosition
+    // objects: byElementId keyed by the position object's own id (used to
+    // resolve a Polyline's Source/Target Refs, which point at the position
+    // object itself - see ConnectorLineSvg/HeatTraceConnectorLine in
+    // App.jsx), and byNodeId keyed by the conceptual PipingNode id it
+    // positions (via its own <References property="Node">) - used to show
+    // a Node's on-drawing position in the Sub-Components list in App.jsx.
+    const byElementId = new Map();
+    const byNodeId = new Map();
     qsa(mainDoc, [
         'Object[type="Plant/Diagram.PipingNodePosition"]',
         'Object[type="Plant/Diagram.InstrumentationNodePosition"]',
@@ -366,9 +374,17 @@ export function parseNodePositionsById(mainDoc) {
     ].join(",")).forEach((obj, idx) => {
         const id = obj.getAttribute("id") || `nodePos_${idx}`;
         const position = aggregatedValue(getData(obj, "Position")?.firstElementChild);
-        if (position) map.set(id, position);
+        if (!position) return;
+        byElementId.set(id, position);
+        // Most PipingNodePosition/InstrumentationNodePosition objects carry
+        // an explicit Node reference; a few files omit it but still follow
+        // the "<nodeId>_PNP" / "<nodeId>_INP" id convention, so fall back to
+        // stripping that suffix rather than losing the position entirely.
+        const nodeId = referenceTargets(obj, "Node")[0]
+            || (/_(PNP|INP)$/.test(id) ? id.replace(/_(PNP|INP)$/, "") : null);
+        if (nodeId && !byNodeId.has(nodeId)) byNodeId.set(nodeId, position);
     });
-    return map;
+    return { byElementId, byNodeId };
 }
 
 export function parseTreeFromConceptual(rootObject) {
@@ -435,7 +451,7 @@ export function collectDescendantObjectIds(node, out = new Set()) {
 const SIGNAL_CONVEYING_DASH_ARRAY = "3 2";
 
 export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
-    const nodePosMap = parseNodePositionsById(mainDoc);
+    const { byElementId: nodePosMap, byNodeId: nodePositionsByNodeId } = parseNodePositionsById(mainDoc);
     const drawn = [];
 
     // Build objectId → Map<propertyName, rawDataValue> for condition evaluation,
@@ -489,6 +505,50 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
 
         const refTargets = referenceTargets(el);
         if (refTargets.length) referencesByParentId.set(id, refTargets);
+    });
+
+    // objectId (of a conceptual element - NOT one of its own Nodes) → [{id,
+    // type, position, nodeRef}, ...] for every PipingNodePosition/
+    // InstrumentationNodePosition sitting DIRECTLY in that element's own
+    // top-level RepresentationGroup's "NodePositions" Components (as
+    // opposed to inside a nested per-node sub-RepresentationGroup, which is
+    // the normal way a node gets positioned - see the "_1_PNP"/"_2_PNP"
+    // sub-groups each with their own Represents pointing at one specific
+    // node) whose own <References property="Node"> is either absent or
+    // doesn't resolve to one of that element's own Node children. These are
+    // graphically part of the element's representation (drawn/positioned
+    // alongside it) but don't represent any of the element's own conceptual
+    // nodes - e.g. the DiscProfile/SPPID convention of stamping an
+    // InstrumentationNodePosition onto every node's location "just in
+    // case" an instrumentation connector ever needs to dock there, whether
+    // or not one actually does in this drawing. Surfaced in App.jsx's
+    // Object pane as "Unmapped Node Positions" so this distinction is
+    // visible instead of silently folded into (or dropped from) the
+    // element's normal per-node Sub-Components positions.
+    const unmappedNodePositions = new Map();
+    qsa(mainDoc, 'Object[type="Core/Diagram.RepresentationGroup"]').forEach(group => {
+        const representedId = referenceTargets(group, "Represents")[0];
+        if (!representedId) return;
+        // A RepresentationGroup can represent EITHER a whole element OR one
+        // specific Node of that element (the normal per-node sub-group
+        // pattern) - only the former is "the element" for this purpose, so
+        // skip groups that represent a Node directly.
+        const representedType = (objectTypeMap.get(representedId) || "").split(".").pop();
+        if (/Node$/.test(representedType)) return;
+        const ownNodeIds = new Set(
+            (childrenByParentId.get(representedId) || [])
+                .filter(c => /Node$/.test(c.type.split(".").pop()))
+                .map(c => c.id)
+        );
+        directComponentsObjects(group, "NodePositions").forEach(obj => {
+            const t = obj.getAttribute("type") || "";
+            if (t !== "Plant/Diagram.PipingNodePosition" && t !== "Plant/Diagram.InstrumentationNodePosition" && t !== "Core/Diagram.NodePosition") return;
+            const nodeRef = referenceTargets(obj, "Node")[0] || null;
+            if (nodeRef && ownNodeIds.has(nodeRef)) return; // does legitimately represent one of this element's own nodes
+            const position = aggregatedValue(getData(obj, "Position")?.firstElementChild);
+            if (!unmappedNodePositions.has(representedId)) unmappedNodePositions.set(representedId, []);
+            unmappedNodePositions.get(representedId).push({ id: obj.getAttribute("id") || "", type: t, position, nodeRef });
+        });
     });
 
     // Resolve a raw Data value (plain string, or a DataReference to an
@@ -1203,7 +1263,7 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         if (overlays.length) el.labelOverlays = overlays;
     });
 
-    return { elements: drawn, nodePosMap };
+    return { elements: drawn, nodePosMap, nodePositionsByNodeId, unmappedNodePositions };
 }
 
 /**

@@ -1411,6 +1411,15 @@ export default function App() {
         if (!selectedId || !parsed?.graphics?.elements) return [];
         return parsed.graphics.elements.filter(el => el.kind === "symbolUsage" && el.representedId === selectedId && el.elementRole === "label");
     }, [selectedId, parsed]);
+    // PipingNodePosition/InstrumentationNodePosition entries sitting directly
+    // in the selected element's own top-level RepresentationGroup that don't
+    // represent any of the element's own Nodes (see unmappedNodePositions in
+    // dexpiParser.js's collectGraphicalElements) - shown in the Object pane
+    // below as "Unmapped Node Positions".
+    const selectedUnmappedNodePositions = useMemo(() => {
+        if (!selectedId || !parsed?.graphics?.unmappedNodePositions) return [];
+        return parsed.graphics.unmappedNodePositions.get(selectedId) || [];
+    }, [selectedId, parsed]);
 
     const handleSelect = useCallback((id) => {
         if (!id) return;
@@ -2087,23 +2096,61 @@ export default function App() {
                                             const hasErr = childIssues.some(x => x.severity === "Error");
                                             const hasWarn = !hasErr && childIssues.some(x => x.severity === "Warning");
                                             const typeSuffix = child.type.split(".").pop();
+                                            // "Node" components (e.g. Plant/Piping.PipingNode) carry no
+                                            // position of their own in the conceptual model - their
+                                            // on-drawing position lives on the Diagram's
+                                            // PipingNodePosition/InstrumentationNodePosition object that
+                                            // represents them, indexed by conceptual Node id in
+                                            // nodePositionsByNodeId (see parseNodePositionsById in
+                                            // dexpiParser.js).
+                                            const nodePos = /Node$/.test(typeSuffix) && child.objectId
+                                                ? parsed?.graphics?.nodePositionsByNodeId?.get(child.objectId)
+                                                : null;
                                             return (
                                                 <div key={i}
                                                     onClick={() => child.objectId && handleSelect(child.objectId)}
-                                                    style={{ display: "flex", alignItems: "center", gap: 5, padding: "4px 6px", marginBottom: 3, background: "#f9fafb", borderRadius: 4, cursor: child.objectId ? "pointer" : "default", border: "1px solid #eef2f6" }}
+                                                    style={{ padding: "4px 6px", marginBottom: 3, background: "#f9fafb", borderRadius: 4, cursor: child.objectId ? "pointer" : "default", border: "1px solid #eef2f6" }}
                                                 >
-                                                    {hasErr && <span title="Has errors" style={{ color: "#cf222e", fontSize: 10, flexShrink: 0 }}>●</span>}
-                                                    {hasWarn && <span title="Has warnings" style={{ color: "#9a6700", fontSize: 10, flexShrink: 0 }}>●</span>}
-                                                    <span style={{ fontSize: 12, fontWeight: 500, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                                                        {child.label || child.objectId || typeSuffix}
-                                                    </span>
-                                                    <span style={{ fontSize: 10, color: "#aaa", flexShrink: 0 }}>{typeSuffix}</span>
-                                                    {child.children.length > 0 && (
-                                                        <span style={{ fontSize: 10, color: "#888", flexShrink: 0 }}>+{child.children.length}</span>
+                                                    <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                                                        {hasErr && <span title="Has errors" style={{ color: "#cf222e", fontSize: 10, flexShrink: 0 }}>●</span>}
+                                                        {hasWarn && <span title="Has warnings" style={{ color: "#9a6700", fontSize: 10, flexShrink: 0 }}>●</span>}
+                                                        <span style={{ fontSize: 12, fontWeight: 500, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                                            {child.label || child.objectId || typeSuffix}
+                                                        </span>
+                                                        <span style={{ fontSize: 10, color: "#aaa", flexShrink: 0 }}>{typeSuffix}</span>
+                                                        {child.children.length > 0 && (
+                                                            <span style={{ fontSize: 10, color: "#888", flexShrink: 0 }}>+{child.children.length}</span>
+                                                        )}
+                                                    </div>
+                                                    {nodePos && (
+                                                        <div style={{ fontSize: 10, color: "#888", display: "flex", flexWrap: "wrap", gap: "2px 10px", marginTop: 2 }}>
+                                                            <span>Position X: {nodePos.x}</span>
+                                                            <span>Position Y: {nodePos.y}</span>
+                                                        </div>
                                                     )}
                                                 </div>
                                             );
                                         })}
+                                    </div>
+                                )}
+                                {selectedUnmappedNodePositions.length > 0 && (
+                                    <div style={S.section}>
+                                        <div style={{ fontWeight: 600, fontSize: 12, marginBottom: 6 }} title="PipingNodePosition/InstrumentationNodePosition entries placed directly in this element's own drawing group that don't represent any of its own Nodes above - e.g. an InstrumentationNodePosition stamped at a node's location with no instrumentation connector actually using it.">
+                                            Unmapped Node Positions ({selectedUnmappedNodePositions.length})
+                                        </div>
+                                        {selectedUnmappedNodePositions.map((np, i) => (
+                                            <div key={i} style={{ marginBottom: 6, padding: "4px 6px", background: "#f9fafb", borderRadius: 4 }}>
+                                                <div style={{ fontSize: 12, fontWeight: 500, marginBottom: 2, wordBreak: "break-all" }}>{np.id || "(no id)"}</div>
+                                                <div style={{ fontSize: 11, color: "#57606a", display: "flex", flexWrap: "wrap", gap: "2px 12px" }}>
+                                                    <span>{np.type.split(".").pop()}</span>
+                                                    <span>Position X: {np.position?.x}</span>
+                                                    <span>Position Y: {np.position?.y}</span>
+                                                </div>
+                                                <div style={{ fontSize: 10, color: "#9a6700", marginTop: 2 }}>
+                                                    {np.nodeRef ? `References node "${np.nodeRef}" - not one of this element's own Nodes` : "No Node reference - doesn't represent any node"}
+                                                </div>
+                                            </div>
+                                        ))}
                                     </div>
                                 )}
                                 {selectedSymbolUsages.length > 0 && (
@@ -2117,6 +2164,10 @@ export default function App() {
                                                     <span>Scale Y: {su.scaleY}</span>
                                                     <span>Is Mirrored: {su.isMirrored ? "true" : "false"}</span>
                                                     <span>Rotation: {su.rotation}°</span>
+                                                </div>
+                                                <div style={{ fontSize: 11, color: "#57606a", display: "flex", flexWrap: "wrap", gap: "2px 12px", marginTop: 2 }}>
+                                                    <span>Position X: {su.position?.x}</span>
+                                                    <span>Position Y: {su.position?.y}</span>
                                                 </div>
                                             </div>
                                         ))}
@@ -2133,6 +2184,10 @@ export default function App() {
                                                     <span>Scale Y: {su.scaleY}</span>
                                                     <span>Is Mirrored: {su.isMirrored ? "true" : "false"}</span>
                                                     <span>Rotation: {su.rotation}°</span>
+                                                </div>
+                                                <div style={{ fontSize: 11, color: "#57606a", display: "flex", flexWrap: "wrap", gap: "2px 12px", marginTop: 2 }}>
+                                                    <span>Position X: {su.position?.x}</span>
+                                                    <span>Position Y: {su.position?.y}</span>
                                                 </div>
                                             </div>
                                         ))}
