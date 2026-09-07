@@ -21,7 +21,7 @@ It is intended to serve as a reference implementation for DEXPI 2.0 file parsing
 - **Topology tree** — full structured view of the DEXPI object model with search, expand/collapse, and issue indicators
 - **Object details** — data properties, references, referenced-by, parent and sub-components for any selected object
 - **Connectivity map** — upstream/downstream/group tracing for piping and instrumentation networks
-- **Validation engine** — 34 named rules across six rule families (VAL, ERR, VAX, VAE, PRF-E, PRF) covering XML well-formedness, schema compliance, structural integrity, engineering semantics, and DISC profile conformance; additional dynamic per-property profile rules generated from loaded profiles
+- **Validation engine** — 36 named rules across six rule families (VAL, ERR, VAX, VAE, PRF-E, PRF) covering XML well-formedness, schema compliance, structural integrity, engineering semantics, and DISC profile conformance; additional dynamic per-property profile rules generated from loaded profiles
 - **Profile support** — load and validate against DISC profile files; stacked profiles with precedence rules; cross-profile symbol and attribute inheritance (attributes granted via `ClassExtension` or `DataProperty` inheritance in a base profile are honoured by all profiles that build on it)
 - **Severity configuration** — per-rule severity overrides; export/import as JSON
 - **CSV export** — full validation report as CSV for integration into QA workflows
@@ -69,6 +69,7 @@ It is intended to serve as a reference implementation for DEXPI 2.0 file parsing
 | VAX-003 | Warning | `PipingNetworkSystem` contains no `PipingNetworkSegment`; or `InstrumentationLoopFunction` contains no `ProcessInstrumentationFunction` |
 | VAX-004 | Warning | `PipingNode` is not referenced by any connection (orphaned node) |
 | VAX-005 | Info    | `PipingNetworkSegment` has no connections defined |
+| VAX-006 | Warning | A piping component has several connection points but only some are referenced by a segment — reported once per component, where VAX-004 reports each orphaned node |
 
 ### VAE — Engineering / Semantic Validation (DEXPI XML)
 
@@ -94,6 +95,7 @@ It is intended to serve as a reference implementation for DEXPI 2.0 file parsing
 |------|---------|-------------|
 | PRF-E04 | Error   | A `SymbolUsage` in the drawing references a Symbol name not declared in the profile (or any profile in the loaded stack); or the symbol's allowed types do not match the model object's DEXPI type |
 | PRF-E05 | Error   | A `PipingNodePosition` in the drawing does not align with any profile-defined connection point of the placed symbol (within 0.5 % of drawing size) |
+| PRF-E07 | Warning | An object is drawn but its `RepresentationGroup` places no `SymbolUsage`, though the profile defines at least one symbol for that class (via `MetaData/usage`) |
 | PRF-007 | Info    | A profile constraint was silently overridden by a later-loaded profile (logged when multiple profiles are stacked) |
 | PRF-{profile}-{property} | Warning | A model object is missing a property that is required (`Lower ≥ 1`) by the loaded profile's `PropertyConstraint`; property name matching handles bare, slash-prefixed, and fully-qualified forms |
 

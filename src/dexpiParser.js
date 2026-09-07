@@ -507,50 +507,6 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         if (refTargets.length) referencesByParentId.set(id, refTargets);
     });
 
-    // objectId (of a conceptual element - NOT one of its own Nodes) → [{id,
-    // type, position, nodeRef}, ...] for every PipingNodePosition/
-    // InstrumentationNodePosition sitting DIRECTLY in that element's own
-    // top-level RepresentationGroup's "NodePositions" Components (as
-    // opposed to inside a nested per-node sub-RepresentationGroup, which is
-    // the normal way a node gets positioned - see the "_1_PNP"/"_2_PNP"
-    // sub-groups each with their own Represents pointing at one specific
-    // node) whose own <References property="Node"> is either absent or
-    // doesn't resolve to one of that element's own Node children. These are
-    // graphically part of the element's representation (drawn/positioned
-    // alongside it) but don't represent any of the element's own conceptual
-    // nodes - e.g. the DiscProfile/SPPID convention of stamping an
-    // InstrumentationNodePosition onto every node's location "just in
-    // case" an instrumentation connector ever needs to dock there, whether
-    // or not one actually does in this drawing. Surfaced in App.jsx's
-    // Object pane as "Unmapped Node Positions" so this distinction is
-    // visible instead of silently folded into (or dropped from) the
-    // element's normal per-node Sub-Components positions.
-    const unmappedNodePositions = new Map();
-    qsa(mainDoc, 'Object[type="Core/Diagram.RepresentationGroup"]').forEach(group => {
-        const representedId = referenceTargets(group, "Represents")[0];
-        if (!representedId) return;
-        // A RepresentationGroup can represent EITHER a whole element OR one
-        // specific Node of that element (the normal per-node sub-group
-        // pattern) - only the former is "the element" for this purpose, so
-        // skip groups that represent a Node directly.
-        const representedType = (objectTypeMap.get(representedId) || "").split(".").pop();
-        if (/Node$/.test(representedType)) return;
-        const ownNodeIds = new Set(
-            (childrenByParentId.get(representedId) || [])
-                .filter(c => /Node$/.test(c.type.split(".").pop()))
-                .map(c => c.id)
-        );
-        directComponentsObjects(group, "NodePositions").forEach(obj => {
-            const t = obj.getAttribute("type") || "";
-            if (t !== "Plant/Diagram.PipingNodePosition" && t !== "Plant/Diagram.InstrumentationNodePosition" && t !== "Core/Diagram.NodePosition") return;
-            const nodeRef = referenceTargets(obj, "Node")[0] || null;
-            if (nodeRef && ownNodeIds.has(nodeRef)) return; // does legitimately represent one of this element's own nodes
-            const position = aggregatedValue(getData(obj, "Position")?.firstElementChild);
-            if (!unmappedNodePositions.has(representedId)) unmappedNodePositions.set(representedId, []);
-            unmappedNodePositions.get(representedId).push({ id: obj.getAttribute("id") || "", type: t, position, nodeRef });
-        });
-    });
-
     // Resolve a raw Data value (plain string, or a DataReference to an
     // enumeration literal) down to its bare name - used for the signal-
     // conveying lookup below, which needs the full representation name
@@ -1263,7 +1219,7 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         if (overlays.length) el.labelOverlays = overlays;
     });
 
-    return { elements: drawn, nodePosMap, nodePositionsByNodeId, unmappedNodePositions };
+    return { elements: drawn, nodePosMap, nodePositionsByNodeId };
 }
 
 /**

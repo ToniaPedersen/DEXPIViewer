@@ -59,7 +59,7 @@ Two load modes are available at the top of the left panel:
 
 | Mode | Description |
 |------|-------------|
-| **With profile** | Enables the **DiscProfile.xml** button and profile-specific rules (PRF-E01–E05, VAL-004, ERR-E18, ERR-E19). Use when validating against DISC profile requirements. |
+| **With profile** | Enables the **DiscProfile.xml** button and profile-specific rules (PRF-E01–E07, VAL-004, ERR-E18, ERR-E19). Use when validating against DISC profile requirements. |
 | **Internal** | Profile loading is disabled. Only DEXPI base rules fire. Use for quick structural checks without profile constraints. |
 
 To load profiles:
@@ -349,6 +349,7 @@ Rules marked **Profile required** only fire when at least one profile XML has be
 | VAX-003 | Warning | `PipingNetworkSystem` contains no `PipingNetworkSegment`; or `InstrumentationLoopFunction` contains no `ProcessInstrumentationFunction`. | |
 | VAX-004 | Warning | `PipingNode` is not referenced by any connection (orphaned node). | |
 | VAX-005 | Info | `PipingNetworkSegment` has no connections defined. | |
+| VAX-006 | Warning | A piping component has several connection points but only some are referenced by a segment (e.g. a `PipeTee` with one branch wired and two dangling). Reported once per component; VAX-004 names the individual nodes. | |
 
 ### VAE — Engineering / Semantic Validation
 
@@ -375,6 +376,7 @@ Rules marked **Profile required** only fire when at least one profile XML has be
 | PRF-E04 | Error | A `SymbolUsage` references a Symbol not declared in the profile, or the symbol's allowed types do not match the model object's DEXPI type. | ✓ |
 | PRF-E05 | Warning | A `PipingNodePosition` does not align with any profile-defined piping connection point of the placed symbol (within 0.5% of drawing size); or the connection point is designated as Auxiliary (actuator/operator port — piping must not be routed there). | ✓ |
 | PRF-E06 | Error | A `Core/Diagram.TextTemplate`'s `AttributeName` is not one of the attribute placeholders the placed symbol's own catalog `Profile/LabelTemplate`(s) actually define — even if that attribute happens to resolve to a real value elsewhere (see ERR-E20 above, which checks resolvability rather than the symbol's own declared placeholder set). | ✓ |
+| PRF-E07 | Warning | An object is drawn but its `RepresentationGroup` places no `SymbolUsage`, even though the profile defines at least one symbol for that class (via the symbol's `MetaData/usage`). Classes the profile offers no symbol for — pipes, segments, piping nodes, tees, signal lines — are skipped. | ✓ |
 | PRF-007 | Info | A profile constraint was silently overridden by a later-loaded profile (logged when multiple profiles are stacked). | ✓ |
 | PRF-{profile}-{property} | Warning | A model object is missing a property that is required (`Lower ≥ 1`) by the loaded profile's `PropertyConstraint`. Generated dynamically per property. | ✓ |
 

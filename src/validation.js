@@ -25,6 +25,7 @@ export const DEFAULT_SEVERITIES = {
     "VAX-003": { level: "Warning", score: 2 },
     "VAX-004": { level: "Warning", score: 2 },
     "VAX-005": { level: "Info",    score: 1 },
+    "VAX-006": { level: "Warning", score: 2 },
     "VAE-001": { level: "Warning", score: 2 },
     "VAE-002": { level: "Warning", score: 2 },
     "VAE-003": { level: "Warning", score: 2 },
@@ -60,6 +61,7 @@ export const DEFAULT_SEVERITIES = {
     "PRF-E04": { level: "Error",   score: 3 },
     "PRF-E05": { level: "Warning", score: 2 },
     "PRF-E06": { level: "Error",   score: 3 },
+    "PRF-E07": { level: "Warning", score: 2 },
 };
 
 export function resolveSeverity(ruleId, severityConfig) {
@@ -979,13 +981,21 @@ export function runXmlSchemaValidation(mainXml, flatTree, severityConfig, extern
 export function runStructuralValidation(flatTree, severityConfig) {
     const issues = [];
 
-    // Build set of PipingNode IDs referenced by connections
+    // Build set of PipingNode IDs referenced by connections.
+    //
+    // NOTE: a bare "node" term must NOT be included here. Every PipingNode that
+    // is drawn at all is the target of its own PipingNodePosition's
+    // References[@property="Node"] back-reference, so a `p.includes("node")`
+    // test marks every drawn node as connected and VAX-004 can never fire.
+    // (Measured on a 248-node Smart P&ID export: 0 orphans reported with the
+    // bare term, 119 without it.) SourceNode / TargetNode are still matched via
+    // the "source" / "target" terms below, so nothing real is lost.
     const connectedNodeIds = new Set();
     flatTree.forEach(node => {
         node.refs.forEach(ref => {
             const p = ref.property.toLowerCase();
             if (p.includes("startnode") || p.includes("endnode") ||
-                p.includes("source") || p.includes("target") || p.includes("node")) {
+                p.includes("source") || p.includes("target")) {
                 ref.objects.forEach(id => connectedNodeIds.add(id));
             }
         });
@@ -1085,6 +1095,245 @@ export function runStructuralValidation(flatTree, severityConfig) {
             }
         }
     });
+
+    return issues;
+}
+
+// ─── Missing Symbol Reference (PRF-E07) ──────────────────────────────────────
+//
+// If the profile declares at least one symbol for a class — via a
+// Profile/Symbol's Data[@property="MetaData/usage"] — then every drawn instance
+// of that class is expected to place one. A RepresentationGroup that represents
+// such an object but contains no Profile/SymbolUsage is drawn without its
+// symbol.
+//
+// The profile decides which classes are in scope, so nothing is hard-coded and
+// the rule stays correct as the profile grows. Classes the profile maps no
+// symbol to are silently skipped, which is what keeps pipes, segments, piping
+// nodes, tees and signal lines — none of which carry a symbol — out of the
+// results.
+//
+// Complements rather than duplicates the existing rules: VAL-004 and ERR-E17 ask
+// whether an object is represented at all; PRF-E04/E05/E06 all start from a
+// SymbolUsage that exists and check what it points at. Nothing else looks for a
+// SymbolUsage that should be there and is not.
+
+export function runMissingSymbolValidation(mainXml, profileXmlList, severityConfig, profileName = "DiscProfile") {
+    const issues = [];
+    if (!mainXml || !profileXmlList || !profileXmlList.length) return issues;
+
+    const parser = new DOMParser();
+
+    // class suffix → the symbols the profile offers for it
+    const symbolsForClass = new Map();
+    for (const xml of profileXmlList) {
+        if (!xml) continue;
+        const pdoc = parser.parseFromString(xml, "application/xml");
+        if (pdoc.querySelector("parsererror")) continue;
+        pdoc.querySelectorAll('Object[type="Profile/Symbol"]').forEach(sym => {
+            const symName = sym.getAttribute("name");
+            if (!symName) return;
+            Array.from(sym.children).forEach(d => {
+                if (d.tagName !== "Data" || d.getAttribute("property") !== "MetaData/usage") return;
+                const v = d.querySelector("String");
+                const usage = v && v.textContent ? v.textContent.trim() : "";
+                if (!usage) return;
+                const suffix = usage.split(/[./]/).pop();
+                if (!symbolsForClass.has(suffix)) symbolsForClass.set(suffix, new Set());
+                symbolsForClass.get(suffix).add(symName);
+            });
+        });
+    }
+    if (!symbolsForClass.size) return issues;
+
+    const doc = parser.parseFromString(mainXml, "application/xml");
+    if (doc.querySelector("parsererror")) return issues;
+
+    // A drawing with no Profile/SymbolUsage anywhere has no symbol layer at all —
+    // a plain DEXPI file being validated against a profile it does not use. That
+    // is one fact about the file, not one finding per object, and the other PRF
+    // rules are silent on it for the same reason, so say nothing here rather than
+    // flagging every represented object. (DEXPIORG_reference_pid.xml is such a
+    // file: 185 RepresentationGroups, 0 SymbolUsages, no profile Import.)
+    if (doc.querySelectorAll('Object[type="Profile/SymbolUsage"]').length === 0) return issues;
+
+    const byId = new Map();
+    doc.querySelectorAll("Object[id]").forEach(o => byId.set(o.getAttribute("id"), o));
+
+    const representsOf = el => {
+        const r = Array.from(el.children).find(
+            c => c.tagName === "References" && c.getAttribute("property") === "Represents");
+        if (!r) return null;
+        const t = (r.getAttribute("objects") || "").split(/\s+/)[0] || "";
+        return t.startsWith("#") ? t.slice(1) : null;
+    };
+
+    // A SymbolUsage belongs to the nearest enclosing group that Represents
+    // something, so a nested sub-assembly's symbol is not credited to its parent.
+    const ownsASymbol = group => {
+        const usages = group.querySelectorAll('Object[type="Profile/SymbolUsage"]');
+        for (const su of usages) {
+            let e = su.parentNode;
+            while (e && e !== group) {
+                if (e.tagName === "Object" &&
+                    (e.getAttribute("type") || "").endsWith("Diagram.RepresentationGroup") &&
+                    representsOf(e)) break;
+                e = e.parentNode;
+            }
+            if (e === group) return true;
+        }
+        return false;
+    };
+
+    // An object is commonly represented by MORE THAN ONE group — typically one
+    // carrying the Static with the SymbolUsage and a sibling carrying only the
+    // NodePositions. So gather every group per target first and ask whether ANY
+    // of them places the symbol; judging groups one at a time reports the
+    // node-position-only sibling as missing a symbol it was never going to hold.
+    const groupsByTarget = new Map();
+    doc.querySelectorAll('Object[type="Core/Diagram.RepresentationGroup"]').forEach(group => {
+        const targetId = representsOf(group);
+        if (!targetId) return;
+        if (!groupsByTarget.has(targetId)) groupsByTarget.set(targetId, []);
+        groupsByTarget.get(targetId).push(group);
+    });
+
+    for (const [targetId, groups] of groupsByTarget) {
+        const target = byId.get(targetId);
+        if (!target) continue;                     // dangling Represents — VAL-005's job
+        const suffix = (target.getAttribute("type") || "").split(/[./]/).pop();
+        const offered = symbolsForClass.get(suffix);
+        if (!offered || !offered.size) continue;   // profile defines no symbol for this class
+        if (groups.some(g => ownsASymbol(g))) continue;
+
+        const choices = [...offered].sort();
+        const shown = choices.slice(0, 6).join(", ") + (choices.length > 6 ? `, … (${choices.length} in total)` : "");
+        const sev = resolveSeverity("PRF-E07", severityConfig);
+        issues.push({
+            objectId: targetId,
+            objectType: target.getAttribute("type") || suffix,
+            ruleId: "PRF-E07",
+            severity: sev.level,
+            score: sev.score,
+            description: `${suffix} '${targetId}' is drawn but its RepresentationGroup places no ` +
+                         `Profile/SymbolUsage, even though the profile defines ${choices.length} ` +
+                         `symbol${choices.length === 1 ? "" : "s"} for ${suffix}: ${shown}.`,
+            location: `//*[@id='${targetId}']`,
+            profileSource: profileName,
+            suggestedCorrection: `Add a Profile/SymbolUsage referencing the appropriate symbol ` +
+                                 `(${shown}) to this object's RepresentationGroup.`,
+        });
+    }
+
+    return issues;
+}
+
+// ─── Partially Connected Piping Components (VAX-006) ─────────────────────────
+//
+// A component with several piping connection points should have every one of
+// them attached to something: a tee's three branches, an inline valve's two
+// ends. When only some are referenced by a segment, the topology is incomplete
+// — the drawing may look continuous because the unused ports sit under a
+// neighbour's connected port, but the model says nothing arrives there.
+//
+// Reported once per COMPONENT, unlike VAX-004 which reports each orphaned node.
+// The two are complementary: VAX-006 is for triage ("this tee has 2 of 3
+// branches unconnected"), VAX-004 names the individual nodes.
+//
+// Deliberately NOT keyed on duplicate coordinates. Co-located connection points
+// are legitimate and normal — in the official DISC example every PipeTee has
+// its three PipingNodes at one coordinate, and all three are properly
+// referenced. Connectivity is carried by node identity, not by position. The
+// coordinates are reported only as supporting detail.
+
+export function runPartialNodeConnectivityValidation(mainXml, severityConfig) {
+    const issues = [];
+    if (!mainXml) return issues;
+
+    const doc = new DOMParser().parseFromString(mainXml, "application/xml");
+    if (doc.querySelector("parsererror")) return issues;
+
+    // PipingNode id → "x, y" of the position that draws it (detail only)
+    const nodeCoord = new Map();
+    doc.querySelectorAll('Object[type="Plant/Diagram.PipingNodePosition"]').forEach(np => {
+        const nodeRef = Array.from(np.children).find(
+            c => c.tagName === "References" && c.getAttribute("property") === "Node");
+        if (!nodeRef) return;
+        const nodeId = (nodeRef.getAttribute("objects") || "").replace(/^#/, "").trim();
+        if (!nodeId) return;
+        const posData = Array.from(np.children).find(
+            c => c.tagName === "Data" && c.getAttribute("property") === "Position");
+        if (!posData) return;
+        const agv = posData.querySelector("AggregatedDataValue");
+        if (!agv) return;
+        let x = null, y = null;
+        for (const d of agv.children) {
+            const v = d.querySelector("Double") || d.querySelector("Integer");
+            if (!v) continue;
+            const prop = d.getAttribute("property");
+            if (prop === "X") x = parseFloat(v.textContent);
+            if (prop === "Y") y = parseFloat(v.textContent);
+        }
+        if (x === null || y === null || Number.isNaN(x) || Number.isNaN(y)) return;
+        nodeCoord.set(nodeId, `${x}, ${y}`);
+    });
+
+    // Nodes a segment or connection actually attaches to. The bare "node" term
+    // is excluded for the same reason as in VAX-004 — see the note there.
+    const connectedNodeIds = new Set();
+    doc.querySelectorAll("References").forEach(ref => {
+        const p = (ref.getAttribute("property") || "").toLowerCase();
+        if (!(p.includes("startnode") || p.includes("endnode") ||
+              p.includes("source") || p.includes("target"))) return;
+        (ref.getAttribute("objects") || "").split(/\s+/).forEach(t => {
+            const id = t.replace(/^#/, "").trim();
+            if (id) connectedNodeIds.add(id);
+        });
+    });
+
+    // Group PipingNodes by the component that owns them
+    const byOwner = new Map();
+    doc.querySelectorAll('Object[type="Plant/Piping.PipingNode"]').forEach(n => {
+        const id = n.getAttribute("id");
+        if (!id) return;
+        // parent chain: <Object owner> → <Components property="Nodes"> → <Object node>
+        const owner = n.parentNode?.parentNode;
+        if (!owner || owner.tagName !== "Object") return;
+        const key = owner.getAttribute("id") || "(no id)";
+        if (!byOwner.has(key)) byOwner.set(key, { owner, nodes: [] });
+        byOwner.get(key).nodes.push(id);
+    });
+
+    for (const [ownerId, { owner, nodes }] of byOwner) {
+        if (nodes.length < 2) continue;                       // single-port items: VAX-004's job
+        const unconnected = nodes.filter(n => !connectedNodeIds.has(n));
+        if (unconnected.length === 0) continue;               // fully wired up
+
+        const ownerType = owner.getAttribute("type") || "(unknown type)";
+        const typeSuffix = ownerType.split(/[./]/).pop();
+        const connected = nodes.length - unconnected.length;
+        const distinct = new Set(nodes.map(n => nodeCoord.get(n)).filter(Boolean));
+        const colocated = distinct.size === 1 && nodes.length > 1
+            ? ` All ${nodes.length} sit at the same point (${[...distinct][0]}), so the unconnected ` +
+              `ones are hidden underneath the connected one on the drawing.`
+            : "";
+        const sev = resolveSeverity("VAX-006", severityConfig);
+        issues.push({
+            objectId: ownerId,
+            objectType: ownerType,
+            ruleId: "VAX-006",
+            severity: sev.level,
+            score: sev.score,
+            description: `${typeSuffix} '${ownerId}' has ${nodes.length} piping connection points but ` +
+                         `only ${connected} ${connected === 1 ? "is" : "are"} referenced by a segment. ` +
+                         `Unconnected: ${unconnected.join(", ")}.${colocated}`,
+            location: `//*[@id='${ownerId}']`,
+            profileSource: "Base",
+            suggestedCorrection: `Reference each connection point from the segment that attaches there, ` +
+                                 `so this ${typeSuffix}'s ${nodes.length} ports carry the topology ` +
+                                 `individually; or remove any port the component does not have.`,
+        });
+    }
 
     return issues;
 }
@@ -2863,6 +3112,7 @@ export function runFullValidation({ mainXml, flatTree, profiles, severityConfig,
     const profileLabelAttrNames = collectProfileLabelTemplateAttrNames(allProfileXmls.map(p => p.xml));
     allIssues.push(...runTextTemplateAttributeValidation(mainXml, severityConfig, profileLabelAttrNames));
     allIssues.push(...runStructuralValidation(flatTree, severityConfig));
+    allIssues.push(...runPartialNodeConnectivityValidation(mainXml, severityConfig));
     allIssues.push(...runEngineeringValidation(flatTree, severityConfig));
 
     // Build full XML string list for cross-profile symbol lookup in PRF-E04.
@@ -2895,6 +3145,13 @@ export function runFullValidation({ mainXml, flatTree, profiles, severityConfig,
         // VAL-004 (graphical representation): only meaningful when a DISC profile is active,
         // since it checks that engineering objects required by the profile appear on the diagram.
         allIssues.push(...runDiscProfileGraphicalValidation(mainXml, flatTree, severityConfig));
+    }
+
+    // PRF-E07: object drawn without the symbol its class is offered by the profile.
+    // Run once over the whole profile stack, not per profile, so a class covered
+    // by any loaded profile is only reported once.
+    if (allProfileXmlStrings.length > 0) {
+        allIssues.push(...runMissingSymbolValidation(mainXml, allProfileXmlStrings, severityConfig, discXmlName));
     }
 
     // Run symbol rules against the disc profile (loaded via "DiscProfile.xml" button) if it

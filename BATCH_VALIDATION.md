@@ -78,7 +78,7 @@ DISC TEST\
 
 ## Validating with DISC profiles
 
-Add `--profile` for each profile XML to load.  Profiles activate the PRF-E01 to PRF-E05
+Add `--profile` for each profile XML to load.  Profiles activate the PRF-E01 to PRF-E07
 symbol and constraint rules that only fire when a profile is present.
 
 ### DEXPI DISC base profile only
@@ -322,6 +322,9 @@ garbled.
 | `PRF-E04` | Error | `SymbolUsage` references a symbol not defined in the profile, or a symbol designated for a different DEXPI type |
 | `PRF-E05` | Warning | A `PipingNodePosition` does not align with any profile-defined piping connection point of the placed symbol, or is connected to an Auxiliary (actuator/operator) port — piping must not be routed to actuator ports |
 | `VAL-004` | Info | Object has no graphical representation (no `RepresentationGroup`) |
+| `VAX-004` | Warning | A `PipingNode` is not referenced by any connection (orphaned node) |
+| `VAX-006` | Warning | A piping component has several connection points but only some are referenced by a segment |
+| `PRF-E07` | Warning | An object is drawn without a `SymbolUsage`, though the profile defines a symbol for its class |
 
 ---
 
@@ -371,7 +374,7 @@ Ensure `package.json` contains `"type": "module"` (it does by default in this pr
 Also check that `node --version` is 18 or later.
 
 **Files are processed but no PRF-Exx rules fire**
-The `--profile` flag was not supplied.  Profile rules (PRF-E01 to PRF-E05) only activate
+The `--profile` flag was not supplied.  Profile rules (PRF-E01 to PRF-E07) only activate
 when at least one profile XML is loaded.
 
 **Exit code is `1` even though the summary shows zero errors**

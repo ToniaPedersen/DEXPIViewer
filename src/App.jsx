@@ -1411,15 +1411,6 @@ export default function App() {
         if (!selectedId || !parsed?.graphics?.elements) return [];
         return parsed.graphics.elements.filter(el => el.kind === "symbolUsage" && el.representedId === selectedId && el.elementRole === "label");
     }, [selectedId, parsed]);
-    // PipingNodePosition/InstrumentationNodePosition entries sitting directly
-    // in the selected element's own top-level RepresentationGroup that don't
-    // represent any of the element's own Nodes (see unmappedNodePositions in
-    // dexpiParser.js's collectGraphicalElements) - shown in the Object pane
-    // below as "Unmapped Node Positions".
-    const selectedUnmappedNodePositions = useMemo(() => {
-        if (!selectedId || !parsed?.graphics?.unmappedNodePositions) return [];
-        return parsed.graphics.unmappedNodePositions.get(selectedId) || [];
-    }, [selectedId, parsed]);
 
     const handleSelect = useCallback((id) => {
         if (!id) return;
@@ -2131,26 +2122,6 @@ export default function App() {
                                                 </div>
                                             );
                                         })}
-                                    </div>
-                                )}
-                                {selectedUnmappedNodePositions.length > 0 && (
-                                    <div style={S.section}>
-                                        <div style={{ fontWeight: 600, fontSize: 12, marginBottom: 6 }} title="PipingNodePosition/InstrumentationNodePosition entries placed directly in this element's own drawing group that don't represent any of its own Nodes above - e.g. an InstrumentationNodePosition stamped at a node's location with no instrumentation connector actually using it.">
-                                            Unmapped Node Positions ({selectedUnmappedNodePositions.length})
-                                        </div>
-                                        {selectedUnmappedNodePositions.map((np, i) => (
-                                            <div key={i} style={{ marginBottom: 6, padding: "4px 6px", background: "#f9fafb", borderRadius: 4 }}>
-                                                <div style={{ fontSize: 12, fontWeight: 500, marginBottom: 2, wordBreak: "break-all" }}>{np.id || "(no id)"}</div>
-                                                <div style={{ fontSize: 11, color: "#57606a", display: "flex", flexWrap: "wrap", gap: "2px 12px" }}>
-                                                    <span>{np.type.split(".").pop()}</span>
-                                                    <span>Position X: {np.position?.x}</span>
-                                                    <span>Position Y: {np.position?.y}</span>
-                                                </div>
-                                                <div style={{ fontSize: 10, color: "#9a6700", marginTop: 2 }}>
-                                                    {np.nodeRef ? `References node "${np.nodeRef}" - not one of this element's own Nodes` : "No Node reference - doesn't represent any node"}
-                                                </div>
-                                            </div>
-                                        ))}
                                     </div>
                                 )}
                                 {selectedSymbolUsages.length > 0 && (
