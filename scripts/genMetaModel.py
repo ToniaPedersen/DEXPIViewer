@@ -20,7 +20,10 @@ Output:
 
 Property entry format:
     DataProperty:                        "name:L:U"
-    CompositionProperty / ReferenceProperty: "name:L:U:T"
+    CompositionProperty:                     "name:L:U:T"
+    ReferenceProperty:                       "name:L:U:T:OL:OU"
+        OL/OU = the INVERSE bounds (oppositeLower / oppositeUpper): how many
+               objects may reference the same target through this property.
         name = property name (unqualified local name)
         L    = lower bound integer (0 = optional, 1+ = required, minimum count)
         U    = upper bound string  ("1" = at most one allowed, "" = unbounded)
@@ -182,8 +185,18 @@ def parse_xml(path):
                 # Compact encoding: "PropertyName:lowerBound:upperBound:targetSuffix"
                 # Example: "Items:0::PipingNetworkSegmentItem"
                 entry = f"{pname}:{lo}:{up}:{target_suffix(child)}"
-                if child.tag == "CompositionProperty": c_props.append(entry)
-                else:                                  r_props.append(entry)
+                if child.tag == "CompositionProperty":
+                    c_props.append(entry)
+                else:
+                    # ReferenceProperty carries the INVERSE bounds too:
+                    # "...:oppositeLower:oppositeUpper". oppositeUpper="1" means at
+                    # most one object may point at a given target through this
+                    # property — e.g. PipingNetworkSegment.SourceNode, where a node
+                    # may be the source of only one segment. Nothing enforced these
+                    # before, so they were never emitted.
+                    o_lo = int(child.get("oppositeLower", "0"))
+                    o_up = "1" if child.get("oppositeUpper") == "1" else ""
+                    r_props.append(f"{entry}:{o_lo}:{o_up}")
             # Other child tags (Constraint, Documentation, etc.) are ignored.
 
         # Only record the class if it has at least one property — classes with

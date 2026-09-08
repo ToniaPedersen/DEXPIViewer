@@ -340,6 +340,7 @@ Rules marked **Profile required** only fire when at least one profile XML has be
 | ERR-E18 | Error | Attribute used on a class that does not allow it per the loaded profile's `PropertyConstraint` definitions. | ✓ |
 | ERR-E19 | Error | Attribute appears more times than the upper cardinality allows per the loaded profile. | ✓ |
 | ERR-E20 | Error | A `Core/Diagram.TextTemplate`'s `AttributeName` doesn't resolve to a value anywhere reachable from the owning object (direct property, or a nested/related object up to two hops out). Skipped when the loaded profile itself recognises the attribute name somewhere in its own LabelTemplate catalogue, since such attributes are legitimately optional. | |
+| ERR-E21 | Error | More than one object references the same target through a property the meta-model bounds at one via `oppositeUpper` — 26 properties declare it, covering nodes (`SourceNode`, `TargetNode`), connector-line endpoints (`Source`, `Target`) and equipment links (`Valve`, `Sensorwell`, `MountedObject`, …). A typical cause is every branch of a tee being wired to its first node. Nine (owning class, property) pairs are excluded because the DEXPI reference files themselves breach them — see the list in `validation.js`. | |
 
 ### VAX — Structural / Topology Validation
 
@@ -349,7 +350,7 @@ Rules marked **Profile required** only fire when at least one profile XML has be
 | VAX-003 | Warning | `PipingNetworkSystem` contains no `PipingNetworkSegment`; or `InstrumentationLoopFunction` contains no `ProcessInstrumentationFunction`. | |
 | VAX-004 | Warning | `PipingNode` is not referenced by any connection (orphaned node). | |
 | VAX-005 | Info | `PipingNetworkSegment` has no connections defined. | |
-| VAX-006 | Warning | A piping component has several connection points but only some are referenced by a segment (e.g. a `PipeTee` with one branch wired and two dangling). Reported once per component; VAX-004 names the individual nodes. | |
+| VAX-006 | Warning | A piping component has several connection points but only some are referenced (e.g. a `PipeTee` with one branch wired and two dangling). Reported once per component; VAX-004 names the individual nodes. Instrumentation links count as a use, and a component an instrumentation function points at is allowed one unconnected port for the process-to-instrument tap. | |
 
 ### VAE — Engineering / Semantic Validation
 

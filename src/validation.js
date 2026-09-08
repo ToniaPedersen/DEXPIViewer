@@ -55,6 +55,7 @@ export const DEFAULT_SEVERITIES = {
     "ERR-E18": { level: "Error",   score: 3 },
     "ERR-E19": { level: "Error",   score: 3 },
     "ERR-E20": { level: "Error",   score: 3 },
+    "ERR-E21": { level: "Error",   score: 3 },
     "ERR":     { level: "Error",   score: 3 },
     "PRF-E01": { level: "Error",   score: 3 },
     "PRF-E02": { level: "Error",   score: 3 },
@@ -117,7 +118,11 @@ function buildMetaModelLookup(hierarchyPairs, propRows) {
         const set = new Set();
         const mul = new Map();
         const target = new Map();
-        if (!csv) return { set, mul, target };
+        // ReferenceProperty entries carry two extra fields, the INVERSE bounds:
+        // "name:L:U:T:OL:OU". OU === 1 means at most one object may reference a
+        // given target through this property.
+        const opp = new Map();
+        if (!csv) return { set, mul, target, opp };
         for (const entry of csv.split("|")) {
             if (!entry) continue;
             const parts = entry.split(":");
@@ -129,8 +134,13 @@ function buildMetaModelLookup(hierarchyPairs, propRows) {
             set.add(name);
             mul.set(name, { lo, up });
             if (t) target.set(name, t);
+            if (parts.length > 5) {
+                const olo = parts[4] !== "" ? parseInt(parts[4], 10) : 0;
+                const oup = parts[5] === "" ? null : parseInt(parts[5], 10);
+                opp.set(name, { lo: olo, up: oup });
+            }
         }
-        return { set, mul, target };
+        return { set, mul, target, opp };
     }
 
     const hier = new Map();
@@ -147,7 +157,7 @@ function buildMetaModelLookup(hierarchyPairs, propRows) {
         direct.set(cls, {
             d: dp.set, dm: dp.mul,
             c: cp.set, cm: cp.mul, ct: cp.target,
-            r: rp.set, rm: rp.mul, rt: rp.target,
+            r: rp.set, rm: rp.mul, rt: rp.target, ro: rp.opp,
         });
     }
 
@@ -161,19 +171,20 @@ function buildMetaModelLookup(hierarchyPairs, propRows) {
                 direct.set(cls, {
                     d: new Set(), dm: new Map(),
                     c: new Set(), cm: new Map(), ct: new Map(),
-                    r: new Set(), rm: new Map(), rt: new Map(),
+                    r: new Set(), rm: new Map(), rt: new Map(), ro: new Map(),
                 });
             }
             const entry = direct.get(cls);
             for (const sup of supers) {
                 const supEntry = direct.get(sup);
                 if (!supEntry) continue;
-                for (const [k, mk, tk] of [["d","dm",null], ["c","cm","ct"], ["r","rm","rt"]]) {
+                for (const [k, mk, tk, ok] of [["d","dm",null,null], ["c","cm","ct",null], ["r","rm","rt","ro"]]) {
                     for (const [prop, mul] of supEntry[mk]) {
                         if (!entry[k].has(prop)) {
                             entry[k].add(prop);
                             entry[mk].set(prop, mul);
                             if (tk && supEntry[tk].has(prop)) entry[tk].set(prop, supEntry[tk].get(prop));
+                            if (ok && supEntry[ok] && supEntry[ok].has(prop)) entry[ok].set(prop, supEntry[ok].get(prop));
                             changed = true;
                         }
                     }
@@ -981,23 +992,27 @@ export function runXmlSchemaValidation(mainXml, flatTree, severityConfig, extern
 export function runStructuralValidation(flatTree, severityConfig) {
     const issues = [];
 
-    // Build set of PipingNode IDs referenced by connections.
+    // Build set of PipingNode IDs that something in the CONCEPTUAL model uses.
     //
-    // NOTE: a bare "node" term must NOT be included here. Every PipingNode that
-    // is drawn at all is the target of its own PipingNodePosition's
-    // References[@property="Node"] back-reference, so a `p.includes("node")`
-    // test marks every drawn node as connected and VAX-004 can never fire.
-    // (Measured on a 248-node Smart P&ID export: 0 orphans reported with the
-    // bare term, 119 without it.) SourceNode / TargetNode are still matched via
-    // the "source" / "target" terms below, so nothing real is lost.
+    // Defined by what the referring object is, not by the property name. Only
+    // the diagram layer is excluded: a PipingNodePosition points at its node
+    // through References[@property="Node"], and a RepresentationGroup through
+    // "Represents". Counting those would mark every drawn node as connected and
+    // VAX-004 could never fire (measured on a 248-node Smart P&ID export: 0
+    // orphans with them, 119 without).
+    //
+    // Everything else counts, deliberately. Piping segments reach a node via
+    // SourceNode / TargetNode, but a node may equally be used by an
+    // instrumentation link — a SignalConveyingFunction or MeasuringLineFunction
+    // connecting the process to an instrument — and those are legitimate uses of
+    // the port. A name-based test would have to guess at every such property;
+    // this one cannot miss them.
+    const DIAGRAM_REFERRERS = /(NodePosition|RepresentationGroup)$/;
     const connectedNodeIds = new Set();
     flatTree.forEach(node => {
+        if (DIAGRAM_REFERRERS.test((node.type || "").split(".").pop())) return;
         node.refs.forEach(ref => {
-            const p = ref.property.toLowerCase();
-            if (p.includes("startnode") || p.includes("endnode") ||
-                p.includes("source") || p.includes("target")) {
-                ref.objects.forEach(id => connectedNodeIds.add(id));
-            }
+            ref.objects.forEach(id => connectedNodeIds.add(id));
         });
     });
 
@@ -1095,6 +1110,118 @@ export function runStructuralValidation(flatTree, severityConfig) {
             }
         }
     });
+
+    return issues;
+}
+
+// ─── Inverse Reference Cardinality (ERR-E21) ─────────────────────────────────
+//
+// Every ReferenceProperty in the DEXPI meta-model declares bounds in BOTH
+// directions. `upper` limits how many targets one object may name;
+// `oppositeUpper` limits how many objects may name the same target. For
+// example Plant.xml declares
+//
+//   <ReferenceProperty name="SourceNode" lower="0" upper="1"
+//                      oppositeLower="0" oppositeUpper="1"/>
+//
+// on PipingNetworkSegment — a segment has one source node, AND a node may be
+// the source of only one segment. The forward bound was already enforced; the
+// inverse one was not modelled at all until now, so an exporter could wire
+// three branches of a tee to a single node and nothing complained.
+//
+// Counting is per (target, owning class, property) rather than per (target,
+// property), because PipingConnection.SourceNode and
+// PipingNetworkSegment.SourceNode are different properties that happen to share
+// a name. Two different SUBclasses of one declaring class pointing at the same
+// target are therefore counted separately and can slip through — deliberately
+// the conservative direction, since a false Error is worse than a missed one.
+//
+// SCOPE: every ReferenceProperty declaring oppositeUpper is enforced, EXCEPT
+// the handful the reference files demonstrate are not honoured in practice.
+// 26 properties in Core/Plant/Process declare oppositeUpper="1"; the exclusions
+// below are the only ones any canonical file breaches, and each is excluded per
+// (owning class, property) rather than by name, so the same property stays
+// enforced on classes that do respect it.
+//
+//   Pipe / PipingNetworkSegment . SourceItem   DISC_EXAMPLE-14-10 ×14, DEXPIORG ×10
+//   Pipe / PipingNetworkSegment . TargetItem   DISC_EXAMPLE-14-10 ×2
+//   SignalConveyingFunction . Source / Target  DISC_EXAMPLE-14-10 ×2 each
+//   MaterialPort / MechanicalEnergyPort . ConnectorReference
+//                                              TennesseeEastman ×43
+//   Nozzle . Chamber                           DEXPIORG ×4
+//
+// The item-level exclusions look deliberate rather than accidental: an ITEM is a
+// component and legitimately serves several segments — through different nodes —
+// whereas a NODE is one specific port serving one connection. The remaining 20
+// properties (Valve, Sensorwell, MountedObject, InlineMeasuringElement,
+// ActuatingLocation, …) are breached by none of the four files tested, so
+// enforcing them costs nothing today and covers the cases as they arise.
+const INVERSE_CARDINALITY_EXCLUSIONS = new Set([
+    "Pipe.SourceItem", "PipingNetworkSegment.SourceItem",
+    "Pipe.TargetItem", "PipingNetworkSegment.TargetItem",
+    "SignalConveyingFunction.Source", "SignalConveyingFunction.Target",
+    "MaterialPort.ConnectorReference", "MechanicalEnergyPort.ConnectorReference",
+    "Nozzle.Chamber",
+]);
+
+export function runInverseCardinalityValidation(mainXml, severityConfig) {
+    const issues = [];
+    if (!mainXml) return issues;
+
+    const doc = new DOMParser().parseFromString(mainXml, "application/xml");
+    if (doc.querySelector("parsererror")) return issues;
+
+    const model = detectMetaModel(doc);
+    const { classPropMap } = buildMetaModelLookup(
+        model === "Process" ? PROCESS_HIERARCHY : PLANT_HIERARCHY,
+        model === "Process" ? PROCESS_PROPS     : PLANT_PROPS
+    );
+
+    // (targetId, ownerClassSuffix, property) → referencing objects
+    const tally = new Map();
+    doc.querySelectorAll("Object[type]").forEach(obj => {
+        const ownerSuffix = (obj.getAttribute("type") || "").split(/[./]/).pop();
+        const entry = classPropMap.get(ownerSuffix);
+        if (!entry || !entry.ro || !entry.ro.size) return;
+        Array.from(obj.children).forEach(ref => {
+            if (ref.tagName !== "References") return;
+            const prop = ref.getAttribute("property");
+            if (!prop) return;
+            const bounds = entry.ro.get(prop);
+            if (!bounds || bounds.up === null) return;      // inverse is unbounded
+            if (INVERSE_CARDINALITY_EXCLUSIONS.has(`${ownerSuffix}.${prop}`)) return;  // see SCOPE above
+            (ref.getAttribute("objects") || "").split(/\s+/).forEach(t => {
+                if (!t.startsWith("#")) return;             // only id references
+                const targetId = t.slice(1);
+                if (!targetId) return;
+                const key = `${targetId}\u0000${ownerSuffix}\u0000${prop}`;
+                if (!tally.has(key)) {
+                    tally.set(key, { targetId, ownerSuffix, prop, up: bounds.up, sources: [] });
+                }
+                tally.get(key).sources.push(obj.getAttribute("id") || "(no id)");
+            });
+        });
+    });
+
+    for (const { targetId, ownerSuffix, prop, up, sources } of tally.values()) {
+        if (sources.length <= up) continue;
+        const sev = resolveSeverity("ERR-E21", severityConfig);
+        const shown = sources.slice(0, 5).join(", ") + (sources.length > 5 ? `, … (${sources.length} in total)` : "");
+        issues.push({
+            objectId: targetId,
+            objectType: (doc.querySelector(`Object[id="${targetId}"]`)?.getAttribute("type")) || "(unknown type)",
+            ruleId: "ERR-E21",
+            severity: sev.level,
+            score: sev.score,
+            description: `${sources.length} ${ownerSuffix} objects reference '${targetId}' through ` +
+                         `'${prop}', but the meta-model allows at most ${up} ` +
+                         `(oppositeUpper=${up}). Referencing objects: ${shown}.`,
+            location: `//*[@id='${targetId}']`,
+            profileSource: "Base",
+            suggestedCorrection: `Point all but one of these ${ownerSuffix} objects at a different ` +
+                                 `target, so each ${prop} target is used once.`,
+        });
+    }
 
     return issues;
 }
@@ -1278,16 +1405,26 @@ export function runPartialNodeConnectivityValidation(mainXml, severityConfig) {
         nodeCoord.set(nodeId, `${x}, ${y}`);
     });
 
-    // Nodes a segment or connection actually attaches to. The bare "node" term
-    // is excluded for the same reason as in VAX-004 — see the note there.
+    // Nodes something in the conceptual model uses — see the note in VAX-004 on
+    // why this is decided by the referring object rather than the property name.
+    // Instrumentation links to a port count as a use, not as a missing pipe.
     const connectedNodeIds = new Set();
-    doc.querySelectorAll("References").forEach(ref => {
-        const p = (ref.getAttribute("property") || "").toLowerCase();
-        if (!(p.includes("startnode") || p.includes("endnode") ||
-              p.includes("source") || p.includes("target"))) return;
-        (ref.getAttribute("objects") || "").split(/\s+/).forEach(t => {
-            const id = t.replace(/^#/, "").trim();
-            if (id) connectedNodeIds.add(id);
+    // Components an instrumentation function points at. Such a component is a
+    // process-to-instrument tapping point, and one of its piping ports carries
+    // the tap rather than a pipe, so one unconnected port there is expected.
+    const instrumentTapTargets = new Set();
+    doc.querySelectorAll("Object[type]").forEach(obj => {
+        const suffix = (obj.getAttribute("type") || "").split(/[./]/).pop();
+        const isDiagram = /(NodePosition|RepresentationGroup)$/.test(suffix);
+        const isFunction = /Function$/.test(suffix);
+        Array.from(obj.children).forEach(ref => {
+            if (ref.tagName !== "References") return;
+            (ref.getAttribute("objects") || "").split(/\s+/).forEach(t => {
+                const id = t.replace(/^#/, "").trim();
+                if (!id) return;
+                if (!isDiagram) connectedNodeIds.add(id);
+                if (isFunction) instrumentTapTargets.add(id);
+            });
         });
     });
 
@@ -1308,6 +1445,10 @@ export function runPartialNodeConnectivityValidation(mainXml, severityConfig) {
         if (nodes.length < 2) continue;                       // single-port items: VAX-004's job
         const unconnected = nodes.filter(n => !connectedNodeIds.has(n));
         if (unconnected.length === 0) continue;               // fully wired up
+        // A tapping point is allowed one port that carries the instrument
+        // connection instead of a pipe. More than one is still worth reporting.
+        const isTap = instrumentTapTargets.has(ownerId);
+        if (isTap && unconnected.length <= 1) continue;
 
         const ownerType = owner.getAttribute("type") || "(unknown type)";
         const typeSuffix = ownerType.split(/[./]/).pop();
@@ -1325,8 +1466,10 @@ export function runPartialNodeConnectivityValidation(mainXml, severityConfig) {
             severity: sev.level,
             score: sev.score,
             description: `${typeSuffix} '${ownerId}' has ${nodes.length} piping connection points but ` +
-                         `only ${connected} ${connected === 1 ? "is" : "are"} referenced by a segment. ` +
-                         `Unconnected: ${unconnected.join(", ")}.${colocated}`,
+                         `only ${connected} ${connected === 1 ? "is" : "are"} referenced. ` +
+                         `Unconnected: ${unconnected.join(", ")}.${colocated}` +
+                         (isTap ? ` This component is an instrumentation tapping point, so one ` +
+                                  `unconnected port is expected and has already been allowed for.` : ""),
             location: `//*[@id='${ownerId}']`,
             profileSource: "Base",
             suggestedCorrection: `Reference each connection point from the segment that attaches there, ` +
@@ -3113,6 +3256,7 @@ export function runFullValidation({ mainXml, flatTree, profiles, severityConfig,
     allIssues.push(...runTextTemplateAttributeValidation(mainXml, severityConfig, profileLabelAttrNames));
     allIssues.push(...runStructuralValidation(flatTree, severityConfig));
     allIssues.push(...runPartialNodeConnectivityValidation(mainXml, severityConfig));
+    allIssues.push(...runInverseCardinalityValidation(mainXml, severityConfig));
     allIssues.push(...runEngineeringValidation(flatTree, severityConfig));
 
     // Build full XML string list for cross-profile symbol lookup in PRF-E04.

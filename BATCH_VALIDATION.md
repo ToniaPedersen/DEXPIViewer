@@ -323,8 +323,9 @@ garbled.
 | `PRF-E05` | Warning | A `PipingNodePosition` does not align with any profile-defined piping connection point of the placed symbol, or is connected to an Auxiliary (actuator/operator) port — piping must not be routed to actuator ports |
 | `VAL-004` | Info | Object has no graphical representation (no `RepresentationGroup`) |
 | `VAX-004` | Warning | A `PipingNode` is not referenced by any connection (orphaned node) |
-| `VAX-006` | Warning | A piping component has several connection points but only some are referenced by a segment |
+| `VAX-006` | Warning | A piping component has several connection points but only some are referenced (an instrumentation tapping point is allowed one unconnected port) |
 | `PRF-E07` | Warning | An object is drawn without a `SymbolUsage`, though the profile defines a symbol for its class |
+| `ERR-E21` | Error | Several objects reference the same target through a property whose meta-model `oppositeUpper` bound is 1 |
 
 ---
 

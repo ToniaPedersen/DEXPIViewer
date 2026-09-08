@@ -21,7 +21,7 @@ It is intended to serve as a reference implementation for DEXPI 2.0 file parsing
 - **Topology tree** — full structured view of the DEXPI object model with search, expand/collapse, and issue indicators
 - **Object details** — data properties, references, referenced-by, parent and sub-components for any selected object
 - **Connectivity map** — upstream/downstream/group tracing for piping and instrumentation networks
-- **Validation engine** — 36 named rules across six rule families (VAL, ERR, VAX, VAE, PRF-E, PRF) covering XML well-formedness, schema compliance, structural integrity, engineering semantics, and DISC profile conformance; additional dynamic per-property profile rules generated from loaded profiles
+- **Validation engine** — 37 named rules across six rule families (VAL, ERR, VAX, VAE, PRF-E, PRF) covering XML well-formedness, schema compliance, structural integrity, engineering semantics, and DISC profile conformance; additional dynamic per-property profile rules generated from loaded profiles
 - **Profile support** — load and validate against DISC profile files; stacked profiles with precedence rules; cross-profile symbol and attribute inheritance (attributes granted via `ClassExtension` or `DataProperty` inheritance in a base profile are honoured by all profiles that build on it)
 - **Severity configuration** — per-rule severity overrides; export/import as JSON
 - **CSV export** — full validation report as CSV for integration into QA workflows
@@ -60,6 +60,7 @@ It is intended to serve as a reference implementation for DEXPI 2.0 file parsing
 | ERR-E18  | Error           | Attribute used on an element whose class does not allow it per the loaded profile's `PropertyConstraint` definitions (or, absent a profile, per the base DEXPI 2.0 meta model); cross-profile class-model inheritance (`ClassExtension`, `DataProperty`) is honoured before raising |
 | ERR-E19  | Error           | Attribute appears more times than the upper cardinality allows per the loaded profile (or the base DEXPI 2.0 meta model) |
 | ERR-E20  | Error           | A `Core/Diagram.TextTemplate`'s `AttributeName` doesn't resolve to a value reachable from the owning object, per the DEXPI 2.0 meta model |
+| ERR-E21  | Error           | More than one object references the same target through a property whose meta-model `oppositeUpper` bound is 1 (nodes, connector-line endpoints, equipment links); nine class/property pairs the DEXPI reference files themselves breach are excluded |
 
 ### VAX — Structural / Topology Validation (DEXPI XML)
 
@@ -69,7 +70,7 @@ It is intended to serve as a reference implementation for DEXPI 2.0 file parsing
 | VAX-003 | Warning | `PipingNetworkSystem` contains no `PipingNetworkSegment`; or `InstrumentationLoopFunction` contains no `ProcessInstrumentationFunction` |
 | VAX-004 | Warning | `PipingNode` is not referenced by any connection (orphaned node) |
 | VAX-005 | Info    | `PipingNetworkSegment` has no connections defined |
-| VAX-006 | Warning | A piping component has several connection points but only some are referenced by a segment — reported once per component, where VAX-004 reports each orphaned node |
+| VAX-006 | Warning | A piping component has several connection points but only some are referenced — reported once per component, where VAX-004 reports each orphaned node; an instrumentation tapping point is allowed one unconnected port |
 
 ### VAE — Engineering / Semantic Validation (DEXPI XML)
 
