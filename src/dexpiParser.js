@@ -94,16 +94,71 @@ export function refName(value) {
     return "";
 }
 
+// Enumeration literals the profile gives an Abbreviation, e.g.
+//   <Package name="InformationModel"><Package name="ProcessInstrumentationFunctionTypeCodes">
+//     <Object name="ProcessShutdown" ...><Data property="Abbreviation"><String>PSD</String>
+// keyed by the DataReference an instance uses for it:
+//   "DiscProfile/InformationModel.ProcessInstrumentationFunctionTypeCodes.ProcessShutdown" -> "PSD"
+// Display only - condition matching keeps using the literal name (refName()).
+export function buildEnumAbbreviationMap(discDoc) {
+    const map = new Map();
+    const root = discDoc?.documentElement;
+    if (!root) return map;
+    const modelName = root.getAttribute("name") || "DiscProfile";
+    const walk = (pkg, path) => {
+        for (const child of Array.from(pkg.children)) {
+            if (child.tagName === "Package") { walk(child, [...path, child.getAttribute("name") || ""]); continue; }
+            if (child.tagName !== "Object") continue;
+            const name = child.getAttribute("name");
+            const abbrEl = Array.from(child.children).find(c => c.tagName === "Data" && c.getAttribute("property") === "Abbreviation");
+            const abbr = abbrEl?.querySelector("String")?.textContent?.trim();
+            if (name && abbr) map.set(`${modelName}/${[...path, name].join(".")}`, abbr);
+        }
+    };
+    walk(root, []);
+    return map;
+}
+
+// An enumeration value can also be carried as a reference property to a
+// profile literal rather than a Data value, e.g. on ControlledActuator2 in
+// DISC_EXAMPLE-14-10:
+//   <References objects="DiscProfile/InformationModel.ControlledActuatorTypeCodes.Motor" property="DiscProfile/TypeCode"/>
+// (a prefixed, non-"#" target). Returned as [property, DataReference] pairs
+// so labels can resolve them exactly like a Data DataReference.
+export function enumReferenceValues(el) {
+    const out = [];
+    for (const r of Array.from(el.children || [])) {
+        if (r.tagName !== "References") continue;
+        const prop = r.getAttribute("property") || "";
+        const target = (r.getAttribute("objects") || "").trim();
+        if (!prop || !target || target.startsWith("#") || /\s/.test(target) || !target.includes("/")) continue;
+        out.push([prop, { kind: "DataReference", value: target }]);
+    }
+    return out;
+}
+
+/** Display text for an enumeration DataReference: the profile Abbreviation when there is one, else the literal name. */
+export function enumDisplayName(value, abbreviations) {
+    const ref = typeof value === "string" ? value : value?.kind === "DataReference" ? value.value : "";
+    return (ref && abbreviations?.get(ref)) || refName(value);
+}
+
 export function parseStroke(node) {
     const color = aggregatedValue(getData(node, "Color")?.firstElementChild);
     const width = numberFromData(node, "Width", 0.25);
     const dashStyle = refName(valueFromData(node, "DashStyle")) || "Solid";
+    // Covers every Core/Diagram.DashStyle literal (ShortDash, LongDash and the
+    // combined styles used to fall through to "" and render as solid).
     const dashMap = {
         Solid: "", Dash: `${4 * width} ${2 * width}`, Dot: `${width} ${2 * width}`,
+        ShortDash: `${2 * width} ${2 * width}`, LongDash: `${8 * width} ${2 * width}`,
         DashDot: `${4 * width} ${2 * width} ${width} ${2 * width}`,
         DashDotDot: `${4 * width} ${2 * width} ${width} ${2 * width} ${width} ${2 * width}`,
+        DashShortDash: `${4 * width} ${2 * width} ${2 * width} ${2 * width}`,
+        LongDashShortDash: `${8 * width} ${2 * width} ${2 * width} ${2 * width}`,
+        LongDashShortDashShortDash: `${8 * width} ${2 * width} ${2 * width} ${2 * width} ${2 * width} ${2 * width}`,
     };
-    return { color: parseColor(color), width, dashArray: dashMap[dashStyle] || "", dashOffset: numberFromData(node, "Offset", 0) };
+    return { color: parseColor(color), width, dashStyle, dashArray: dashMap[dashStyle] || "", dashOffset: numberFromData(node, "Offset", 0) };
 }
 
 export function parseFill(node) {
@@ -453,6 +508,7 @@ const SIGNAL_CONVEYING_DASH_ARRAY = "3 2";
 export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
     const { byElementId: nodePosMap, byNodeId: nodePositionsByNodeId } = parseNodePositionsById(mainDoc);
     const drawn = [];
+    const enumAbbreviations = buildEnumAbbreviationMap(discDoc);
 
     // Build objectId → Map<propertyName, rawDataValue> for condition evaluation,
     // and objectId → type (used by signalConveyingTypeFor() below to restrict
@@ -493,6 +549,8 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
             const prop = d.getAttribute("property");
             if (prop) props.set(prop, dataValue(d));
         });
+        // Enumeration values held as a reference to a profile literal (see enumReferenceValues()).
+        enumReferenceValues(el).forEach(([prop, v]) => { if (!props.has(prop)) props.set(prop, v); });
         if (props.size) objectDataMap.set(id, props);
 
         let p = el.parentNode;
@@ -589,7 +647,7 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         if (typeof raw === "string") return raw;
         if (typeof raw === "number") return String(raw);
         if (typeof raw === "boolean") return raw ? "true" : "false";
-        if (raw.kind === "DataReference") return refName(raw);
+        if (raw.kind === "DataReference") return enumDisplayName(raw, enumAbbreviations);
         if (raw.kind === "PhysicalQuantity") {
             const val = raw.value !== null && raw.value !== undefined ? String(raw.value) : "";
             if (repType === "Units") return raw.unit || "";
@@ -666,6 +724,30 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         return (matches[idx] || matches[matches.length - 1]).id;
     }
 
+    // Turns a VB-style LabelTemplate formula into plain template text:
+    // parts joined by "&" outside quotes are concatenated, a quoted part
+    // keeps its inner text verbatim (spaces included), unquoted parts are
+    // trimmed. Unbalanced edge quotes from older profiles ("H=' & ...")
+    // are dropped. Text with no "&" and no quotes is returned unchanged.
+    function unwrapLabelFormula(text) {
+        if (!/[&']/.test(text)) return text;
+        if ((text.match(/'/g) || []).length % 2) return text.replace(/'\s*&\s*/g, "").replace(/^'|'$/g, "");
+        const parts = [];
+        let cur = "", inQuote = false;
+        for (const ch of text) {
+            if (ch === "'") { inQuote = !inQuote; cur += ch; }
+            else if (ch === "&" && !inQuote) { parts.push(cur); cur = ""; }
+            else cur += ch;
+        }
+        parts.push(cur);
+        return parts.map(part => {
+            const t = part.trim();
+            const m = /^'([^']*)'$/.exec(t);
+            if (m) return m[1];
+            return t.replace(/^'|'$/g, "");
+        }).join("");
+    }
+
     // Fallback for a DiscProfile-symbol label whose own Text carries no
     // Template: substitute <PlaceholderName> tokens in the matching symbol
     // variant's Profile/LabelTemplate.Text against representedId's own (or,
@@ -703,7 +785,12 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         // the "&" concatenation operator), not text meant to be shown. Strip
         // it so the literal "H=" prefix runs directly into the resolved
         // value (e.g. "H=100"), not "H=' & 100".
-        const labelTemplateText = rawLabelTemplateText.replace(/'\s*&\s*/g, "");
+        // Newer profiles (e.g. DISCDEXPI_2026Pack, symbols ND0006/ND0270/
+        // ND0271) quote the literal on BOTH sides - "'SP = ' & <SetPoint>",
+        // "'H=' & SignalConveyingFunction:<AlarmValue>" - so the opening
+        // quote must go too, not just the "' & " joint; otherwise the label
+        // renders as "'SP = 5". See unwrapLabelFormula() above.
+        const labelTemplateText = unwrapLabelFormula(rawLabelTemplateText);
         if (!/[<>]/.test(labelTemplateText)) return labelTemplateText;
         const portStatusHint = extractPortStatusHint(labelTemplateText);
         // Only ONE failure mode suppresses the whole template (returns null
@@ -952,9 +1039,18 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
     // isDiscProfileLabel/profileText at render time — both fields are always
     // computed and attached here regardless of the checkbox state.
     const discSymbolByRepresentedId = new Map();
+    // ALL DiscProfile symbols placed for each represented object (e.g. a
+    // valve body ND0193B plus its tag bubble ND0248B) - used by
+    // resolveFilteredTemplateFragments() so an attribute is valid if ANY of
+    // the object's placed symbols offers it as a LabelTemplate placeholder.
+    const discSymbolsByRepresentedId = new Map();
     drawn.forEach(el => {
-        if (el.kind === "symbolUsage" && el.representedId && el.symbol?.key?.startsWith("DiscProfile/") && !discSymbolByRepresentedId.has(el.representedId)) {
-            discSymbolByRepresentedId.set(el.representedId, { symbol: el.symbol, variant: el.variant });
+        if (el.kind === "symbolUsage" && el.representedId && el.symbol?.key?.startsWith("DiscProfile/")) {
+            if (!discSymbolsByRepresentedId.has(el.representedId)) discSymbolsByRepresentedId.set(el.representedId, []);
+            discSymbolsByRepresentedId.get(el.representedId).push(el.symbol);
+            if (!discSymbolByRepresentedId.has(el.representedId)) {
+                discSymbolByRepresentedId.set(el.representedId, { symbol: el.symbol, variant: el.variant });
+            }
         }
     });
 
@@ -1003,8 +1099,10 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         return fragments.map(f => {
             if (f.kind === "literal") return f.text || "";
             if (f.kind === "attr") {
-                const discInfoForFrag = f.objectId ? discSymbolByRepresentedId.get(f.objectId) : null;
-                const allowed = discInfoForFrag ? labelTemplateAttrsForSymbol(discInfoForFrag.symbol) : null;
+                const symsForFrag = f.objectId ? discSymbolsByRepresentedId.get(f.objectId) : null;
+                const allowed = symsForFrag
+                    ? new Set(symsForFrag.flatMap(sym => [...(labelTemplateAttrsForSymbol(sym) || [])]))
+                    : null;
                 if (allowed && allowed.size) {
                     const bare = f.attributeName.split("/").pop();
                     if (!allowed.has(f.attributeName) && !allowed.has(bare)) return "";
@@ -1551,7 +1649,8 @@ export function parseDexpiPackage(mainXml, discProfileXml) {
         }
         return raw;
     })();
-    return { mainDoc, discDoc, tree, flatTree, treeMap, symbolMap, graphics, meta, connectivityMap, heatTraceSet };
+    const enumAbbreviations = buildEnumAbbreviationMap(discDoc);
+    return { mainDoc, discDoc, tree, flatTree, treeMap, symbolMap, graphics, meta, connectivityMap, heatTraceSet, enumAbbreviations };
 }
 
 export function boundsFromElements(graphics) {

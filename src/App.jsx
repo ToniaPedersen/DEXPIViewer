@@ -6,6 +6,43 @@ import {
     parseColor, collectModelValidIds, isConnectivityRefProperty,
 } from "./dexpiParser.js";
 import { jsPDF } from "jspdf";
+import { version as APP_VERSION } from "../package.json";
+import { buildXlsxBlob } from "./xlsxBlob.js";
+import { collectFolderElements } from "./elementUsage.js";
+import { buildCompareGeometry, placementToBgParams, IMG_CODES, DEFAULT_COMPARE_OPTIONS } from "./imageCompare.js";
+import { pickXmlFiles, pickPngFiles, supportsDirectoryPicker, pickDirectory, pickDirectoryForWrite, relPathOf, pngPathFor, writeFileAt, validateFiles, folderResultsCsv } from "./folderValidate.js";
+
+// DiscProfile.xml loaded automatically at startup (public repo). A profile
+// picked by hand replaces it; "x" unloads it as before.
+const DEFAULT_PROFILE_URL = "https://raw.githubusercontent.com/ToniaPedersen/DISCDEXPI_2026Pack/main/Profile/xml/DiscProfile.xml";
+const DEFAULT_PROFILE_NAME = "DiscProfile.xml (DISCDEXPI_2026Pack)";
+
+// ---------- Hide elements with issues (persisted in localStorage) ----------
+// Mode: "All" | "AllErrors" | "None" | "Custom". The preset name is stored,
+// not the expanded code list, so All / All Errors pick up new codes
+// automatically. "codes" is only used by Custom.
+const HIDE_ISSUES_KEY = "dexpiViewer.hideIssues";
+// Image compare (PNG vs DEXPI) UI: the Compare button / Compare layer
+// checkbox in BG Controls and the Compare tabs. Auto-fit and Save placement
+// stay available either way. Set to true to bring the compare back.
+const SHOW_IMAGE_COMPARE = false;
+// Default code set for the Custom mode (fill in, e.g. ["VAX-003", "ERR-E02"]).
+const DEFAULT_CUSTOM_HIDE_CODES = [];
+const HIDE_ISSUES_DEFAULT = { enabled: false, mode: "AllErrors", codes: DEFAULT_CUSTOM_HIDE_CODES };
+
+function loadHideIssues() {
+    try {
+        const v = JSON.parse(localStorage.getItem(HIDE_ISSUES_KEY));
+        if (v && typeof v === "object") {
+            return {
+                enabled: !!v.enabled,
+                mode: ["All", "AllErrors", "None", "Custom"].includes(v.mode) ? v.mode : HIDE_ISSUES_DEFAULT.mode,
+                codes: Array.isArray(v.codes) ? v.codes.filter(c => typeof c === "string") : DEFAULT_CUSTOM_HIDE_CODES,
+            };
+        }
+    } catch { /* storage unavailable or corrupt - fall back to defaults */ }
+    return { ...HIDE_ISSUES_DEFAULT };
+}
 
 // ---------- BG image default placement (embedded in the PNG itself) --------
 // The saved default placement ({scale, offsetX, offsetY}) is written
@@ -105,7 +142,7 @@ function png_buildTextChunk(keyword, text) {
 }
 
 // Returns new PNG bytes with any existing placement tEXt chunk removed -
-// used both standalone (Clear Default) and as the first step of writing a
+// used as the first step of writing a
 // fresh one (write always strips-then-reinserts, so there's never more than
 // one placement chunk in the file).
 function png_stripPlacementChunk(bytes) {
@@ -169,7 +206,7 @@ function readPngEmbeddedPlacement(bytes) {
  * Render a parsed data value into a human-readable string or JSX.
  * Handles PhysicalQuantity (UoM), DataReference (enums), strings, numbers, etc.
  */
-function formatDataValue(value) {
+function formatDataValue(value, enumAbbreviations = null) {
     if (value === null || value === undefined) return { text: "—", uom: null };
 
     // Physical quantity: { kind:"PhysicalQuantity", value, unit, unitRef }
@@ -181,13 +218,16 @@ function formatDataValue(value) {
     // DataReference (enumeration): { kind:"DataReference", value:"..." }
     if (value && typeof value === "object" && value.kind === "DataReference") {
         const short = value.value.split(".").pop().split("/").pop();
+        // Profile enumeration literal with an Abbreviation (e.g. ProcessShutdown -> PSD): show the abbreviation, literal name alongside.
+        const abbr = enumAbbreviations?.get(value.value);
+        if (abbr) return { text: abbr, uom: null, fullRef: value.value, literal: short };
         return { text: short, uom: null, fullRef: value.value };
     }
 
     // Generic aggregated value fallback: { kind:"AggregatedValue", type, entries }
     if (value && typeof value === "object" && value.kind === "AggregatedValue") {
         const parts = Object.entries(value.entries || {})
-            .map(([k, v]) => `${k}: ${formatDataValue(v).text}`).join(", ");
+            .map(([k, v]) => `${k}: ${formatDataValue(v, enumAbbreviations).text}`).join(", ");
         return { text: parts || `(${value.type})`, uom: null };
     }
 
@@ -960,36 +1000,6 @@ function TreeNode({ node, selectedId, onSelect, expanded, setExpanded, level, is
     );
 }
 
-// ---------- Severity Editor --------------------------------------------------
-
-function SeverityEditor({ issues, severityConfig, onUpdate }) {
-    const ruleIds = useMemo(() => [...new Set(issues.map(i => i.ruleId))].sort(), [issues]);
-    if (!ruleIds.length) return <div style={{ color: "#888", fontSize: 13 }}>Run validation first to see rules.</div>;
-    const scoreFor = l => l === "Error" ? 3 : l === "Warning" ? 2 : l === "Info" ? 1 : 0;
-    const dotColor = l => l === "Error" ? "#cf222e" : l === "Warning" ? "#9a6700" : l === "Info" ? "#0969da" : "#aaa";
-    return (
-        <div>
-            {ruleIds.map(ruleId => {
-                const effective = resolveSeverity(ruleId, severityConfig);
-                const overridden = !!severityConfig[ruleId];
-                return (
-                    <div key={ruleId} style={{ marginBottom: 6, display: "flex", alignItems: "center", gap: 6, padding: "4px 6px", borderRadius: 4, background: overridden ? "#f0f7ff" : "transparent" }}>
-                        <span style={{ width: 8, height: 8, borderRadius: "50%", background: dotColor(effective.level), flexShrink: 0, display: "inline-block" }} />
-                        <span style={{ fontSize: 12, flex: 1, overflow: "hidden", textOverflow: "ellipsis", fontFamily: "monospace" }} title={ruleId}>{ruleId}</span>
-                        <select value={effective.level} onChange={e => { const l = e.target.value; onUpdate(ruleId, { level: l, score: scoreFor(l) }); }} style={{ fontSize: 12, padding: "2px 4px", border: "1px solid #c7ced6", borderRadius: 4 }}>
-                            <option value="Error">Error</option>
-                            <option value="Warning">Warning</option>
-                            <option value="Info">Info</option>
-                            <option value="Ignore">Ignore</option>
-                        </select>
-                        {overridden && <button title="Reset to default" style={{ fontSize: 10, padding: "1px 5px", border: "1px solid #c7ced6", borderRadius: 4, cursor: "pointer", background: "white", color: "#57606a" }} onClick={() => onUpdate(ruleId, null)}>↺</button>}
-                    </div>
-                );
-            })}
-        </div>
-    );
-}
-
 // ---------- App --------------------------------------------------------------
 
 export default function App() {
@@ -1013,20 +1023,26 @@ export default function App() {
     const [panStart, setPanStart] = useState(null);
     const [bgImage, setBgImage] = useState(null);
     const [showBgControls, setShowBgControls] = useState(false);
-    // "Go to X/Y": lets the user paste/type a drawing-coordinate point (e.g.
-    // "281.402440417167, 454.852545971671") and jump the view there instead
-    // of hunting for it by panning/zooming. goToInput holds the raw text
-    // field; goToMarker (once a jump succeeds) is the drawing point a
-    // crosshair is drawn at, in the same coordinate space as viewBox/
-    // fullBounds - see the crosshair <g> rendered on top of the SVG below.
-    const [goToInput, setGoToInput] = useState("");
-    const [goToMarker, setGoToMarker] = useState(null);
+    // Folder tab (ported from AKSODEXPIViewer): validation results for every
+    // .xml in a picked folder, plus the Save PNG run. Null until a run ends.
+    const [folderResults, setFolderResults] = useState(null);
+    const [folderProgress, setFolderProgress] = useState(null); // { done, total, name }
+    const [folderFilter, setFolderFilter] = useState("All");
+    const [folderName, setFolderName] = useState("");
+    const [collapsedFolderFiles, setCollapsedFolderFiles] = useState(new Set());
+    const [pngProgress, setPngProgress] = useState(null);
+    const [elemProgress, setElemProgress] = useState(null);
+    const [pngResult, setPngResult] = useState(null);
+    // True while Save PNG renders each file through the drawing view - hides the BG image so it isn't baked in.
+    const [batchPng, setBatchPng] = useState(false);
+    // Startup fetch of DEFAULT_PROFILE_URL: "loading" | "loaded" | "error".
+    const [defaultProfileState, setDefaultProfileState] = useState("loading");
     const [profiles, setProfiles] = useState([]);
     const [validationIssues, setValidationIssues] = useState([]);
     const [validationDone, setValidationDone] = useState(false);
     const [validationFilter, setValidationFilter] = useState("All");
     const [collapsedCodeGroups, setCollapsedCodeGroups] = useState(new Set());
-    const [severityConfig, setSeverityConfig] = useState({});
+    const [severityConfig] = useState({});
     // Connectivity checkbox: checking it SHOWS the upstream/downstream/group
     // highlight for the selected object; unchecked (the default) hides it.
     // See connectivityHighlight below and the legend near the drawing canvas,
@@ -1042,6 +1058,12 @@ export default function App() {
     // 100 = unchanged (no-op), so nothing is boosted until the user raises it.
     const [lineBoostPct, setLineBoostPct] = useState(100);
     const [boostSymbolOutlines, setBoostSymbolOutlines] = useState(false);
+    // Hide elements with issues: checkbox + code-set mode, persisted per browser.
+    const [hideIssues, setHideIssues] = useState(loadHideIssues);
+    const [showHideCodes, setShowHideCodes] = useState(false);
+    useEffect(() => {
+        try { localStorage.setItem(HIDE_ISSUES_KEY, JSON.stringify(hideIssues)); } catch { /* ignore */ }
+    }, [hideIssues]);
     // Profile labels: only meaningful (and only shown, see the toolbar below)
     // once a DiscProfile.xml is loaded. When checked, labels belonging to a
     // symbol placed from that DiscProfile catalogue show their
@@ -1057,6 +1079,23 @@ export default function App() {
     // nested items - blocking clicks on whatever is underneath - can be
     // pushed behind everything else via "Send to Back" in the Object panel.
     const [sentToBackIds, setSentToBackIds] = useState(new Set());
+    // Image compare (PNG BG image vs. DEXPI drawing) - see runImageCompare().
+    // cmp: last result { issues, stats, diffUrl, diffBlob, diffPlacement, placement, ranAt } or null.
+    const [cmp, setCmp] = useState(null);
+    // Running auto-fit / compare job: { kind: "fit" | "compare", phase, done, total } or null.
+    const [cmpBusy, setCmpBusy] = useState(null);
+    const [cmpView, setCmpView] = useState("markers"); // "off" | "markers" | "diff"
+    const [cmpFilter, setCmpFilter] = useState("All");
+    const [cmpShowReviewed, setCmpShowReviewed] = useState(false);
+    const [cmpSelKey, setCmpSelKey] = useState(null);
+    // Accept / Ignore / False positive decisions per issue key, saved per drawing file.
+    const [cmpDecisions, setCmpDecisions] = useState({});
+    const [cmpOpts, setCmpOpts] = useState({
+        tolMm: DEFAULT_COMPARE_OPTIONS.tolMm, searchMm: DEFAULT_COMPARE_OPTIONS.searchMm,
+        okScore: DEFAULT_COMPARE_OPTIONS.okScore, minRegionMm: DEFAULT_COMPARE_OPTIONS.minRegionMm,
+    });
+    const [fitStatus, setFitStatus] = useState(null); // { score } after an auto-fit
+    const compareWorkerRef = useRef(null);
     const toggleSendToBack = (id) => {
         if (!id) return;
         setSentToBackIds(prev => {
@@ -1129,6 +1168,45 @@ export default function App() {
         return back.concat(rest);
     }, [parsed, sentToBackIds]);
 
+    // All rule codes present in the current validation run, with severity.
+    const issueCodeList = useMemo(() => {
+        const m = new Map();
+        validationIssues.forEach(i => { if (i.ruleId && !m.has(i.ruleId)) m.set(i.ruleId, i.severity); });
+        return [...m.entries()].map(([code, severity]) => ({ code, severity })).sort((a, b) => a.code.localeCompare(b.code));
+    }, [validationIssues]);
+
+    // Codes selected for hiding, resolved from the stored mode.
+    const hiddenIssueCodes = useMemo(() => {
+        switch (hideIssues.mode) {
+            case "All": return new Set(issueCodeList.map(c => c.code));
+            case "AllErrors": return new Set(issueCodeList.filter(c => c.severity === "Error").map(c => c.code));
+            case "None": return new Set();
+            default: return new Set(hideIssues.codes);
+        }
+    }, [hideIssues, issueCodeList]);
+
+    // Object ids whose drawing elements are hidden. Issues on non-drawn
+    // sub-objects hide their nearest drawn ancestor (visualContextId).
+    const hiddenIssueIds = useMemo(() => {
+        const ids = new Set();
+        if (!hideIssues.enabled || hiddenIssueCodes.size === 0) return ids;
+        validationIssues.forEach(issue => {
+            if (!hiddenIssueCodes.has(issue.ruleId)) return;
+            const id = issue.objectId;
+            if (id && !id.startsWith("(")) {
+                id.split(",").map(x => x.trim()).filter(x => x && !x.startsWith("(") && !x.endsWith("…")).forEach(x => ids.add(x));
+            }
+            if (issue.visualContextId) ids.add(issue.visualContextId);
+        });
+        return ids;
+    }, [hideIssues.enabled, hiddenIssueCodes, validationIssues]);
+
+    const toggleHideCode = (code) => setHideIssues(h => {
+        const cur = new Set(h.mode === "Custom" ? h.codes : hiddenIssueCodes);
+        if (cur.has(code)) cur.delete(code); else cur.add(code);
+        return { ...h, mode: "Custom", codes: [...cur].sort() };
+    });
+
     // Whether a DiscProfile.xml is loaded decides the parsing behavior -
     // there's no separate mode to pick: no profile loaded means "internal",
     // a profile loaded means "with profile", full stop.
@@ -1148,13 +1226,23 @@ export default function App() {
         } catch (e) { setParseError(e.message || String(e)); }
     }
 
-    async function handleMainFile(e) {
-        const file = e.target.files?.[0]; if (!file) return;
+    const baseNameOf = (name) => name.replace(/\.[^.]+$/, "").toLowerCase();
+
+    // The DEXPI XML may be picked together with its .png: the one with the same
+    // base name (or the only .png picked) becomes the BG image.
+    async function handleMainFile(e, handleByFile = null) {
+        const picked = [...(e.target.files || [])];
+        e.target.value = "";
+        const file = picked.find(f => /\.xml$/i.test(f.name)); if (!file) return;
+        const pngs = picked.filter(f => /\.png$/i.test(f.name));
+        const png = pngs.find(f => baseNameOf(f.name) === baseNameOf(file.name)) || (pngs.length === 1 ? pngs[0] : null);
         const txt = await file.text(); setMainXmlText(txt);
         // Strip extension for CSV filename
         setMainFileName(file.name.replace(/\.[^.]+$/, ""));
         setMainFileFullName(file.name);
         rebuild(txt, discXmlText);
+        if (png) await loadBgFile(png, handleByFile?.get(png) || null);
+        else removeBg();
     }
     async function handleDiscFile(e) {
         const file = e.target.files?.[0]; if (!file) return;
@@ -1166,6 +1254,265 @@ export default function App() {
         setDiscXmlText(""); setDiscFileFullName(""); setShowProfileLabels(false);
         if (mainXmlText) rebuild(mainXmlText, "");
     }
+
+    // ---------- Default DiscProfile.xml ----------
+    // Latest values for async code (fetch / folder runs) that outlives the render it started in.
+    const mainXmlRef = useRef(""); mainXmlRef.current = mainXmlText;
+    const discXmlRef = useRef(""); discXmlRef.current = discXmlText;
+
+    // Fetches the shared DiscProfile.xml. Runs once at startup and again from
+    // the "Retry" button; a profile already loaded by hand is left alone.
+    const loadDefaultProfile = useCallback(async () => {
+        setDefaultProfileState("loading");
+        try {
+            const res = await fetch(DEFAULT_PROFILE_URL, { cache: "no-cache" });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const txt = await res.text();
+            if (discXmlRef.current) { setDefaultProfileState("loaded"); return; }
+            setDiscXmlText(txt); setDiscFileFullName(DEFAULT_PROFILE_NAME);
+            setDefaultProfileState("loaded");
+            if (mainXmlRef.current) rebuild(mainXmlRef.current, txt);
+        } catch (e) {
+            console.warn("Default DiscProfile.xml could not be loaded:", e);
+            setDefaultProfileState("error");
+        }
+    }, []);
+
+    useEffect(() => { loadDefaultProfile(); }, [loadDefaultProfile]);
+
+    // ---------- Folder tab (ported from AKSODEXPIViewer) ----------
+    const folderInputRef = useRef(null);
+    const folderPngInputRef = useRef(null);
+    // Picked files kept by path, so a file can be reopened from its row without re-picking the folder.
+    const folderFilesRef = useRef(new Map());
+    const folderCancelRef = useRef(false);
+    const pngCancelRef = useRef(false);
+    const elemCancelRef = useRef(false);
+    const folderElemInputRef = useRef(null);
+    // .png files of the validated folder (lower-cased relative path -> File or FileSystemFileHandle), for the Open button's BG image.
+    const folderPngsRef = useRef(new Map());
+
+    const folderIssues = useMemo(() => {
+        if (!folderResults) return [];
+        const out = [];
+        folderResults.forEach(r => r.issues.forEach((issue, i) => out.push({ ...issue, key: `${r.path}#${i}`, path: r.path })));
+        return out;
+    }, [folderResults]);
+
+    const folderCounts = useMemo(() => {
+        const c = { Error: 0, Warning: 0, Info: 0 };
+        folderIssues.forEach(i => { c[i.severity] = (c[i.severity] || 0) + 1; });
+        return c;
+    }, [folderIssues]);
+
+    // path -> issues, filtered by the Folder tab's type chips.
+    const folderByFile = useMemo(() => {
+        const map = new Map();
+        folderIssues.forEach(i => {
+            if (folderFilter !== "All" && i.severity !== folderFilter) return;
+            if (!map.has(i.path)) map.set(i.path, []);
+            map.get(i.path).push(i);
+        });
+        return map;
+    }, [folderIssues, folderFilter]);
+
+    const folderNameOf = (files) => {
+        const first = files[0]?.webkitRelativePath || "";
+        return first.includes("/") ? first.split("/")[0] : "";
+    };
+
+    // Directory picker where the browser has one, otherwise the folder input.
+    async function handleFolderButton() {
+        if (!supportsDirectoryPicker()) { folderInputRef.current?.click(); return; }
+        let picked = null;
+        try {
+            picked = await pickDirectory();
+        } catch (err) {
+            console.error("Folder pick failed:", err);
+            folderInputRef.current?.click();
+            return;
+        }
+        if (!picked) return;
+        runFolderValidation(picked.files, picked.name, picked.pngs);
+    }
+    function handleFolderPick(e) {
+        const picked = pickXmlFiles(e.target.files);
+        if (folderInputRef.current) folderInputRef.current.value = "";
+        runFolderValidation(picked, folderNameOf(picked), pickPngFiles(e.target.files));
+    }
+
+    // Save PNG…: writes <name>.png next to each .xml when the browser can write to the folder, otherwise downloads each PNG.
+    async function handleSavePngButton() {
+        if (!supportsDirectoryPicker()) { folderPngInputRef.current?.click(); return; }
+        let picked = null;
+        try {
+            picked = await pickDirectoryForWrite();
+        } catch (err) {
+            console.error("Folder pick failed:", err);
+            folderPngInputRef.current?.click();
+            return;
+        }
+        if (!picked) return;
+        runFolderPng(picked.files, picked.name, picked.dirHandle);
+    }
+    function handleFolderPngPick(e) {
+        const picked = pickXmlFiles(e.target.files);
+        if (folderPngInputRef.current) folderPngInputRef.current.value = "";
+        runFolderPng(picked, folderNameOf(picked), null);
+    }
+
+    const nextPaint = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+    // Renders each file through the drawing view, then restores the file that was open before.
+    async function runFolderPng(files, name, dirHandle) {
+        setLeftTab("folder");
+        setPngResult(null);
+        if (!files.length) { setPngResult({ folder: name, total: 0, saved: 0, failed: [], downloaded: !dirHandle }); return; }
+        const prevText = mainXmlRef.current;
+        const disc = discXmlRef.current;
+        pngCancelRef.current = false;
+        setBatchPng(true);
+        const failed = [];
+        let saved = 0;
+        try {
+            for (let i = 0; i < files.length; i++) {
+                if (pngCancelRef.current) break;
+                const file = files[i];
+                const rel = relPathOf(file);
+                setPngProgress({ done: i, total: files.length, name: rel });
+                try {
+                    const p = parseDexpiPackage(await file.text(), disc);
+                    const b = boundsFromElements(p.graphics);
+                    const vb = { x: b.minX, y: b.minY, w: Math.max(100, b.maxX - b.minX), h: Math.max(100, b.maxY - b.minY) };
+                    setFullBounds(b);
+                    setParsed(p);
+                    setSelectedId(null);
+                    setSentToBackIds(new Set());
+                    setViewBox(vb);
+                    const want = `${vb.x} ${vb.y} ${vb.w} ${vb.h}`;
+                    for (let f = 0; f < 60; f++) {
+                        await nextPaint();
+                        if (svgElRef.current?.getAttribute("viewBox") === want) break;
+                    }
+                    const canvas = await renderViewboxToCanvas(vb);
+                    const blob = await new Promise(resolve => canvas.toBlob(resolve, "image/png"));
+                    if (!blob) throw new Error("PNG encoding failed.");
+                    if (dirHandle) await writeFileAt(dirHandle, pngPathFor(rel), blob);
+                    else downloadBlob(blob, pngPathFor(file.name));
+                    saved++;
+                } catch (err) {
+                    failed.push({ path: rel, error: err.message || String(err) });
+                }
+            }
+        } finally {
+            setBatchPng(false);
+            setPngProgress(null);
+            if (prevText) rebuild(prevText, disc);
+            else setParsed(null);
+        }
+        setPngResult({ folder: name, total: files.length, saved, failed, downloaded: !dirHandle, cancelled: pngCancelRef.current });
+    }
+
+    // Validates every .xml found, against the currently loaded profile.
+    async function runFolderValidation(files, name, pngs) {
+        setLeftTab("folder");
+        setFolderName(name || "");
+        folderPngsRef.current = pngs || new Map();
+        if (!files.length) { setFolderResults([]); setFolderProgress(null); return; }
+        const disc = discXmlRef.current;
+        if (!disc) {
+            const go = window.confirm(
+                `No DiscProfile.xml is loaded.\n\n` +
+                `${files.length} file${files.length === 1 ? "" : "s"} will be validated without a profile, so the profile-dependent checks will report nothing.\n\n` +
+                `Validate anyway?`
+            );
+            if (!go) { setFolderProgress(null); return; }
+        }
+        folderFilesRef.current = new Map(files.map(f => [relPathOf(f), f]));
+        folderCancelRef.current = false;
+        setFolderResults(null);
+        setFolderProgress({ done: 0, total: files.length, name: relPathOf(files[0]) });
+        const results = await validateFiles(files, disc, {
+            profiles, severityConfig,
+            onProgress: setFolderProgress,
+            isCancelled: () => folderCancelRef.current,
+        });
+        setFolderResults(results);
+        setFolderProgress(null);
+        setCollapsedFolderFiles(new Set(results.map(r => r.path)));
+    }
+
+    // Loads one of the folder's files into the viewer itself.
+    async function openFolderFile(path) {
+        const file = folderFilesRef.current.get(path);
+        if (!file) return;
+        const txt = await file.text();
+        setMainXmlText(txt);
+        setMainFileName(file.name.replace(/\.[^.]+$/, ""));
+        setMainFileFullName(file.name);
+        rebuild(txt, discXmlRef.current);
+        // Carry this file's results from the folder run over to the Validation
+        // tab (same issue objects as Run Validation produces), so they don't
+        // have to be re-run after opening the drawing.
+        const folderResult = folderResults?.find(r => r.path === path);
+        if (folderResult && !folderResult.error) {
+            setValidationIssues(folderResult.issues);
+            setValidationDone(true);
+            setLeftTab(folderResult.issues.length ? "validation" : "topology");
+        } else {
+            setLeftTab("topology");
+        }
+        // Same base name .png in the validated folder becomes the BG image; otherwise the previous one is dropped.
+        const png = folderPngsRef.current.get(pngPathFor(path).toLowerCase());
+        if (png) await loadBgFile(png.getFile ? await png.getFile() : png, png.getFile ? png : null);
+        else removeBg();
+    }
+
+    // Export Element…: classes, attributes and symbols used per DEXPI 2.0 file, as an .xlsx download.
+    async function handleExportElementButton() {
+        if (!supportsDirectoryPicker()) { folderElemInputRef.current?.click(); return; }
+        let picked = null;
+        try {
+            picked = await pickDirectory();
+        } catch (err) {
+            console.error("Folder pick failed:", err);
+            folderElemInputRef.current?.click();
+            return;
+        }
+        if (!picked) return;
+        runExportElements(picked.files, picked.name);
+    }
+    function handleFolderElemPick(e) {
+        const picked = pickXmlFiles(e.target.files);
+        if (folderElemInputRef.current) folderElemInputRef.current.value = "";
+        runExportElements(picked, folderNameOf(picked));
+    }
+    async function runExportElements(files, name) {
+        setLeftTab("folder");
+        const disc = discXmlRef.current;
+        if (!disc) { alert("Load a DiscProfile.xml first - Export Element checks every class, attribute and symbol against it."); return; }
+        if (!files.length) { alert("No .xml files found in that folder."); return; }
+        elemCancelRef.current = false;
+        setElemProgress({ done: 0, total: files.length, name: "" });
+        try {
+            const sheets = await collectFolderElements(files, disc, {
+                onProgress: setElemProgress,
+                isCancelled: () => elemCancelRef.current,
+            });
+            const base = (name || "folder").replace(/[\\/:*?"<>|]+/g, "_");
+            downloadBlob(buildXlsxBlob(sheets), `${base}-elements.xlsx`);
+        } catch (err) {
+            alert("Export Element failed: " + (err.message || String(err)));
+        } finally {
+            setElemProgress(null);
+        }
+    }
+
+    function downloadFolderCsv() {
+        const csv = folderResultsCsv(folderResults || []);
+        const base = (folderName || "folder").replace(/[\\/:*?"<>|]+/g, "_");
+        downloadBlob(new Blob([csv], { type: "text/csv;charset=utf-8;" }), `${base}-validation.csv`);
+    }
     async function handleProfileFile(e) {
         const file = e.target.files?.[0]; if (!file) return;
         const xml = await file.text();
@@ -1174,8 +1521,51 @@ export default function App() {
         setProfiles(prev => [...prev, { name, xml, constraints }]);
         e.target.value = "";
     }
+    function removeBg() {
+        if (bgObjectUrlRef.current) { URL.revokeObjectURL(bgObjectUrlRef.current); bgObjectUrlRef.current = null; }
+        setBgImage(null); setShowBgControls(false);
+    }
+
+    // BG Image button: an image on its own, or a DEXPI XML picked together with its .png - then both are loaded.
+    // Where the browser has a file picker API the PNG's file handle is kept, so
+    // "Save placement" can write straight back into that same file.
+    async function handleBgButton() {
+        if (typeof window.showOpenFilePicker !== "function") { bgInputRef.current?.click(); return; }
+        let handles;
+        try {
+            handles = await window.showOpenFilePicker({
+                multiple: true,
+                types: [{
+                    description: "DEXPI XML and/or background image",
+                    accept: {
+                        "image/png": [".png"], "image/jpeg": [".jpg", ".jpeg"], "image/gif": [".gif"],
+                        "image/bmp": [".bmp"], "image/webp": [".webp"], "image/svg+xml": [".svg"], "text/xml": [".xml"],
+                    },
+                }],
+            });
+        } catch (err) {
+            if (err?.name !== "AbortError") bgInputRef.current?.click();
+            return;
+        }
+        const files = await Promise.all(handles.map(h => h.getFile()));
+        const handleByFile = new Map(files.map((file, i) => [file, handles[i]]));
+        await routeBgFiles(files, handleByFile);
+    }
     async function handleBgFile(e) {
-        const file = e.target.files?.[0]; if (!file) return;
+        const picked = [...(e.target.files || [])];
+        e.target.value = "";
+        await routeBgFiles(picked, null);
+    }
+    async function routeBgFiles(picked, handleByFile) {
+        const xml = picked.find(f => /\.xml$/i.test(f.name));
+        if (xml) { await handleMainFile({ target: { files: picked, set value(_v) { /* already cleared */ } } }, handleByFile); return; }
+        const file = picked.find(f => f.type.startsWith("image/") || /\.(png|jpe?g|gif|bmp|webp|svg)$/i.test(f.name));
+        if (file) await loadBgFile(file, handleByFile?.get(file) || null);
+    }
+
+    // fileHandle (optional): a FileSystemFileHandle for the same file, used by
+    // saveBgPlacementPng() to write the placement back into it in place.
+    async function loadBgFile(file, fileHandle = null) {
         try {
             const bytes = new Uint8Array(await file.arrayBuffer());
             const isPng = isPngBytes(bytes);
@@ -1196,52 +1586,207 @@ export default function App() {
             const probe = new Image();
             const base = {
                 src, opacity: 0, scale: placement.scale, offsetX: placement.offsetX, offsetY: placement.offsetY, visible: true,
-                // sourceBytes/isPng/fileName/embeddedPlacement support the
-                // Download-with-placement/Clear-default controls below - see
-                // downloadBgPlacementPng()/clearBgDefault().
+                // sourceBytes/isPng/fileName/embeddedPlacement/fileHandle support
+                // the Save placement / Clear default controls below - see
+                // saveBgPlacementPng().
                 sourceBytes: bytes, isPng, fileName: file.name, embeddedPlacement: embedded,
+                fileHandle: fileHandle && typeof fileHandle.createWritable === "function" ? fileHandle : null,
             };
-            probe.onload = () => setBgImage({ ...base, naturalWidth: probe.naturalWidth, naturalHeight: probe.naturalHeight });
-            probe.onerror = () => setBgImage({ ...base, naturalWidth: 0, naturalHeight: 0 });
+            setFitStatus(null);
+            // Open the BG Controls bar whenever an image has been loaded.
+            probe.onload = () => { setBgImage({ ...base, naturalWidth: probe.naturalWidth, naturalHeight: probe.naturalHeight }); setShowBgControls(true); };
+            probe.onerror = () => { setBgImage({ ...base, naturalWidth: 0, naturalHeight: 0 }); setShowBgControls(true); };
             probe.src = src;
         } catch (err) {
             alert("Could not read the selected image: " + (err.message || String(err)));
         }
-        e.target.value = "";
     }
 
-    // Embeds the current Scale/X/Y directly into a copy of the loaded PNG's
-    // bytes and immediately downloads it. The originally-selected file on
-    // disk is never modified, since a browser app has no way to do that -
-    // this always hands the user a new file instead.
-    function downloadBgPlacementPng() {
+    // Writes PNG bytes back under the loaded image's own file name: straight
+    // into the opened file when its handle is known (Chrome/Edge ask once for
+    // write permission), otherwise via a Save dialog pre-filled with the same
+    // name, or - in browsers without either API - as a download of that name.
+    // Returns the handle written to (so later saves go straight in), or null.
+    async function writeBgPngSameName(bytes) {
+        const name = bgImage?.fileName || "background.png";
+        const blob = new Blob([bytes], { type: "image/png" });
+        const writeTo = async (handle) => { const w = await handle.createWritable(); await w.write(blob); await w.close(); return handle; };
+        if (bgImage?.fileHandle) return writeTo(bgImage.fileHandle);
+        if (typeof window.showSaveFilePicker === "function") {
+            const handle = await window.showSaveFilePicker({ suggestedName: name, types: [{ description: "PNG image", accept: { "image/png": [".png"] } }] });
+            return writeTo(handle);
+        }
+        downloadBlob(blob, name);
+        return null;
+    }
+
+    // Embeds the current Scale/X/Y into the PNG's own metadata and saves it
+    // under the same file name, so the next load of it starts at this placement.
+    async function saveBgPlacementPng() {
         if (!bgImage?.isPng || !bgImage.sourceBytes) return;
         try {
             const placement = { scale: bgImage.scale, offsetX: bgImage.offsetX, offsetY: bgImage.offsetY };
             const updated = writePngEmbeddedPlacement(bgImage.sourceBytes, placement);
-            const blob = new Blob([updated], { type: "image/png" });
-            const base = (bgImage.fileName || "background").replace(/\.png$/i, "");
-            downloadBlob(blob, `${base}-placement.png`);
-            setBgImage(b => b && ({ ...b, sourceBytes: updated, embeddedPlacement: placement }));
+            const handle = await writeBgPngSameName(updated);
+            setBgImage(b => b && ({ ...b, sourceBytes: updated, embeddedPlacement: placement, fileHandle: handle || b.fileHandle }));
         } catch (err) {
+            if (err?.name === "AbortError") return;
             alert("Could not save the placement into the PNG: " + (err.message || String(err)));
         }
     }
 
-    // Removes the embedded placement from the in-memory PNG bytes and
-    // immediately downloads the result. Never touches the currently
-    // displayed placement (scale/offsetX/offsetY) - only affects what a
-    // future load of the downloaded file would apply.
-    function clearBgDefault() {
-        if (!bgImage?.isPng || !bgImage.sourceBytes) return;
+    // ---------- Image compare / auto-fit (PNG BG image vs DEXPI drawing) -----
+    // The heavy lifting runs in a module worker (imageCompare.worker.js), which
+    // keeps the last decoded image cached, so an auto-fit followed by a
+    // compare only decodes the PNG once.
+    function runCompareWorker(type, payload, onProgress) {
+        return new Promise((resolve, reject) => {
+            if (!compareWorkerRef.current) {
+                compareWorkerRef.current = new Worker(new URL("./imageCompare.worker.js", import.meta.url), { type: "module" });
+            }
+            const w = compareWorkerRef.current;
+            const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+            const cleanup = () => { w.removeEventListener("message", onMsg); w.removeEventListener("error", onErr); };
+            const onMsg = (e) => {
+                const m = e.data;
+                if (!m || m.id !== id) return;
+                if (m.type === "progress") { onProgress?.(m); return; }
+                cleanup();
+                if (m.type === "done") resolve(m.result); else reject(new Error(m.message || "Image compare failed."));
+            };
+            const onErr = (e) => { cleanup(); compareWorkerRef.current = null; reject(new Error(e.message || "The image compare worker could not start.")); };
+            w.addEventListener("message", onMsg);
+            w.addEventListener("error", onErr);
+            w.postMessage({ id, type, blob: new Blob([bgImage.sourceBytes]), cacheKey: bgImage.src, ...payload });
+        });
+    }
+
+    // Auto-fit: finds the Scale/X/Y that lays the PNG over the DEXPI drawing
+    // (uniform scale + offset), then applies it - Save placement stores it.
+    async function autoFitBg() {
+        if (!bgImage?.sourceBytes || !compareGeometry || !bgPlacement || !bgImage.naturalWidth || cmpBusy) return;
+        setCmpBusy({ kind: "fit", phase: "Starting", done: 0, total: 1 });
         try {
-            const updated = png_stripPlacementChunk(bgImage.sourceBytes);
-            const blob = new Blob([updated], { type: "image/png" });
-            const base = (bgImage.fileName || "background").replace(/\.png$/i, "");
-            downloadBlob(blob, `${base}-placement.png`);
-            setBgImage(b => b && ({ ...b, sourceBytes: updated, embeddedPlacement: null }));
+            const res = await runCompareWorker("autofit", { geometry: compareGeometry, initial: bgPlacement }, m => setCmpBusy({ kind: "fit", ...m }));
+            const p = placementToBgParams(fullBounds, bgImage.naturalWidth, bgImage.naturalHeight, res.placement);
+            setBgImage(b => b && ({ ...b, scale: p.scale, offsetX: p.offsetX, offsetY: p.offsetY }));
+            setFitStatus({ score: res.score });
         } catch (err) {
-            alert("Could not clear the embedded placement: " + (err.message || String(err)));
+            alert("Auto-fit failed: " + (err.message || String(err)));
+        } finally {
+            setCmpBusy(null);
+        }
+    }
+
+    const cmpDecisionsKey = (fileName) => `dexpiViewer.imgCompare.${fileName || "drawing"}`;
+    function loadCmpDecisions(fileName) {
+        try { return JSON.parse(localStorage.getItem(cmpDecisionsKey(fileName)) || "{}") || {}; } catch { return {}; }
+    }
+    function setCmpDecision(issueKey, patch) {
+        setCmpDecisions(prev => {
+            const cur = prev[issueKey] || {};
+            const nextEntry = { ...cur, ...patch };
+            const next = { ...prev };
+            if (!nextEntry.status && !nextEntry.comment) delete next[issueKey]; else next[issueKey] = nextEntry;
+            try { localStorage.setItem(cmpDecisionsKey(mainFileFullName), JSON.stringify(next)); } catch { /* storage unavailable */ }
+            return next;
+        });
+    }
+
+    async function runImageCompare() {
+        if (!bgImage?.sourceBytes || !compareGeometry || !bgPlacement || cmpBusy) return;
+        setCmpBusy({ kind: "compare", phase: "Starting", done: 0, total: 1 });
+        const placement = { x: bgPlacement.x, y: bgPlacement.y, width: bgPlacement.width, height: bgPlacement.height };
+        try {
+            const res = await runCompareWorker("compare", { geometry: compareGeometry, placement, options: cmpOpts }, m => setCmpBusy({ kind: "compare", ...m }));
+            const diffUrl = URL.createObjectURL(res.diffBlob);
+            // the difference image is the PNG grid (ceil(W/f) x ceil(H/f)), so it can be a few px wider than the PNG
+            const diffPlacement = {
+                x: placement.x, y: placement.y,
+                width: placement.width * (res.gridW * res.f) / res.W,
+                height: placement.height * (res.gridH * res.f) / res.H,
+            };
+            setCmp(prev => {
+                if (prev?.diffUrl) URL.revokeObjectURL(prev.diffUrl);
+                return { issues: res.issues, stats: res.stats, diffUrl, diffBlob: res.diffBlob, diffPlacement, placement, ranAt: new Date().toISOString() };
+            });
+            setCmpDecisions(loadCmpDecisions(mainFileFullName));
+            setCmpSelKey(null);
+            setLeftTab("compare");
+            setLeftCollapsed(false);
+        } catch (err) {
+            alert("Image compare failed: " + (err.message || String(err)));
+        } finally {
+            setCmpBusy(null);
+        }
+    }
+
+    // One image compare issue row - used by the Compare list (left panel) and
+    // the selected object's Compare tab (right panel).
+    function renderCmpIssueRow(issue, { showLabel = true } = {}) {
+        const dec = cmpDecisions[issue.key] || {};
+        const sel = issue.key === cmpSelKey;
+        const color = IMG_CODES[issue.code]?.color;
+        return (
+            <div key={issue.key} onClick={() => selectCmpIssue(issue)}
+                style={{ padding: "8px 10px", borderBottom: "1px solid #eef2f6", cursor: "pointer", background: sel ? "#f6f8fa" : "white", borderLeft: `3px solid ${color || "#ccc"}`, opacity: dec.status ? 0.6 : 1 }}>
+                <div style={{ display: "flex", gap: 5, alignItems: "center", marginBottom: 3 }}>
+                    <span style={{ ...S.badge(S.sevColor[issue.severity]) }}>{issue.severity}</span>
+                    <span style={{ fontSize: 11, fontFamily: "monospace", color: "#555" }}>{issue.code}</span>
+                    <span style={{ fontSize: 12, fontWeight: 600, color }}>{issue.title}</span>
+                </div>
+                {showLabel && issue.label && <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 2, wordBreak: "break-word" }}>{issue.label}</div>}
+                <div style={{ fontSize: 12, color: "#333" }}>{issue.message}</div>
+                <div style={{ display: "flex", gap: 4, marginTop: 5 }} onClick={e => e.stopPropagation()}>
+                    {[["accepted", "Accept"], ["ignored", "Ignore"], ["false-positive", "False positive"]].map(([st, l]) => (
+                        <button key={st} style={{ ...S.btnSmall, fontSize: 11, background: dec.status === st ? "#eaf2ff" : "white", borderColor: dec.status === st ? "#0969da" : "#c7ced6" }}
+                            onClick={() => setCmpDecision(issue.key, { status: dec.status === st ? undefined : st })}>{l}</button>
+                    ))}
+                </div>
+                {(sel || dec.comment) && (
+                    <input style={{ ...S.input, marginTop: 5, fontSize: 12, padding: "3px 6px" }} placeholder="Comment" value={dec.comment || ""}
+                        onClick={e => e.stopPropagation()} onChange={e => setCmpDecision(issue.key, { comment: e.target.value || undefined })} />
+                )}
+            </div>
+        );
+    }
+
+    function zoomToBox(b) {
+        if (!b) return;
+        const cx = (b.minX + b.maxX) / 2, cy = (b.minY + b.maxY) / 2;
+        const aspect = viewBox.w / viewBox.h || 1;
+        let w = Math.max(60, (b.maxX - b.minX) * 4);
+        let h = w / aspect;
+        if (h < (b.maxY - b.minY) * 4) { h = Math.max(60, (b.maxY - b.minY) * 4); w = h * aspect; }
+        setViewBox(clampViewBox({ x: cx - w / 2, y: cy - h / 2, w, h }, fullBounds));
+    }
+
+    function selectCmpIssue(issue) {
+        setCmpSelKey(issue.key);
+        zoomToBox(issue.bbox);
+        if (issue.representedId && parsed?.treeMap?.has(issue.representedId)) handleSelect(issue.representedId);
+    }
+
+    function exportCmp(kind) {
+        if (!cmp) return;
+        const base = `${exportFileBaseName()}-image-compare`;
+        const rows = cmp.issues.map(i => ({
+            code: i.code, title: i.title, severity: i.severity, object: i.label, objectType: i.objectType, objectId: i.representedId || "",
+            x: +((i.bbox.minX + i.bbox.maxX) / 2).toFixed(2), y: +((i.bbox.minY + i.bbox.maxY) / 2).toFixed(2),
+            dxMm: i.dxMm != null ? +i.dxMm.toFixed(2) : "", dyMm: i.dyMm != null ? +i.dyMm.toFixed(2) : "",
+            score: i.score != null ? +Number(i.score).toFixed(3) : "", message: i.message,
+            status: cmpDecisions[i.key]?.status || "open", comment: cmpDecisions[i.key]?.comment || "", key: i.key,
+        }));
+        if (kind === "json") {
+            const doc = { drawing: mainFileFullName, image: bgImage?.fileName || "", ranAt: cmp.ranAt, placement: cmp.placement, stats: cmp.stats, issues: rows };
+            downloadBlob(new Blob([JSON.stringify(doc, null, 2)], { type: "application/json" }), `${base}.json`);
+        } else if (kind === "csv") {
+            const cols = Object.keys(rows[0] || { code: "" });
+            const esc = v => { const t = String(v ?? ""); return /[",\n\r;]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t; };
+            const csv = [cols.join(","), ...rows.map(r => cols.map(c => esc(r[c])).join(","))].join("\r\n");
+            downloadBlob(new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8" }), `${base}.csv`);
+        } else if (kind === "png" && cmp.diffBlob) {
+            downloadBlob(cmp.diffBlob, `${base}-difference.png`);
         }
     }
 
@@ -1259,12 +1804,12 @@ export default function App() {
     // px) regardless of the viewBox's native magnitude.
     const EXPORT_LONG_EDGE_PX = 3000;
 
-    async function renderViewboxToCanvas() {
+    async function renderViewboxToCanvas(vb = viewBox) {
         const svgEl = svgElRef.current;
         if (!svgEl) throw new Error("Drawing is not ready yet.");
         const clone = svgEl.cloneNode(true);
         clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
-        const aspect = viewBox.w / viewBox.h;
+        const aspect = vb.w / vb.h;
         const pxW = Math.max(1, Math.round(aspect >= 1 ? EXPORT_LONG_EDGE_PX : EXPORT_LONG_EDGE_PX * aspect));
         const pxH = Math.max(1, Math.round(aspect >= 1 ? EXPORT_LONG_EDGE_PX / aspect : EXPORT_LONG_EDGE_PX));
         clone.setAttribute("width", String(pxW));
@@ -1446,20 +1991,6 @@ export default function App() {
         return () => el.removeEventListener("wheel", onWheel);
     }, [fullBounds]);
 
-    // Center the view on a user-typed drawing-coordinate point, keeping the
-    // current zoom level, and drop a crosshair marker there so it's easy to
-    // spot. Coordinates are in the drawing's own native units (same space as
-    // fullBounds/viewBox) - not screen pixels.
-    function goToPoint() {
-        const parts = goToInput.trim().split(/[,;\s]+/).filter(Boolean);
-        if (parts.length !== 2) return;
-        const x = parseFloat(parts[0]);
-        const y = parseFloat(parts[1]);
-        if (Number.isNaN(x) || Number.isNaN(y)) return;
-        setViewBox(v => clampViewBox({ x: x - v.w / 2, y: y - v.h / 2, w: v.w, h: v.h }, fullBounds));
-        setGoToMarker({ x, y });
-    }
-
     useEffect(() => {
         const onKeyDown = e => { if (e.code === "Space" && e.target === document.body) { e.preventDefault(); setSpaceDown(true); } };
         const onKeyUp   = e => { if (e.code === "Space") { setSpaceDown(false); setIsPanning(false); setPanStart(null); } };
@@ -1476,29 +2007,8 @@ export default function App() {
         return () => { if (bgObjectUrlRef.current) URL.revokeObjectURL(bgObjectUrlRef.current); };
     }, []);
 
-    function updateSeverity(ruleId, config) {
-        setSeverityConfig(prev => {
-            const next = { ...prev };
-            if (config === null) delete next[ruleId];
-            else next[ruleId] = config;
-            return next;
-        });
-    }
-    function exportSeverityConfig() {
-        // Export full effective config for every rule seen in the current run,
-        // so the user gets a complete file they can edit and re-import.
-        const full = {};
-        [...new Set(validationIssues.map(i => i.ruleId))].sort().forEach(id => {
-            full[id] = severityConfig[id] || resolveSeverity(id, severityConfig);
-        });
-        const b = new Blob([JSON.stringify(full, null, 2)], { type: "application/json" });
-        const u = URL.createObjectURL(b); const a = document.createElement("a");
-        a.href = u; a.download = "severity-config.json"; a.click(); URL.revokeObjectURL(u);
-    }
-    async function importSeverityConfig(e) { const f = e.target.files?.[0]; if (!f) return; try { setSeverityConfig(JSON.parse(await f.text())); } catch (_) { alert("Invalid config file."); } e.target.value = ""; }
     function expandAll() { if (!parsed) return; const ids = new Set(); flattenTree(parsed.tree).forEach(n => ids.add(n.id)); setExpanded(ids); }
     function collapseAll() { if (!parsed) return; setExpanded(new Set([parsed.tree.id])); }
-    const moveProfile = (i, dir) => setProfiles(prev => { const a = [...prev]; const j = i + dir; if (j < 0 || j >= a.length) return a; [a[i], a[j]] = [a[j], a[i]]; return a; });
 
     const issueCounts = useMemo(() => { const c = { Error: 0, Warning: 0, Info: 0 }; validationIssues.forEach(i => { c[i.severity] = (c[i.severity] || 0) + 1; }); return c; }, [validationIssues]);
     const filteredIssues = useMemo(() => validationFilter === "All" ? validationIssues : validationIssues.filter(i => i.severity === validationFilter), [validationIssues, validationFilter]);
@@ -1548,6 +2058,27 @@ export default function App() {
             height: baseH * bgImage.scale,
         };
     }, [bgImage, fullBounds, boundsW, boundsH]);
+    // Sampled DEXPI graphics for the image compare / auto-fit (imageCompare.js).
+    const compareGeometry = useMemo(() => (parsed ? buildCompareGeometry(parsed) : null), [parsed]);
+    // A new drawing or a new BG image makes the last compare result meaningless.
+    useEffect(() => {
+        setCmp(prev => { if (prev?.diffUrl) URL.revokeObjectURL(prev.diffUrl); return null; });
+        setCmpSelKey(null);
+    }, [parsed, bgImage?.src]);
+    useEffect(() => () => { compareWorkerRef.current?.terminate(); compareWorkerRef.current = null; }, []);
+    const cmpVisibleIssues = useMemo(() => {
+        if (!cmp) return [];
+        return cmp.issues.filter(i => (cmpFilter === "All" || i.code === cmpFilter) && (cmpShowReviewed || !cmpDecisions[i.key]?.status));
+    }, [cmp, cmpFilter, cmpShowReviewed, cmpDecisions]);
+    const cmpOpenCount = useMemo(() => (cmp ? cmp.issues.filter(i => !cmpDecisions[i.key]?.status).length : 0), [cmp, cmpDecisions]);
+    // Image compare issues of the selected object (and its sub-components when
+    // that highlight option is on) - shown on the right panel's Compare tab.
+    const selectedCmpIssues = useMemo(() => {
+        if (!cmp || !selectedId) return [];
+        const ids = selectedRepresentedIds?.size ? selectedRepresentedIds : new Set([selectedId]);
+        return cmp.issues.filter(i => i.representedId && (ids.has(i.representedId) || i.representedId === selectedId));
+    }, [cmp, selectedId, selectedRepresentedIds]);
+    const cmpPlacementChanged = !!(cmp && bgPlacement && (Math.abs(cmp.placement.x - bgPlacement.x) > 1e-6 || Math.abs(cmp.placement.y - bgPlacement.y) > 1e-6 || Math.abs(cmp.placement.width - bgPlacement.width) > 1e-6));
     // Tints the overlay a mid-dark blue while preserving the image's original
     // luminance/detail (mix-blend-mode "color" replaces hue+saturation only).
     const BG_TINT_COLOR = "#1e3a5f";
@@ -1561,12 +2092,31 @@ export default function App() {
             ) : (
                 <div style={S.panel}>
                     <div style={S.toolbar}>
-                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-                            <div style={{ fontWeight: 700, fontSize: 15 }}>DEXPI Verificator</div>
-                            <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-                                <button style={{ ...S.collapseBtn, fontSize: 14, fontWeight: 700, color: "#0969da", padding: "2px 7px", border: "1px solid #c7ced6", borderRadius: 4 }} title="Open User Guide" onClick={() => window.open("./UserGuide.html", "_blank", "noopener")}>?</button>
-                                <button style={S.collapseBtn} onClick={() => setLeftCollapsed(true)}>{"<"}</button>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, gap: 6 }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+                                <div style={{ fontWeight: 700, fontSize: 15, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>DEXPI Verificator <span style={{ fontWeight: 400, fontSize: 12, color: "#57606a" }} title={`Version ${APP_VERSION}`}>v{APP_VERSION.split(".").slice(0, 2).join(".")}</span></div>
+                                {/* Opens public/UserGuide.html in a new tab; the app keeps its state. Same open-book icon as AKSODEXPIViewer. */}
+                                <a
+                                    href={`${import.meta.env.BASE_URL}UserGuide.html`}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    title="Open the User Guide"
+                                    aria-label="Open the User Guide"
+                                    style={{
+                                        display: "inline-flex", alignItems: "center", justifyContent: "center",
+                                        width: 22, height: 22, flexShrink: 0, borderRadius: 5,
+                                        border: "1px solid #d0d7de", background: "white",
+                                        color: "#57606a", textDecoration: "none",
+                                    }}
+                                >
+                                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                                        <path d="M8 4.2C7.3 3.1 6.1 2.6 4 2.6H1.8v9.6H4c1.8 0 3.2.4 4 1.2" />
+                                        <path d="M8 4.2c.7-1.1 1.9-1.6 4-1.6h2.2v9.6H12c-1.8 0-3.2.4-4 1.2" />
+                                        <path d="M8 4.2v9.2" />
+                                    </svg>
+                                </a>
                             </div>
+                            <button style={S.collapseBtn} onClick={() => setLeftCollapsed(true)}>{"<"}</button>
                         </div>
                         <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                             <button style={S.btn} onClick={() => mainInputRef.current?.click()}>
@@ -1576,7 +2126,7 @@ export default function App() {
                                 DiscProfile.xml{discXmlText && <span style={S.loadedTick} title="File loaded">✓</span>}
                             </button>
                         </div>
-                        <input ref={mainInputRef} type="file" accept=".xml" style={{ display: "none" }} onChange={handleMainFile} />
+                        <input ref={mainInputRef} type="file" accept=".xml,.png" multiple style={{ display: "none" }} onChange={handleMainFile} />
                         <input ref={discInputRef} type="file" accept=".xml" style={{ display: "none" }} onChange={handleDiscFile} />
                         <input ref={profileInputRef} type="file" accept=".xml" style={{ display: "none" }} onChange={handleProfileFile} />
                         {mainFileFullName && (
@@ -1592,12 +2142,15 @@ export default function App() {
                                 <button style={{ ...S.btnDanger, padding: "1px 6px", flexShrink: 0 }} title="Remove profile (revert to internal)" onClick={clearDiscProfile}>x</button>
                             </div>
                         )}
-                        <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "#57606a", marginTop: 8 }} title="Center the drawing view on a drawing-coordinate point (same units as the drawing itself) and mark it with a crosshair. Paste as 'x, y', e.g. 281.402440417167, 454.852545971671">
-                            Go to
-                            <input type="text" value={goToInput} onChange={e => setGoToInput(e.target.value)} onKeyDown={e => { if (e.key === "Enter") goToPoint(); }} style={{ ...S.numBoxWide, width: 150 }} placeholder="x, y" />
-                            <button style={S.btnSmall} disabled={!parsed} onClick={goToPoint} title="Center the view on the X/Y point above">Go</button>
-                            {goToMarker && <button style={S.btnSmall} onClick={() => setGoToMarker(null)} title="Remove the crosshair marker">Clear</button>}
-                        </label>
+                        {!discXmlText && defaultProfileState === "loading" && (
+                            <div style={{ marginTop: 6, fontSize: 12, color: "#57606a" }}>Loading default DiscProfile.xml…</div>
+                        )}
+                        {!discXmlText && defaultProfileState === "error" && (
+                            <div style={{ marginTop: 6, fontSize: 11, color: "#9a6700", display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                                <span>Default DiscProfile.xml unavailable — load one by hand, or</span>
+                                <button style={S.btnSmall} onClick={loadDefaultProfile}>Retry</button>
+                            </div>
+                        )}
                         {parsed && <button style={{ ...S.btnPrimary, marginTop: 8, width: "100%" }} onClick={runValidation}>Run Validation</button>}
                         {validationDone && (
                             <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
@@ -1609,9 +2162,11 @@ export default function App() {
                         )}
                     </div>
 
-                    <div style={S.tabBar}>
-                        {[["topology", "Topology"], ["validation", `Validation${validationDone ? ` (${validationIssues.length})` : ""}`], ["config", "Config"]].map(([t, label]) => (
-                            <button key={t} style={S.tab(leftTab === t)} onClick={() => setLeftTab(t)}>{label}</button>
+                    <div style={{ ...S.tabBar, overflowX: "auto" }}>
+                        {[["topology", "Topology"], ["validation", `Validation${validationDone ? ` (${validationIssues.length})` : ""}`],
+                            ...(SHOW_IMAGE_COMPARE && (bgImage || cmp) ? [["compare", `Compare${cmp ? ` (${cmpOpenCount})` : ""}`]] : []),
+                            ["folder", `Folder${folderProgress ? "…" : folderIssues.length ? ` (${folderIssues.length})` : ""}`]].map(([t, label]) => (
+                            <button key={t} style={{ ...S.tab(leftTab === t), whiteSpace: "nowrap", padding: "8px 10px" }} onClick={() => setLeftTab(t)}>{label}</button>
                         ))}
                     </div>
 
@@ -1750,27 +2305,232 @@ export default function App() {
                         </div>
                     )}
 
-                    {leftTab === "config" && (
+                    {SHOW_IMAGE_COMPARE && leftTab === "compare" && (
                         <div style={S.scroll}>
-                            <div style={S.section}>
-                                {profiles.map((p, i) => (
-                                    <div key={i} style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 5, padding: "4px 8px", background: "#f6f8fa", borderRadius: 4 }}>
-                                        <span style={{ fontSize: 12, flex: 1 }}>{p.name}</span>
-                                        <span style={{ fontSize: 11, color: "#888" }}>{p.constraints.length} rules</span>
-                                        <button style={S.btnSmall} onClick={() => moveProfile(i, -1)} disabled={i === 0}>up</button>
-                                        <button style={S.btnSmall} onClick={() => moveProfile(i, 1)} disabled={i === profiles.length - 1}>dn</button>
-                                        <button style={S.btnDanger} onClick={() => setProfiles(prev => prev.filter((_, j) => j !== i))}>x</button>
+                                <div style={S.section}>
+                                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+                                        <button style={S.btnPrimary} disabled={!!cmpBusy || !parsed || !bgImage} onClick={runImageCompare} title="Compare the DEXPI drawing with the BG image at the current placement">
+                                            {cmpBusy?.kind === "compare" ? "Comparing…" : cmp ? "Re-run compare" : "Run compare"}
+                                        </button>
+                                        <button style={S.btn} disabled={!!cmpBusy || !parsed || !bgImage?.naturalWidth} onClick={autoFitBg} title="Fit the BG image to the drawing first (then Save placement in BG Controls to keep it)">
+                                            {cmpBusy?.kind === "fit" ? "Fitting…" : "Auto-fit"}
+                                        </button>
                                     </div>
-                                ))}
-                            </div>
-                            <div style={S.section}>
-                                <div style={{ fontWeight: 700, marginBottom: 8, fontSize: 13 }}>Severity Configuration</div>
-                                <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
-                                    <button style={S.btnSmall} onClick={exportSeverityConfig}>Export JSON</button>
-                                    <label style={{ ...S.btnSmall, cursor: "pointer" }}>Import JSON<input type="file" accept=".json" style={{ display: "none" }} onChange={importSeverityConfig} /></label>
+                                    {!bgImage && <div style={{ marginTop: 8, fontSize: 12, color: "#888" }}>Load a BG image (PNG of the same drawing) to compare.</div>}
+                                    {cmpBusy && <div style={{ marginTop: 8, fontSize: 12, color: "#57606a" }}>{cmpBusy.phase}{cmpBusy.total > 1 ? ` – ${Math.round(100 * cmpBusy.done / cmpBusy.total)}%` : ""}</div>}
+                                    {cmpPlacementChanged && <div style={{ marginTop: 8, fontSize: 12, color: "#9a6700" }}>The BG placement changed since this run – re-run to update.</div>}
+                                    <details style={{ marginTop: 8, fontSize: 12 }}>
+                                        <summary style={{ cursor: "pointer", color: "#57606a" }}>Settings</summary>
+                                        <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: "4px 8px", alignItems: "center", marginTop: 6 }}>
+                                            <span title="How far image ink may be from DEXPI ink and still count as matching">Match tolerance (mm)</span>
+                                            <input type="number" min={0.1} max={5} step={0.1} value={cmpOpts.tolMm} onChange={e => { const v = parseFloat(e.target.value); if (v > 0) setCmpOpts(o => ({ ...o, tolMm: v })); }} style={S.numBox} />
+                                            <span title="Objects that don't match in place are searched for within this radius (Misplaced)">Misplaced search radius (mm)</span>
+                                            <input type="number" min={0} max={30} step={0.5} value={cmpOpts.searchMm} onChange={e => { const v = parseFloat(e.target.value); if (v >= 0) setCmpOpts(o => ({ ...o, searchMm: v })); }} style={S.numBox} />
+                                            <span title="Share of an object's outline that must lie on image ink">Required match (%)</span>
+                                            <input type="number" min={30} max={100} step={5} value={Math.round(cmpOpts.okScore * 100)} onChange={e => { const v = parseFloat(e.target.value); if (v >= 30 && v <= 100) setCmpOpts(o => ({ ...o, okScore: v / 100 })); }} style={S.numBox} />
+                                            <span title="Smallest unexplained image region reported as Missing in DEXPI">Smallest missing region (mm)</span>
+                                            <input type="number" min={1} max={50} step={1} value={cmpOpts.minRegionMm} onChange={e => { const v = parseFloat(e.target.value); if (v > 0) setCmpOpts(o => ({ ...o, minRegionMm: v })); }} style={S.numBox} />
+                                        </div>
+                                    </details>
                                 </div>
-                                <SeverityEditor issues={validationIssues} severityConfig={severityConfig} onUpdate={updateSeverity} />
+                                {cmp && (
+                                    <>
+                                        <div style={S.section}>
+                                            <div style={{ display: "flex", gap: 4, alignItems: "center", fontSize: 12, marginBottom: 8 }}>
+                                                <span style={{ color: "#57606a", marginRight: 2 }}>View</span>
+                                                {[["off", "Off"], ["markers", "Markers"], ["diff", "Difference"]].map(([v, l]) => (
+                                                    <button key={v} style={{ ...S.btnSmall, background: cmpView === v ? "#eaf2ff" : "white", borderColor: cmpView === v ? "#0969da" : "#c7ced6" }} onClick={() => setCmpView(v)}>{l}</button>
+                                                ))}
+                                            </div>
+                                            {cmpView === "diff" && (
+                                                <div style={{ fontSize: 11, color: "#57606a", marginBottom: 8, lineHeight: 1.5 }}>
+                                                    <span style={{ color: "#969696" }}>■</span> matched &nbsp;
+                                                    <span style={{ color: "#dc0000" }}>■</span> image only (missing in DEXPI) &nbsp;
+                                                    <span style={{ color: "#f5a0a0" }}>■</span> image only, ignored (text / small) &nbsp;
+                                                    <span style={{ color: "#005aff" }}>■</span> DEXPI only
+                                                </div>
+                                            )}
+                                            <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                                                {[["All", cmp.issues.length], ...Object.keys(IMG_CODES).filter(c => cmp.stats.counts[c]).map(c => [c, cmp.stats.counts[c]])].map(([c, n]) => (
+                                                    <button key={c} onClick={() => setCmpFilter(c)} title={c === "All" ? "All issues" : IMG_CODES[c].title}
+                                                        style={{ ...S.btnSmall, fontSize: 11, background: cmpFilter === c ? "#eaf2ff" : "white", borderColor: cmpFilter === c ? "#0969da" : (IMG_CODES[c]?.color || "#c7ced6"), color: IMG_CODES[c]?.color || "#111" }}>
+                                                        {c === "All" ? "All" : `${c} ${IMG_CODES[c].title}`} ({n})
+                                                    </button>
+                                                ))}
+                                            </div>
+                                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 8, fontSize: 12 }}>
+                                                <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+                                                    <input type="checkbox" checked={cmpShowReviewed} onChange={e => setCmpShowReviewed(e.target.checked)} /> Show reviewed
+                                                </label>
+                                                <span style={{ display: "flex", gap: 4 }}>
+                                                    <button style={S.btnSmall} onClick={() => exportCmp("csv")} title="Download the issues with their review status as CSV">CSV</button>
+                                                    <button style={S.btnSmall} onClick={() => exportCmp("json")} title="Download the issues, settings and placement as JSON">JSON</button>
+                                                    <button style={S.btnSmall} onClick={() => exportCmp("png")} title="Download the difference image">Diff PNG</button>
+                                                </span>
+                                            </div>
+                                            <div style={{ fontSize: 11, color: "#888", marginTop: 6 }}>
+                                                {cmp.stats.checked} objects checked · {cmpOpenCount} open · {Math.round(cmp.stats.ms)} ms · {cmp.stats.pxPerMm.toFixed(1)} px/mm
+                                            </div>
+                                        </div>
+                                        {cmpVisibleIssues.length === 0 && <div style={{ padding: 12, color: "#888", fontSize: 12 }}>{cmp.issues.length ? "No open issues for this filter." : "No differences found."}</div>}
+                                        {cmpVisibleIssues.slice(0, 500).map(issue => renderCmpIssueRow(issue))}
+                                        {cmpVisibleIssues.length > 500 && <div style={{ padding: 10, fontSize: 11, color: "#888" }}>Showing the first 500 of {cmpVisibleIssues.length} – use the filters above.</div>}
+                                    </>
+                                )}
                             </div>
+                        )}
+
+                    {leftTab === "folder" && (
+                        <div style={S.scroll}>
+                            <input ref={folderInputRef} type="file" webkitdirectory="" directory="" multiple style={{ display: "none" }} onChange={handleFolderPick} />
+                            <input ref={folderPngInputRef} type="file" webkitdirectory="" directory="" multiple style={{ display: "none" }} onChange={handleFolderPngPick} />
+                            <input ref={folderElemInputRef} type="file" webkitdirectory="" directory="" multiple style={{ display: "none" }} onChange={handleFolderElemPick} />
+                            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", padding: "8px 12px", borderBottom: "1px solid #eef2f6" }}>
+                                <button style={S.btn} disabled={!!folderProgress || !!pngProgress || !!elemProgress} onClick={handleFolderButton} title="Validate every .xml in a folder, and its subfolders, against the loaded profile. The browser asks permission to read the folder; the files stay on this machine and nothing is uploaded.">
+                                    Validate…
+                                </button>
+                                <button style={S.btn} disabled={!!folderProgress || !!pngProgress || !!elemProgress} onClick={handleSavePngButton} title="Render every .xml in a folder, and its subfolders, and save each as a .png next to it. The browser asks permission to write to the folder.">
+                                    Save PNG…
+                                </button>
+                                <button style={S.btn} disabled={!!folderProgress || !!pngProgress || !!elemProgress || !discXmlText} onClick={handleExportElementButton} title={discXmlText ? "Export every class, Data attribute and placed symbol used in a folder's DEXPI 2.0 .xml files, with counts and validity against the DEXPI 2.0 meta model and the loaded DiscProfile.xml, as an Excel file." : "Load a DiscProfile.xml first"}>
+                                    Export Element…
+                                </button>
+                            </div>
+                            {elemProgress && (
+                                <div style={{ padding: 16, fontSize: 13, color: "#57606a" }}>
+                                    <div>Reading {Math.min(elemProgress.done + 1, elemProgress.total)} of {elemProgress.total}…</div>
+                                    <div style={{ marginTop: 4, fontSize: 11, fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{elemProgress.name}</div>
+                                    <button style={{ ...S.btnSmall, marginTop: 8 }} onClick={() => { elemCancelRef.current = true; }}>Stop</button>
+                                </div>
+                            )}
+                            {pngProgress && (
+                                <div style={{ padding: 16, fontSize: 13, color: "#57606a" }}>
+                                    <div>Saving PNG {Math.min(pngProgress.done + 1, pngProgress.total)} of {pngProgress.total}…</div>
+                                    <div style={{ marginTop: 4, fontSize: 11, fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{pngProgress.name}</div>
+                                    <button style={{ ...S.btnSmall, marginTop: 8 }} onClick={() => { pngCancelRef.current = true; }}>Stop</button>
+                                </div>
+                            )}
+                            {!pngProgress && pngResult && (
+                                <div style={{ margin: "8px 12px", padding: "8px 10px", fontSize: 12, background: pngResult.failed.length ? "#fff8c5" : "#dafbe1", border: "1px solid #eef2f6", borderRadius: 6 }}>
+                                    <div style={{ display: "flex", alignItems: "center" }}>
+                                        <span>
+                                            {pngResult.total === 0
+                                                ? "No .xml files found in that folder."
+                                                : `${pngResult.saved} of ${pngResult.total} PNG${pngResult.total === 1 ? "" : "s"} ${pngResult.downloaded ? "downloaded" : `saved to ${pngResult.folder || "the folder"}`}${pngResult.cancelled ? " (stopped)" : ""}.`}
+                                        </span>
+                                        <button style={{ ...S.btnSmall, marginLeft: "auto" }} onClick={() => setPngResult(null)}>×</button>
+                                    </div>
+                                    {pngResult.failed.map(f => (
+                                        <div key={f.path} style={{ marginTop: 4, fontFamily: "monospace", fontSize: 11 }} title={f.error}>{f.path}: {f.error}</div>
+                                    ))}
+                                </div>
+                            )}
+                            {folderProgress && (
+                                <div style={{ padding: 16, fontSize: 13, color: "#57606a" }}>
+                                    <div>Validating {Math.min(folderProgress.done + 1, folderProgress.total)} of {folderProgress.total}…</div>
+                                    {folderProgress.name && (
+                                        <div style={{ marginTop: 4, fontSize: 11, fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{folderProgress.name}</div>
+                                    )}
+                                    <button style={{ ...S.btnSmall, marginTop: 8 }} onClick={() => { folderCancelRef.current = true; }}>Stop</button>
+                                </div>
+                            )}
+                            {!folderProgress && !pngProgress && !elemProgress && !folderResults && (
+                                <div style={{ padding: 16, color: "#888", fontSize: 13, lineHeight: 1.5 }}>
+                                    Each button works on every .xml file in a folder and its subfolders. <b>Open</b> on a validated file also loads the .png with the same name from that folder as the BG image.
+                                    <ul style={{ margin: "6px 0 0", paddingLeft: 18 }}>
+                                        <li><b>Validate…</b> checks each file with the same validation as Run Validation.</li>
+                                        <li><b>Save PNG…</b> saves each drawing as a .png next to its file, using the drawing toolbar's Profile labels, Line Boost and symbol outline settings.</li>
+                                        <li><b>Export Element…</b> downloads an Excel file listing the classes, Data attributes and symbols used in each DEXPI 2.0 file, with counts and whether each is valid against the meta model and the loaded DiscProfile.xml. Needs a DiscProfile.xml loaded; non-2.0 files are listed as skipped.</li>
+                                    </ul>
+                                    <div style={{ marginTop: 8, padding: "8px 10px", background: "#f6f8fa", border: "1px solid #eef2f6", borderRadius: 6 }}>
+                                        <b>Nothing is uploaded.</b> The files are read and processed inside this browser, on this machine, and are never sent to a server.
+                                        The browser asks permission first; its wording ("view and copy", or "upload") is the browser asking whether this page may <i>read</i> those files into itself.
+                                        <b> Save PNG…</b> also asks to <i>edit</i> files in the folder, so it can write the PNGs there. Browsers that can't write to a folder download them instead.
+                                    </div>
+                                    <div style={{ marginTop: 8 }}>
+                                        {discXmlText
+                                            ? <>Profile in use: <b>{discFileFullName}</b>.</>
+                                            : "No DiscProfile.xml is loaded, so profile-dependent checks will not be evaluated."}
+                                    </div>
+                                </div>
+                            )}
+                            {!folderProgress && folderResults?.length === 0 && (
+                                <div style={{ padding: 16, color: "#888", fontSize: 13 }}>No .xml files found in that folder.</div>
+                            )}
+                            {!folderProgress && folderResults?.length > 0 && (
+                                <>
+                                    <div style={{ padding: "8px 10px", borderBottom: "1px solid #eef2f6", display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                                        {folderIssues.length === 0
+                                            ? <span style={S.badge("#1a7f37")}>No issues found</span>
+                                            : <span style={S.badge("#cf222e")}>{folderIssues.length} issue{folderIssues.length === 1 ? "" : "s"}</span>}
+                                        <span style={{ fontSize: 11, color: "#888" }} title="Validated in this browser - no file was uploaded">
+                                            {folderName ? `${folderName} · ` : ""}
+                                            {folderResults.length} file{folderResults.length === 1 ? "" : "s"}
+                                            {discXmlText ? ` · ${discFileFullName}` : " · no profile"}
+                                            {" · checked in this browser, nothing uploaded"}
+                                        </span>
+                                    </div>
+                                    <div style={{ padding: "6px 10px", borderBottom: "1px solid #eef2f6", display: "flex", gap: 5, flexWrap: "wrap", alignItems: "center" }}>
+                                        {["All", "Error", "Warning", "Info"].map(f => {
+                                            const count = f === "All" ? folderIssues.length : (folderCounts[f] || 0);
+                                            const active = folderFilter === f;
+                                            return (
+                                                <button
+                                                    key={f}
+                                                    style={{ ...S.btnSmall, background: active ? "#0969da" : "white", color: active ? "white" : "#111", borderColor: active ? "#0969da" : "#c7ced6" }}
+                                                    onClick={() => setFolderFilter(f)}
+                                                >{f} ({count})</button>
+                                            );
+                                        })}
+                                        <button style={{ ...S.btnSmall, marginLeft: "auto" }} onClick={downloadFolderCsv}>CSV</button>
+                                    </div>
+                                    <div style={{ padding: "4px 10px", borderBottom: "1px solid #eef2f6", display: "flex", gap: 6 }}>
+                                        <button style={S.btnSmall} onClick={() => setCollapsedFolderFiles(new Set())}>Expand all</button>
+                                        <button style={S.btnSmall} onClick={() => setCollapsedFolderFiles(new Set(folderResults.map(r => r.path)))}>Collapse all</button>
+                                    </div>
+                                    {folderResults.map(r => {
+                                        const items = folderByFile.get(r.path) || [];
+                                        if (!items.length && folderFilter !== "All" && !r.error) return null;
+                                        const isFolded = collapsedFolderFiles.has(r.path);
+                                        return (
+                                            <div key={r.path}>
+                                                <div
+                                                    onClick={() => setCollapsedFolderFiles(prev => { const n = new Set(prev); n.has(r.path) ? n.delete(r.path) : n.add(r.path); return n; })}
+                                                    style={{ padding: "6px 10px", background: "#f6f8fa", borderBottom: "1px solid #eef2f6", cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}
+                                                >
+                                                    <span style={{ width: 12, textAlign: "center", flexShrink: 0, color: "#888", fontSize: 12 }}>{isFolded ? "▸" : "▾"}</span>
+                                                    <span style={{ fontWeight: 600, fontSize: 12, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={r.path}>{r.path}</span>
+                                                    {r.error
+                                                        ? <span style={S.badge("#cf222e")}>failed</span>
+                                                        : items.length === 0
+                                                            ? <span style={S.badge("#1a7f37")}>clean</span>
+                                                            : <span style={{ fontSize: 11, color: "#57606a" }}>{items.length}</span>}
+                                                    <button
+                                                        style={{ ...S.btnSmall, flexShrink: 0 }}
+                                                        onClick={ev => { ev.stopPropagation(); openFolderFile(r.path); }}
+                                                        title="Load this file into the viewer"
+                                                    >Open</button>
+                                                </div>
+                                                {!isFolded && r.error && (
+                                                    <div style={{ padding: "8px 10px", fontSize: 12, color: "#cf222e", borderBottom: "1px solid #eef2f6" }}>{r.error}</div>
+                                                )}
+                                                {!isFolded && items.map(issue => (
+                                                    <div key={issue.key} style={{ padding: "8px 10px", borderBottom: "1px solid #eef2f6" }}>
+                                                        <div style={{ display: "flex", gap: 5, alignItems: "center", marginBottom: 2 }}>
+                                                            <span style={S.badge(S.sevColor[issue.severity])}>{issue.severity}</span>
+                                                            <span style={{ fontFamily: "monospace", fontSize: 11, fontWeight: 700, color: "#24292f" }}>{issue.ruleId}</span>
+                                                            {issue.lineNumber != null && <span style={{ fontSize: 11, fontFamily: "monospace", color: "#555" }}>line {issue.lineNumber}</span>}
+                                                        </div>
+                                                        <div style={{ fontSize: 12, color: "#333" }}>{issue.description}</div>
+                                                        {issue.objectId && <div style={{ fontSize: 11, color: "#57606a", fontFamily: "monospace", marginTop: 2 }}>{issue.objectId}</div>}
+                                                        {issue.suggestedCorrection && <div style={{ fontSize: 11, color: "#0969da", marginTop: 2 }}>Suggestion: {issue.suggestedCorrection}</div>}
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        );
+                                    })}
+                                </>
+                            )}
                         </div>
                     )}
                 </div>
@@ -1793,8 +2553,38 @@ export default function App() {
                         </label>
                         <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "#57606a", cursor: "pointer" }} title="When checked, symbol outline strokes are boosted by the same Line Boost percentage as connector/centerlines. When unchecked, only connector/centerlines are affected.">
                             <input type="checkbox" checked={boostSymbolOutlines} onChange={e => setBoostSymbolOutlines(e.target.checked)} />
-                            Include symbol outlines
+                            Include outlines
                         </label>
+                        <div style={{ position: "relative", display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "#57606a" }}>
+                            <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }} title="Hide drawing elements that have validation issues with the selected codes. The issue list is not affected.">
+                                <input type="checkbox" checked={hideIssues.enabled} onChange={e => setHideIssues(h => ({ ...h, enabled: e.target.checked }))} />
+                                Hide elements with issues
+                            </label>
+                            <select value={hideIssues.mode} onChange={e => setHideIssues(h => ({ ...h, mode: e.target.value }))} style={{ fontSize: 12 }} title="Which verification codes hide elements">
+                                <option value="All">All</option>
+                                <option value="AllErrors">All Errors</option>
+                                <option value="None">None</option>
+                                <option value="Custom">Custom</option>
+                            </select>
+                            <button style={S.btn} onClick={() => setShowHideCodes(v => !v)} title="Pick individual codes (switches to Custom)">Codes…</button>
+                            {hideIssues.enabled && hiddenIssueIds.size > 0 && <span title="Objects hidden from the drawing">({hiddenIssueIds.size} hidden)</span>}
+                            {showHideCodes && (
+                                <div style={{ position: "absolute", top: "100%", left: 0, zIndex: 20, marginTop: 4, background: "white", border: "1px solid #d0d7de", borderRadius: 6, boxShadow: "0 4px 12px rgba(0,0,0,0.12)", padding: 8, maxHeight: 320, overflowY: "auto", minWidth: 200 }}>
+                                    {issueCodeList.length === 0 && <div style={{ color: "#8c959f" }}>No codes yet - run verification first.</div>}
+                                    {issueCodeList.map(({ code, severity }) => (
+                                        <label key={code} style={{ display: "flex", alignItems: "center", gap: 6, padding: "2px 0", cursor: "pointer" }}>
+                                            <input type="checkbox" checked={hiddenIssueCodes.has(code)} onChange={() => toggleHideCode(code)} />
+                                            <span style={{ fontFamily: "monospace" }}>{code}</span>
+                                            <span style={{ color: severity === "Error" ? "#cf222e" : severity === "Warning" ? "#9a6700" : "#57606a" }}>{severity}</span>
+                                        </label>
+                                    ))}
+                                    <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+                                        <button style={S.btn} onClick={() => setHideIssues(h => ({ ...h, mode: "Custom", codes: DEFAULT_CUSTOM_HIDE_CODES }))} title="Reset Custom to the default code set">Default</button>
+                                        <button style={S.btn} onClick={() => setShowHideCodes(false)}>Close</button>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
                         <button style={S.btn} disabled={!parsed || exporting} onClick={exportAsPng} title="Save the current view (drawing + BG image, if any) as a PNG">{exporting ? "..." : "Save PNG"}</button>
                         <button style={S.btn} disabled={!parsed || exporting} onClick={exportAsPdf} title="Save the current view (drawing + BG image, if any) as a PDF">{exporting ? "..." : "Save PDF"}</button>
                         <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "#57606a", cursor: "pointer" }} title="Connectivity mode: highlights the upstream (blue), downstream (green), and group (purple) connections of the selected object. Hidden by default - check this box to show the highlight.">
@@ -1811,9 +2601,9 @@ export default function App() {
                                 Profile labels
                             </label>
                         )}
-                        <button style={S.btn} onClick={() => bgInputRef.current?.click()} title="Overlay an image behind the drawing">BG Image</button>
+                        <button style={S.btn} onClick={handleBgButton} title="Overlay an image behind the drawing. Pick a DEXPI XML together with its .png to load both.">BG Image</button>
                         {bgImage && <button style={{ ...S.btn, background: showBgControls ? "#eaf2ff" : "white" }} onClick={() => setShowBgControls(p => !p)}>BG Controls</button>}
-                        <input ref={bgInputRef} type="file" accept="image/*" style={{ display: "none" }} onChange={handleBgFile} />
+                        <input ref={bgInputRef} type="file" accept="image/*,.xml" multiple style={{ display: "none" }} onChange={handleBgFile} />
                         <span style={{ fontSize: 11, color: "#888", marginLeft: 4 }}>Scroll to zoom · Space+drag to pan</span>
                     </div>
                 </div>
@@ -1839,28 +2629,50 @@ export default function App() {
                             <input type="range" min={-boundsH} max={boundsH} step={Math.max(0.01, boundsH / 500)} value={bgImage.offsetY} onChange={e => setBgImage(b => ({ ...b, offsetY: parseFloat(e.target.value) }))} style={{ width: 70 }} />
                             <input type="number" step={Math.max(0.01, boundsH / 500)} value={bgImage.offsetY} onChange={e => { const v = parseFloat(e.target.value); if (!Number.isNaN(v)) setBgImage(b => ({ ...b, offsetY: v })); }} style={S.numBoxWide} title="Y offset, in drawing units, from the auto-fit position" />
                         </label>
-                        <button style={S.btnSmall} onClick={() => setBgImage(b => ({ ...b, scale: 1, offsetX: 0, offsetY: 0 }))} title="Reset to the auto-fit (centered, aspect-correct) placement">Reset fit</button>
-                        {/* Embed this PNG's current placement into a downloaded copy so a
-                            future load of it starts pre-aligned - see
-                            downloadBgPlacementPng()/clearBgDefault() above. Only PNG files
-                            support an embedded default (the chunk format is PNG-specific);
-                            other image types leave this disabled. */}
+                        <button
+                            style={{ ...S.btnSmall, borderColor: "#1a7f37", color: "#1a7f37" }}
+                            disabled={!!cmpBusy || !parsed || !bgImage.naturalWidth}
+                            onClick={autoFitBg}
+                            title="Match the image to the DEXPI drawing: finds the Scale / X / Y that lays the drawn lines and symbols over the image's ink. Then use Save placement to keep it in the PNG."
+                        >
+                            {cmpBusy?.kind === "fit" ? "Fitting…" : "⤢ Auto-fit to drawing"}
+                        </button>
+                        {fitStatus && !cmpBusy && <span style={{ color: fitStatus.score >= 0.9 ? "#1a7f37" : fitStatus.score >= 0.7 ? "#9a6700" : "#cf222e" }} title="Share of the DEXPI drawing's line samples that land on image ink after the fit">{Math.round(fitStatus.score * 100)}% match</span>}
+                        {/* Embed this PNG's current placement into its own metadata and save
+                            it under the same file name, so a future load of it starts
+                            pre-aligned - see saveBgPlacementPng() above.
+                            Only PNG files support an embedded default (the chunk format is
+                            PNG-specific); other image types leave this disabled. */}
                         <button
                             style={{ ...S.btnSmall, borderColor: "#0969da", color: "#0969da" }}
                             disabled={!bgImage.isPng}
-                            onClick={downloadBgPlacementPng}
+                            onClick={saveBgPlacementPng}
                             title={bgImage.isPng
-                                ? "Embed the current Scale / X / Y into a copy of this PNG and download it, so the next time this image is loaded it starts at this placement instead of the auto-fit - the original file you selected is left untouched"
+                                ? `Embed the current Scale / X / Y into ${bgImage.fileName || "the PNG"} and save it under the same name, so the next time this image is loaded it starts at this placement`
                                 : "Only PNG images support an embedded placement default - this file isn't a PNG"}
                         >
-                            ⬇ Download PNG with placement
+                            💾 Save placement
                         </button>
-                        {bgImage.isPng && bgImage.embeddedPlacement && (
-                            <button style={S.btnSmall} onClick={clearBgDefault} title="Download a copy of this PNG with the saved placement default removed">
-                                Clear Default
-                            </button>
+                        {SHOW_IMAGE_COMPARE && (
+                            <>
+                                <button
+                                    style={{ ...S.btnSmall, borderColor: "#8250df", color: "#8250df" }}
+                                    disabled={!!cmpBusy || !parsed}
+                                    onClick={runImageCompare}
+                                    title="Compare the DEXPI drawing with this image at the current placement and list the mismatches in the Compare tab"
+                                >
+                                    {cmpBusy?.kind === "compare" ? "Comparing…" : "⇄ Compare"}
+                                </button>
+                                {cmp && (
+                                    <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }} title="Show or hide the image compare markers / difference image on the drawing">
+                                        <input type="checkbox" checked={cmpView !== "off"} onChange={e => setCmpView(e.target.checked ? "markers" : "off")} />
+                                        Compare layer
+                                    </label>
+                                )}
+                            </>
                         )}
-                        <button style={{ ...S.btnSmall, color: "#cf222e" }} onClick={() => { if (bgObjectUrlRef.current) { URL.revokeObjectURL(bgObjectUrlRef.current); bgObjectUrlRef.current = null; } setBgImage(null); setShowBgControls(false); }}>Remove</button>
+                        {cmpBusy && <span style={{ color: "#57606a" }}>{cmpBusy.phase}{cmpBusy.total > 1 ? ` ${Math.round(100 * cmpBusy.done / cmpBusy.total)}%` : ""}</span>}
+                        <button style={{ ...S.btnSmall, color: "#cf222e" }} onClick={removeBg}>Remove</button>
                     </div>
                 )}
 
@@ -1879,45 +2691,64 @@ export default function App() {
                     onMouseLeave={() => { setIsPanning(false); setPanStart(null); }}
                 >
                     <svg ref={svgElRef} viewBox={`${viewBox.x} ${viewBox.y} ${viewBox.w} ${viewBox.h}`} width="100%" height="100%" style={{ display: "block" }} onAuxClick={e => e.preventDefault()}>
-                        {bgImage && bgPlacement && (
+                        {bgImage && bgPlacement && !batchPng && !(cmp && cmpView === "diff") && (
                             <g style={{ display: bgImage.visible ? "inline" : "none", opacity: bgImage.opacity > 0 ? Math.max(0, 1 - bgImage.opacity) : 1, pointerEvents: "none" }}>
                                 <image href={bgImage.src} x={bgPlacement.x} y={bgPlacement.y} width={bgPlacement.width} height={bgPlacement.height} preserveAspectRatio="none" />
                                 <rect x={bgPlacement.x} y={bgPlacement.y} width={bgPlacement.width} height={bgPlacement.height} fill={BG_TINT_COLOR} style={{ mixBlendMode: "color" }} />
                             </g>
                         )}
-                        <g style={{ opacity: bgImage && bgImage.opacity < 0 ? Math.max(0, 1 + bgImage.opacity) : 1 }}>
+                        {cmp && cmpView === "diff" && !batchPng && (
+                            <image href={cmp.diffUrl} x={cmp.diffPlacement.x} y={cmp.diffPlacement.y} width={cmp.diffPlacement.width} height={cmp.diffPlacement.height} preserveAspectRatio="none" style={{ pointerEvents: "none" }} />
+                        )}
+                        <g style={{ opacity: cmp && cmpView === "diff" && !batchPng ? 0.12 : bgImage && bgImage.opacity < 0 ? Math.max(0, 1 + bgImage.opacity) : 1 }}>
                             {orderedGraphicsElements.map(el => {
+                                if (el.representedId && hiddenIssueIds.has(el.representedId)) return null;
                                 const isSelected = !!el.representedId && selectedRepresentedIds.has(el.representedId);
                                 const ch = connectivityHighlight;
                                 const connColor = el.representedId ? (ch.upstream.has(el.representedId) ? "#0969da" : ch.downstream.has(el.representedId) ? "#1a7f37" : ch.group.has(el.representedId) ? "#8250df" : null) : null;
                                 if (el.kind === "symbolUsage") return <SymbolGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} boostPct={lineBoostPct} boostSymbolOutlines={boostSymbolOutlines} showProfileLabels={showProfileLabels} />;
                                 return <PrimitiveGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} nodePosMap={parsed.graphics.nodePosMap} boostPct={lineBoostPct} boostSymbolOutlines={boostSymbolOutlines} showProfileLabels={showProfileLabels} />;
                             })}
+                            {/* Heat-trace overlays – part of the DEXPI drawing layer (fades with it), only when a DISC profile is loaded */}
+                            {parsed?.heatTraceSet?.size > 0 && parsed.graphics.elements.map(el => {
+                                // Never draw heat-trace overlays on label or annotation elements
+                                if (el.elementRole === "label") return null;
+                                if (el.representedId && hiddenIssueIds.has(el.representedId)) return null;
+                                const htType = el.representedId ? parsed.heatTraceSet.get(el.representedId) : null;
+                                if (!htType) return null;
+                                if (htType === "piping" && el.kind === "connectorLine")
+                                    return <HeatTraceConnectorLine key={`ht_${el.key}`} el={el} nodePosMap={parsed.graphics.nodePosMap} />;
+                                if ((htType === "inline" || htType === "nozzle") && el.kind === "symbolUsage")
+                                    return <HeatTraceSymbol key={`ht_${el.key}`} el={el} />;
+                                if (htType === "pif" && el.kind === "symbolUsage")
+                                    return <HeatTracePIF key={`ht_${el.key}`} el={el} />;
+                                return null;
+                            })}
                         </g>
-                        {goToMarker && (() => {
-                            const r = Math.max(viewBox.w, viewBox.h) * 0.015;
-                            return (
-                                <g style={{ pointerEvents: "none" }}>
-                                    <circle cx={goToMarker.x} cy={goToMarker.y} r={r} fill="none" stroke="#e8590c" strokeWidth={r * 0.18} />
-                                    <line x1={goToMarker.x - r * 1.8} y1={goToMarker.y} x2={goToMarker.x + r * 1.8} y2={goToMarker.y} stroke="#e8590c" strokeWidth={r * 0.18} />
-                                    <line x1={goToMarker.x} y1={goToMarker.y - r * 1.8} x2={goToMarker.x} y2={goToMarker.y + r * 1.8} stroke="#e8590c" strokeWidth={r * 0.18} />
-                                </g>
-                            );
-                        })()}
-                        {/* Heat-trace overlays – rendered on top, only when a DISC profile is loaded */}
-                        {parsed?.heatTraceSet?.size > 0 && parsed.graphics.elements.map(el => {
-                            // Never draw heat-trace overlays on label or annotation elements
-                            if (el.elementRole === "label") return null;
-                            const htType = el.representedId ? parsed.heatTraceSet.get(el.representedId) : null;
-                            if (!htType) return null;
-                            if (htType === "piping" && el.kind === "connectorLine")
-                                return <HeatTraceConnectorLine key={`ht_${el.key}`} el={el} nodePosMap={parsed.graphics.nodePosMap} />;
-                            if ((htType === "inline" || htType === "nozzle") && el.kind === "symbolUsage")
-                                return <HeatTraceSymbol key={`ht_${el.key}`} el={el} />;
-                            if (htType === "pif" && el.kind === "symbolUsage")
-                                return <HeatTracePIF key={`ht_${el.key}`} el={el} />;
-                            return null;
-                        })}
+                        {/* Image compare markers - one box per open issue, arrow to where a misplaced object matches */}
+                        {cmp && cmpView !== "off" && !batchPng && (
+                            <g>
+                                {cmpVisibleIssues.slice(0, 3000).map(issue => {
+                                    const b = issue.bbox, pad = 1.2;
+                                    const color = IMG_CODES[issue.code]?.color || "#cf222e";
+                                    const sel = issue.key === cmpSelKey;
+                                    const cx = (b.minX + b.maxX) / 2, cy = (b.minY + b.maxY) / 2;
+                                    return (
+                                        <g key={issue.key} style={{ cursor: "pointer" }} onClick={e => { e.stopPropagation(); selectCmpIssue(issue); setRightTab("compare"); setRightCollapsed(false); }}>
+                                            <rect x={b.minX - pad} y={b.minY - pad} width={b.maxX - b.minX + pad * 2} height={b.maxY - b.minY + pad * 2}
+                                                fill={sel ? color : "transparent"} fillOpacity={sel ? 0.12 : 0} stroke={color} strokeWidth={sel ? 2.5 : 1.2}
+                                                strokeDasharray={issue.severity === "Info" ? "4 3" : undefined} vectorEffect="non-scaling-stroke" pointerEvents="all" />
+                                            {issue.dxMm != null && (Math.abs(issue.dxMm) > 0.3 || Math.abs(issue.dyMm) > 0.3) && (
+                                                <>
+                                                    <line x1={cx} y1={cy} x2={cx + issue.dxMm} y2={cy + issue.dyMm} stroke={color} strokeWidth={2} vectorEffect="non-scaling-stroke" />
+                                                    <circle cx={cx + issue.dxMm} cy={cy + issue.dyMm} r={0.6} fill={color} />
+                                                </>
+                                            )}
+                                        </g>
+                                    );
+                                })}
+                            </g>
+                        )}
                     </svg>
                     {showConnectivity && selectedId && (
                         <div style={{ position: "absolute", bottom: 10, left: 10, background: "rgba(255,255,255,0.9)", padding: "5px 10px", borderRadius: 6, border: "1px solid #d0d7de", fontSize: 11, display: "flex", gap: 8 }}>
@@ -1941,9 +2772,10 @@ export default function App() {
                             <button style={S.collapseBtn} onClick={() => setRightCollapsed(true)}>{">"}</button>
                         </div>
                     </div>
-                    <div style={S.tabBar}>
-                        {[["details", "Object"], ["connectivity", "Connections"], ["issues", `Issues${selectedId && issueMap.has(selectedId) ? ` (${issueMap.get(selectedId).length})` : ""}`]].map(([t, label]) => (
-                            <button key={t} style={S.tab(rightTab === t)} onClick={() => setRightTab(t)}>{label}</button>
+                    <div style={{ ...S.tabBar, overflowX: "auto" }}>
+                        {[["details", "Object"], ["connectivity", "Connections"], ["issues", `Issues${selectedId && issueMap.has(selectedId) ? ` (${issueMap.get(selectedId).length})` : ""}`],
+                            ...(SHOW_IMAGE_COMPARE && cmp ? [["compare", `Compare${selectedCmpIssues.length ? ` (${selectedCmpIssues.filter(i => !cmpDecisions[i.key]?.status).length})` : ""}`]] : [])].map(([t, label]) => (
+                            <button key={t} style={{ ...S.tab(rightTab === t), whiteSpace: "nowrap", padding: "8px 10px" }} onClick={() => setRightTab(t)}>{label}</button>
                         ))}
                     </div>
                     <div style={S.scroll}>
@@ -1980,13 +2812,14 @@ export default function App() {
                                 <div style={S.section}>
                                     <div style={{ fontWeight: 600, fontSize: 12, marginBottom: 6 }}>Data</div>
                                     {selectedNode?.data?.length ? selectedNode.data.map((d, i) => {
-                                        const fmt = formatDataValue(d.value);
+                                        const fmt = formatDataValue(d.value, parsed?.enumAbbreviations);
                                         const shortProp = d.property.split(".").pop() || d.property;
                                         return (
                                             <div key={`${d.property}_${i}`} style={{ marginBottom: 6, padding: "4px 6px", background: "#f9fafb", borderRadius: 4 }}>
                                                 <div style={{ fontSize: 11, color: "#888", marginBottom: 1 }} title={d.property}>{shortProp}</div>
                                                 <div style={{ fontSize: 13, display: "flex", alignItems: "baseline", gap: 5 }}>
-                                                    <span style={{ fontWeight: 500 }}>{fmt.text}</span>
+                                                    <span style={{ fontWeight: 500 }} title={fmt.fullRef || undefined}>{fmt.text}</span>
+                                                    {fmt.literal && <span style={{ fontSize: 11, color: "#888" }} title={fmt.fullRef}>({fmt.literal})</span>}
                                                     {fmt.uom && (
                                                         <span style={{ fontSize: 11, color: "#0969da", fontWeight: 600, padding: "0 4px", background: "#ddf4ff", borderRadius: 3 }} title={fmt.unitRef || fmt.uom}>
                                                             {fmt.uom}
@@ -2009,9 +2842,18 @@ export default function App() {
                                         <div key={i} style={{ marginBottom: 5 }}>
                                             <div style={{ fontSize: 11, color: "#888" }}>{r.property}</div>
                                             <div style={{ fontSize: 12 }}>
-                                                {r.objects.map((oid, j) => (
-                                                    <span key={j} style={{ cursor: parsed?.treeMap?.has(oid) ? "pointer" : "default", color: parsed?.treeMap?.has(oid) ? "#0969da" : "#cf222e", marginRight: 5 }} onClick={() => parsed?.treeMap?.has(oid) && handleSelect(oid)}>{oid}</span>
-                                                ))}
+                                                {r.objects.map((oid, j) => {
+                                                    // Reference to a profile enumeration literal (e.g. DiscProfile/TypeCode ->
+                                                    // ...ControlledActuatorTypeCodes.Motor): show its Abbreviation ("M") like a Data enum value.
+                                                    const abbr = !parsed?.treeMap?.has(oid) ? parsed?.enumAbbreviations?.get(oid) : null;
+                                                    if (abbr) return (
+                                                        <span key={j} style={{ marginRight: 5, display: "inline-flex", alignItems: "baseline", gap: 5 }} title={oid}>
+                                                            <span style={{ fontSize: 13, fontWeight: 500 }}>{abbr}</span>
+                                                            <span style={{ fontSize: 11, color: "#888" }}>({oid.split(".").pop()})</span>
+                                                        </span>
+                                                    );
+                                                    return <span key={j} style={{ cursor: parsed?.treeMap?.has(oid) ? "pointer" : "default", color: parsed?.treeMap?.has(oid) ? "#0969da" : "#cf222e", marginRight: 5 }} onClick={() => parsed?.treeMap?.has(oid) && handleSelect(oid)}>{oid}</span>;
+                                                })}
                                             </div>
                                         </div>
                                     )) : <div style={{ color: "#888", fontSize: 12 }}>No references.</div>}
@@ -2203,6 +3045,14 @@ export default function App() {
                                         </div>
                                     );
                                 })()}
+                            </div>
+                        )}
+                        {SHOW_IMAGE_COMPARE && rightTab === "compare" && (
+                            <div>
+                                {!cmp ? <div style={{ padding: 12, color: "#888", fontSize: 12 }}>Run the image compare first (Compare tab on the left).</div>
+                                    : !selectedNode ? <div style={{ padding: 12, color: "#888", fontSize: 12 }}>Select an object.</div>
+                                    : selectedCmpIssues.length === 0 ? <div style={{ padding: 12, color: "#888", fontSize: 12 }}>No image compare issues for this object.</div>
+                                    : selectedCmpIssues.map(issue => renderCmpIssueRow(issue, { showLabel: false }))}
                             </div>
                         )}
                         {rightTab === "issues" && (

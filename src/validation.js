@@ -197,7 +197,7 @@ function buildMetaModelLookup(hierarchyPairs, propRows) {
 
 // Detect document meta-model from Import elements.
 // Returns "Plant" (P&ID), "Process" (PFD/PBD), or "Unknown".
-function detectMetaModel(doc) {
+export function detectMetaModel(doc) {
     for (const imp of doc.querySelectorAll("Import")) {
         const src = imp.getAttribute("source") || "";
         if (src.includes("Plant.xml"))   return "Plant";
@@ -210,7 +210,7 @@ function detectMetaModel(doc) {
 
 // Module-level cache — built once per session
 let _plantLookup = null, _processLookup = null;
-function getMetaModelLookup(modelName) {
+export function getMetaModelLookup(modelName) {
     if (modelName === "Plant") {
         if (!_plantLookup)   _plantLookup   = buildMetaModelLookup(PLANT_HIERARCHY,   PLANT_PROPS);
         return _plantLookup;
@@ -1145,6 +1145,11 @@ export function runStructuralValidation(flatTree, severityConfig) {
 //
 //   Pipe / PipingNetworkSegment . SourceItem   DISC_EXAMPLE-14-10 ×14, DEXPIORG ×10
 //   Pipe / PipingNetworkSegment . TargetItem   DISC_EXAMPLE-14-10 ×2
+//   DirectPipingConnection . SourceItem/TargetItem
+//                                              same PipingConnection property as
+//                                              Pipe; a multi-port item (e.g. a
+//                                              double block and bleed valve) feeds
+//                                              one DPC per node - UPP-AIL-P-XB-24050-02
 //   SignalConveyingFunction . Source / Target  DISC_EXAMPLE-14-10 ×2 each
 //   MaterialPort / MechanicalEnergyPort . ConnectorReference
 //                                              TennesseeEastman ×43
@@ -1159,6 +1164,7 @@ export function runStructuralValidation(flatTree, severityConfig) {
 const INVERSE_CARDINALITY_EXCLUSIONS = new Set([
     "Pipe.SourceItem", "PipingNetworkSegment.SourceItem",
     "Pipe.TargetItem", "PipingNetworkSegment.TargetItem",
+    "DirectPipingConnection.SourceItem", "DirectPipingConnection.TargetItem",
     "SignalConveyingFunction.Source", "SignalConveyingFunction.Target",
     "MaterialPort.ConnectorReference", "MechanicalEnergyPort.ConnectorReference",
     "Nozzle.Chamber",
@@ -2280,7 +2286,7 @@ export function runProfileValidation(flatTree, mergedConstraints, overrideLog, s
 // attribute name itself.
 const LABEL_TEMPLATE_PLACEHOLDER_RE = /(?:[A-Za-z][A-Za-z0-9_]*:)?<([^<>]+)>/g;
 
-function parseProfileSymbols(profileXml) {
+export function parseProfileSymbols(profileXml) {
     const symbolUsage = new Map();
     const symbolNodes = new Map();
     // Auxiliary NodePositions (Type = Profile/NodePositionType.Auxiliary) represent
@@ -2433,7 +2439,7 @@ function extractProfileClassPairs(profileXml) {
 // profile's own class hierarchy (profile-redeclared/extended subclasses such
 // as DiscProfile's "ShellAndFixedTubeHeatExchanger" or "ProcessSafetyFunction")
 // into a single classSuffix → Set<superSuffix> map.
-function buildProfileClassHierarchy(profileXmlList, baseHierarchyPairs) {
+export function buildProfileClassHierarchy(profileXmlList, baseHierarchyPairs) {
     const hierarchy = new Map();
     for (const [cls, sup] of baseHierarchyPairs) {
         if (!hierarchy.has(cls)) hierarchy.set(cls, new Set());
@@ -2450,7 +2456,7 @@ function buildProfileClassHierarchy(profileXmlList, baseHierarchyPairs) {
 
 // BFS up the class hierarchy: is `childSuffix` the same as, or a (transitive)
 // subclass of, `ancestorSuffix`?
-function isDescendantOrSelf(hierarchy, childSuffix, ancestorSuffix) {
+export function isDescendantOrSelf(hierarchy, childSuffix, ancestorSuffix) {
     if (childSuffix === ancestorSuffix) return true;
     const seen = new Set([childSuffix]);
     const queue = [childSuffix];
@@ -2508,12 +2514,39 @@ export function validateSymbolRules(mainXml, profileXml, profileName, severityCo
     // AttributeName(s) against the placed symbol's own Profile/LabelTemplate
     // placeholders (labelTemplateAttrs, from parseProfileSymbols above).
     const attrRepsByTargetId = new Map();
+    // A Core/Diagram.Label that places a Profile/SymbolUsage of its own (a label symbol such as
+    // DISC's tag bubble ND0248B or the line label ND0040) shows its attributes through THAT symbol's
+    // LabelTemplates, not through the symbol of the object it labels. Its AttributeRepresentations
+    // are collected per label (labelSymbolAttrs) and checked against the label symbol only; they are
+    // kept out of attrRepsByTargetId, which the object's own symbol is checked against (PRF-E06).
+    const labelSymbolAttrs = new Map(); // Label element → [attrName]
+    const ownLabelSymbol = (label) => {
+        const elems = Array.from(label.children).find(
+            c => c.tagName === "Components" && c.getAttribute("property") === "Elements"
+        );
+        return !!elems && Array.from(elems.children).some(
+            c => c.tagName === "Object" && c.getAttribute("type") === "Profile/SymbolUsage"
+        );
+    };
+    const enclosingLabel = (el) => {
+        for (let p = el.parentNode; p && p.tagName; p = p.parentNode) {
+            if (p.tagName === "Object" && p.getAttribute("type") === "Core/Diagram.Label") return p;
+            if (p.tagName === "Object" && /RepresentationGroup$|Diagram\.Static$/.test(p.getAttribute("type") || "")) return null;
+        }
+        return null;
+    };
     doc.querySelectorAll('Object[type="Core/Diagram.AttributeRepresentation"]').forEach(attrRep => {
         const attrNameEl = Array.from(attrRep.children).find(
             c => c.tagName === "Data" && c.getAttribute("property") === "AttributeName"
         );
         const attrName = attrNameEl?.querySelector("String")?.textContent?.trim();
         if (!attrName) return;
+        const label = enclosingLabel(attrRep);
+        if (label && ownLabelSymbol(label)) {
+            if (!labelSymbolAttrs.has(label)) labelSymbolAttrs.set(label, []);
+            labelSymbolAttrs.get(label).push(attrName);
+            return;
+        }
         const objRefEl = Array.from(attrRep.children).find(
             c => c.tagName === "References" && c.getAttribute("property") === "Object"
         );
@@ -2727,12 +2760,16 @@ export function validateSymbolRules(mainXml, profileXml, profileName, severityCo
         // placeholder at all — a symbol with none simply isn't modelled for this
         // check and shouldn't produce false positives.
         {
-            const dedupKeyE06 = `E06::${representsId || "(unknown)"}::${symName}`;
-            const alreadyCheckedE06 = checkedOnce.has(dedupKeyE06);
-            checkedOnce.add(dedupKeyE06);
+            // A label symbol (SymbolUsage placed inside a Core/Diagram.Label) is checked against the
+            // attributes of its own label; the object's symbol (placed in a Static) against the
+            // attributes of the object's labels that place no symbol of their own.
+            const ownLabel = staticEl?.getAttribute("type") === "Core/Diagram.Label" ? staticEl : null;
+            const dedupKeyE06 = ownLabel ? null : `E06::${representsId || "(unknown)"}::${symName}`;
+            const alreadyCheckedE06 = dedupKeyE06 ? checkedOnce.has(dedupKeyE06) : false;
+            if (dedupKeyE06) checkedOnce.add(dedupKeyE06);
             const allowedAttrs = labelTemplateAttrs.get(symName);
             if (!alreadyCheckedE06 && allowedAttrs && allowedAttrs.size && representsId) {
-                const usedAttrs = attrRepsByTargetId.get(representsId) || [];
+                const usedAttrs = ownLabel ? (labelSymbolAttrs.get(ownLabel) || []) : (attrRepsByTargetId.get(representsId) || []);
                 usedAttrs.forEach(attrName => {
                     const bare = attrName.split("/").pop();
                     if (allowedAttrs.has(attrName) || allowedAttrs.has(bare)) return;

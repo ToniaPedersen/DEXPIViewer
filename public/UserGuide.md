@@ -2,6 +2,8 @@
 
 A browser-based viewer and validation engine for [DEXPI 2.0](https://dexpi.org) intelligent P&ID files, with full support for DISC profile validation.
 
+**Version 2.0**
+
 Developed by **Tonia Pedersen** at **[Draga AS](https://draga.no)**.
 
 **Live demo:** [toniapedersen.github.io/DEXPIViewer](https://toniapedersen.github.io/DEXPIViewer/)
