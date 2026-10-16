@@ -2,7 +2,7 @@
 
 A browser-based viewer and validation engine for [DEXPI 2.0](https://dexpi.org) intelligent P&ID files, with full support for DISC profile validation.
 
-**Version 2.0**
+**Version 2.1**
 
 Developed by **Tonia Pedersen** at **[Draga AS](https://draga.no)**.
 
@@ -248,15 +248,21 @@ Selecting a decorated line, or highlighting it via Connectivity mode, recolours 
 
 ### 5.10 Profile Labels
 
-Once a DiscProfile.xml is loaded, a **Profile labels** checkbox appears in the centre toolbar. It controls whether a label's displayed text comes from the loaded profile's own attribute-driven definitions, or from the literal text baked into the DEXPI file.
+Once a DiscProfile.xml is loaded, a **Profile labels** checkbox appears in the centre toolbar. Whatever its state, a label never shows the literal text stored in the DEXPI file: the text shown is always built from the values of the attributes the label references on the component it belongs to, so the drawing reflects what an intelligent tool linked to an asset register would show. If the referenced attribute has no value, nothing is shown. Units are shown with their symbol (`barg`, `°C`, `m³/h`).
 
-**Checked** — text shown comes *only* from a placed DiscProfile catalog symbol. A label belonging to a symbol placed from the loaded DiscProfile.xml always shows the value built from that *symbol's own* catalog `Profile/LabelTemplate` (e.g. an `<ObjectDisplayName>` placeholder resolved against the represented object) — never the instance's own literal text or its own `Core/Diagram.TextTemplate`.
+**Checked** — labels are drawn from the loaded profile's own `Profile/LabelTemplate` definitions for the placed symbol, at the position the profile defines, resolved against the represented object (e.g. `<ObjectDisplayName>`, `<ReferencedDrawingNumber>`, `'HH=' & SignalConveyingFunction:<AlarmValue>`). Labels stored in the file for that symbol are hidden, so the drawing shows the profile's intended layout. A label is shown only for an element placed with a profile symbol that has label templates; the exception is a label linked to a Note, which is shown when it references a valid Note attribute and may carry literal text.
 
-**Unchecked** — the raw literal `<Data property="Text">` string is no longer shown for a Profile-governed label once a DiscProfile.xml is loaded. Instead:
-- If there is no real attribute backing at all (no `TextTemplate` on the instance and no `LabelTemplate` on the symbol, or either exists but references no attribute), nothing is shown — a purely literal label isn't something the loaded profile has any say over.
-- Otherwise, the attribute-resolved value is shown, with any attribute reference that isn't actually valid for the placed symbol (see PRF-E06 in the [Validation Rules Reference](#7-validation-rules-reference)) suppressed rather than displayed.
+**Unchecked** — labels stored in the file are drawn where the file puts them (position, rotation and alignment exactly as written), but still with the component's attribute values rather than the stored text. A label with no attribute reference shows nothing while a profile is loaded, and its stored text when no profile is loaded. A literal inside a label is shown only when the profile's label template for that symbol defines it.
 
-Text driven by a `TextTemplate`/`LabelTemplate` always renders at its true absolute size regardless of the symbol's own placement scale, and reads left-to-right or bottom-to-top rather than upside-down or right-to-left.
+#### Rotation and mirroring
+
+A profile label template describes the label for the symbol in its upright, unmirrored position. When the symbol is placed rotated or mirrored, the profile label is placed so that:
+
+- the text stays readable — left to right for a horizontal symbol, bottom to top for a vertical one, never upside down or right to left;
+- the label stays on the side of the symbol the profile intends: text above a symbol stays above it when the symbol is turned 180°, and moves beside it when the symbol is vertical; for a symbol whose body lies to one side of its connection point (a nozzle, a shutdown symbol), the label follows the body;
+- a mirrored symbol has its labels mirrored with it, with the text alignment adjusted so the label still grows away from the symbol.
+
+In short, the profile label text alignment is adjusted with the instance's mirroring and rotation. The same placement is used by the label update script (section 10.6) for the labels it adds, so a file processed by the script displays the same whether **Profile labels** is checked or not.
 
 ### 5.11 Draw Order — Send to Back
 
@@ -505,6 +511,16 @@ A reusable PowerShell script (`Run-Validation.ps1`) is included in the project r
 The script creates a timestamped output folder automatically and writes a `validation-run.log` alongside the CSV reports.
 
 ---
+
+### 10.6 Label Update Script
+
+`scripts/Update-DexpiLabels.ps1` (PowerShell 7) brings exported DEXPI 2.0 files in line with the DISC profile labels. It writes updated copies to `<folder>\LabelUpdated` together with `LabelReport.csv`, which lists every change per element.
+
+```powershell
+.\scripts\Update-DexpiLabels.ps1 -InputFolder C:\DEXPI\Export -ProfileFolder C:\GitHub\DISCDEXPI_2026Pack\Profile\xml
+```
+
+For each file, in order: label references to `ItemTag` are switched to `ObjectDisplayName` where the symbol allows it; label lines that reference no valid attribute of the symbol's label templates are removed; labels that reference the right attributes on the wrong lines are relinked; elements without a valid label get the profile label added, placed with the rotation and mirroring rule described in section 5.10 (including instrument plant/system codes and alarm rows); and the labels of operated valves, safety valves and check valves are completed with the attributes of their template rows. Existing labels are never moved and component values are never changed unless the `-BackfillValues` / `-CorrectDisplayNames` switches are given. Run the script with `-?` for all options.
 
 ## 11. Troubleshooting
 

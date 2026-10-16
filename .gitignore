@@ -29,6 +29,7 @@ dist-ssr
 bin/
 obj/
 node_modules/
+scripts/
 
 DEXPI_Verificator_RFT.odt
 DEXPI Standard and Profile/

@@ -1,4 +1,6 @@
 ﻿// DEXPI XML parser utilities â€" shared between App.jsx and validation engine
+import { PLANT_HIERARCHY, PLANT_PROPS } from "./metaModel.js";
+import { UNIT_SYMBOLS } from "./unitSymbols.js";
 
 export function qsa(node, selector) { return Array.from(node.querySelectorAll(selector)); }
 
@@ -56,7 +58,10 @@ export function aggregatedValue(aggNode) {
     if (type === "Core/PhysicalQuantities.PhysicalQuantity") {
         const unitRaw = valueFromData(aggNode, "Unit");
         const unitRef = (unitRaw && unitRaw.kind === "DataReference") ? unitRaw.value : (unitRaw || "");
-        const unitSymbol = unitRef.split(".").pop() || unitRef;
+        // unit shown by its Core.xml symbol (MetaData/un_symbol, see unitSymbols.js),
+        // e.g. PressureGaugeUnit.Bar -> "barg"; falls back to the literal name
+        const unitKey = unitRef.split("/").pop().split(".").slice(-2).join(".");
+        const unitSymbol = UNIT_SYMBOLS[unitKey] || unitRef.split(".").pop() || unitRef;
         const value = valueFromData(aggNode, "Value");
         return { kind: "PhysicalQuantity", value, unit: unitSymbol, unitRef };
     }
@@ -505,6 +510,83 @@ export function collectDescendantObjectIds(node, out = new Set()) {
 // below and App.jsx's SIGNAL_CONVEYING_MARKS for the sub-type glyphs.
 const SIGNAL_CONVEYING_DASH_ARRAY = "3 2";
 
+// Label group types: Core/Diagram.Label and all its subtypes in the class model
+// (e.g. Plant/Diagram.SafetyValveOrFittingLabel, PipingNetworkSegmentLabel).
+const LABEL_CLASS_SUFFIXES = (() => {
+    const supers = new Map();
+    for (const [cls, sup] of PLANT_HIERARCHY) { if (!supers.has(cls)) supers.set(cls, []); supers.get(cls).push(sup); }
+    const isLabel = (cls, seen = new Set()) => {
+        if (cls === "Label") return true;
+        if (seen.has(cls)) return false;
+        seen.add(cls);
+        return (supers.get(cls) || []).some(sup => isLabel(sup, seen));
+    };
+    return new Set([...new Set([...supers.keys(), "Label"])].filter(c => isLabel(c)));
+})();
+export function isLabelType(type) {
+    if (!type || !/^(Core|Plant|Process)\/Diagram\./.test(type)) return false;
+    return LABEL_CLASS_SUFFIXES.has(type.split(/[./]/).pop());
+}
+
+// Class model used to decide whether an attribute is valid for an object:
+// class-name suffix -> Set<attribute name> (Data and Reference properties),
+// inherited along superTypes. Seeded from the base Plant model (metaModel.js)
+// and extended with the loaded DiscProfile's ConcreteClass/AbstractClass
+// declarations and ClassExtensions (keyed on their baseType, e.g.
+// ObjectDisplayName added to Plant/Piping.PipingNetworkSystem). Cached per
+// profile document.
+const classAttributeCache = new WeakMap();
+const NO_PROFILE_KEY = {};
+export function buildClassAttributeMap(discDoc) {
+    const cacheKey = discDoc || NO_PROFILE_KEY;
+    if (classAttributeCache.has(cacheKey)) return classAttributeCache.get(cacheKey);
+    const supers = new Map();
+    const own = new Map();
+    const addSuper = (cls, sup) => { if (!cls || !sup) return; if (!supers.has(cls)) supers.set(cls, new Set()); supers.get(cls).add(sup); };
+    const addAttr = (cls, name) => { if (!cls || !name) return; if (!own.has(cls)) own.set(cls, new Set()); own.get(cls).add(name); };
+    const suffix = v => (v || "").split(/[./]/).pop();
+    for (const [cls, sup] of PLANT_HIERARCHY) addSuper(cls, sup);
+    for (const [cls, dataCsv, , refCsv] of PLANT_PROPS) {
+        for (const csv of [dataCsv, refCsv]) {
+            for (const entry of (csv || "").split("|")) addAttr(cls, entry.split(":")[0]);
+        }
+    }
+    if (discDoc?.documentElement) {
+        const visit = node => {
+            for (const child of Array.from(node.children || [])) {
+                const tag = child.tagName;
+                if (tag === "Package") { visit(child); continue; }
+                let cls = null;
+                if (tag === "ConcreteClass" || tag === "AbstractClass") {
+                    cls = child.getAttribute("name");
+                    (child.getAttribute("superTypes") || "").split(/\s+/).filter(Boolean).forEach(t => addSuper(cls, suffix(t)));
+                } else if (tag === "ClassExtension") {
+                    cls = suffix(child.getAttribute("baseType"));
+                }
+                if (!cls) continue;
+                for (const prop of Array.from(child.children || [])) {
+                    if (prop.tagName === "DataProperty" || prop.tagName === "ReferenceProperty") addAttr(cls, prop.getAttribute("name"));
+                }
+            }
+        };
+        visit(discDoc.documentElement);
+    }
+    const resolved = new Map();
+    const resolve = (cls, stack = new Set()) => {
+        if (resolved.has(cls)) return resolved.get(cls);
+        const out = new Set(own.get(cls) || []);
+        stack.add(cls);
+        for (const sup of supers.get(cls) || []) if (!stack.has(sup)) resolve(sup, stack).forEach(a => out.add(a));
+        stack.delete(cls);
+        resolved.set(cls, out);
+        return out;
+    };
+    const map = new Map();
+    for (const cls of new Set([...supers.keys(), ...own.keys()])) map.set(cls, resolve(cls));
+    classAttributeCache.set(cacheKey, map);
+    return map;
+}
+
 export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
     const { byElementId: nodePosMap, byNodeId: nodePositionsByNodeId } = parseNodePositionsById(mainDoc);
     const drawn = [];
@@ -534,13 +616,17 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
     // "no match" (its label stays suppressed) rather than papered over with
     // an internally-generated id it doesn't actually have in the file.
     const childrenByParentId = new Map();
-    // objectId → [targetId, ...] for every References target the object
-    // itself carries (any property, e.g. ParentStructure/PlantSystem/etc.) -
-    // used by lookupProperty()'s nearby-object search below, since a
-    // template placeholder like <ProcessPlantIdentificationCode> or
-    // <PlantSystemIdentificationCode> lives on a REFERENCED ProcessPlant/
-    // PlantSystem object, not on the object the template is attached to.
-    const referencesByParentId = new Map();
+    // Attribute validity per object class (see buildClassAttributeMap()).
+    const classAttributes = buildClassAttributeMap(discDoc);
+    // objectId -> its composition parent's id, and objectId -> its plant
+    // structure references (ParentStructure / PlantSystem targets) - see
+    // structureSources() below.
+    const parentIdById = new Map();
+    const structureRefsById = new Map();
+    // off-page connector id -> ids of its composed ConnectorReference objects
+    // (xxOffPageConnectorReferenceByNumber), which carry the connector label's
+    // ReferencedDrawingNumber / ReferencedDrawingDescriptor / ReferencedDrawingMainTag
+    const connectorRefsById = new Map();
     qsa(mainDoc, "Object[id]").forEach(el => {
         const id = el.getAttribute("id");
         objectTypeMap.set(id, el.getAttribute("type") || "");
@@ -559,10 +645,19 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         if (parentId) {
             if (!childrenByParentId.has(parentId)) childrenByParentId.set(parentId, []);
             childrenByParentId.get(parentId).push({ id, type: el.getAttribute("type") || "" });
+            parentIdById.set(id, parentId);
+            const holder = el.parentNode;
+            if (holder && typeof holder.getAttribute === "function" && holder.getAttribute("property") === "ConnectorReference") {
+                if (!connectorRefsById.has(parentId)) connectorRefsById.set(parentId, []);
+                connectorRefsById.get(parentId).push(id);
+            }
         }
+        const structureRefs = {
+            parentStructure: referenceTargets(el, "ParentStructure"),
+            plantSystem: referenceTargets(el, "PlantSystem"),
+        };
+        if (structureRefs.parentStructure.length || structureRefs.plantSystem.length) structureRefsById.set(id, structureRefs);
 
-        const refTargets = referenceTargets(el);
-        if (refTargets.length) referencesByParentId.set(id, refTargets);
     });
 
     // Resolve a raw Data value (plain string, or a DataReference to an
@@ -601,40 +696,105 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         return props.get(attributeName) ?? props.get(bare) ?? props.get(`DiscProfile/${bare}`);
     }
 
-    // Look up objectId's Data property, and - when it's not there directly -
-    // search up to two hops out through objectId's own nested children
-    // (Components) and References targets (any property) for the nearest
-    // object that DOES carry it. Several DiscProfile LabelTemplate.Text
-    // placeholders name an attribute that lives on a related object rather
-    // than the one the template itself is attached to - e.g.
-    // <ProcessPlantIdentificationCode> lives on the ProcessPlant a
-    // ProcessInstrumentationFunction reaches via its own ParentStructure
-    // reference, and <PlantSystemIdentificationCode> on the PlantSystem it
-    // reaches via its own PlantSystem reference - neither is a property of
-    // the PIF itself. Breadth-first, so the CLOSEST object with a matching
-    // property wins over a more distant one.
+    // Is attributeName a valid attribute (Data or Reference property, own,
+    // inherited or added by a DiscProfile ClassExtension) of objectId's class?
+    // An object whose class isn't in the class model at all is not restricted.
+    // Tool-specific attribute names (e.g. "SPPID: ItemTag") are never valid.
+    function isAttributeValidFor(objectId, attributeName) {
+        if (!objectId || !attributeName) return false;
+        const cls = (objectTypeMap.get(objectId) || "").split(/[./]/).pop();
+        const attrs = cls ? classAttributes.get(cls) : null;
+        if (!attrs) return true;
+        return attrs.has(attributeName.split("/").pop());
+    }
+
+    // A label shows an attribute ONLY from the object the label itself names
+    // for it, and only when that attribute is valid for that object's class -
+    // no search through nested children or references (that used to pick up
+    // e.g. a segment's TargetItem nozzle tag "N05" for a line label's
+    // <ObjectDisplayName> when the segment itself has none).
     function lookupProperty(objectId, attributeName) {
-        const direct = ownProperty(objectId, attributeName);
-        if (direct !== undefined) return direct;
-        if (!objectId) return undefined;
-        const seen = new Set([objectId]);
-        let frontier = [objectId];
-        for (let depth = 0; depth < 2 && frontier.length; depth++) {
-            const next = [];
-            for (const id of frontier) {
-                const neighborIds = [
-                    ...(childrenByParentId.get(id) || []).map(c => c.id),
-                    ...(referencesByParentId.get(id) || []),
-                ];
-                for (const nid of neighborIds) {
-                    if (!nid || seen.has(nid)) continue;
-                    seen.add(nid);
-                    const v = ownProperty(nid, attributeName);
-                    if (v !== undefined) return v;
-                    next.push(nid);
-                }
+        if (!isAttributeValidFor(objectId, attributeName)) return undefined;
+        return ownProperty(objectId, attributeName);
+    }
+
+    // A label shows attributes of the component it labels (representedId)
+    // only - e.g. an ND0040 line label on a PipingNetworkSegment reads the
+    // SEGMENT's ObjectDisplayName and shows nothing when the segment has none,
+    // even if the label's AttributeRepresentation points at another object
+    // (such as the segment's PipingNetworkSystem). References to a Core/Note
+    // are the only exception (note flags are not component attributes).
+    function isLabelReferenceAllowed(representedId, objectId) {
+        if (!representedId || !objectTypeMap.has(representedId)) return true; // label of no component
+        if (objectId === representedId) return true;
+        if (structureSources(representedId).includes(objectId)) return true;
+        if ((connectorRefsById.get(representedId) || []).includes(objectId)) return true;
+        if (isRoleChildOf(representedId, objectId)) return true;
+        return objectTypeMap.get(objectId) === "Core/Note";
+    }
+
+    // An object nested in the component whose class the component's symbol
+    // label templates name as a role path ("ClassName:<Attr>", e.g. the
+    // SignalConveyingFunction behind "'HH=' & SignalConveyingFunction:
+    // <AlarmValue>") - the same objects pickRoleChild() chooses from.
+    const roleNamesCache = new Map();
+    function roleNamesFor(representedId) {
+        if (roleNamesCache.has(representedId)) return roleNamesCache.get(representedId);
+        const names = new Set();
+        (discSymbolsByRepresentedId.get(representedId) || []).forEach(sym => (sym.variants || []).forEach(v => (v.labelTemplates || []).forEach(lt => {
+            const re = /([A-Za-z][A-Za-z0-9_]*):</g;
+            let m;
+            while ((m = re.exec(lt.text || "")) !== null) names.add(m[1]);
+        })));
+        roleNamesCache.set(representedId, names);
+        return names;
+    }
+    function isRoleChildOf(representedId, objectId) {
+        if (!objectId || parentIdById.get(objectId) !== representedId) return false;
+        return roleNamesFor(representedId).has((objectTypeMap.get(objectId) || "").split(/[./]/).pop());
+    }
+
+    // The plant structure items a component's label may also read from - the
+    // objects it reaches through its own PlantSystem reference and its
+    // ParentStructure reference (followed up the ParentStructure chain, e.g.
+    // PlantArea -> ProcessPlant). E.g. an instrument bubble's
+    // <ProcessPlantIdentificationCode> comes from the ProcessPlant and
+    // <PlantSystemIdentificationCode> from the PlantSystem. A component that
+    // carries neither reference itself (e.g. a valve inside a
+    // PipingNetworkSystem) uses its nearest composition owner that does.
+    const structureSourcesCache = new Map();
+    function structureSources(componentId) {
+        if (structureSourcesCache.has(componentId)) return structureSourcesCache.get(componentId);
+        let holder = componentId;
+        while (holder && !structureRefsById.has(holder)) holder = parentIdById.get(holder);
+        const out = [];
+        if (holder) {
+            const refs = structureRefsById.get(holder);
+            const queue = [...refs.plantSystem, ...refs.parentStructure];
+            while (queue.length) {
+                const id = queue.shift();
+                if (!id || out.includes(id) || !objectTypeMap.has(id)) continue;
+                out.push(id);
+                queue.push(...(structureRefsById.get(id)?.parentStructure || []));
             }
-            frontier = next;
+        }
+        structureSourcesCache.set(componentId, out);
+        return out;
+    }
+
+    // Value of a label placeholder: the component's own attribute, else the
+    // same attribute on one of its plant structure items (structureSources()),
+    // each only when the attribute is valid for that object's class.
+    function componentAttribute(componentId, attributeName) {
+        const own = lookupProperty(componentId, attributeName);
+        if (own !== undefined) return own;
+        for (const id of (connectorRefsById.get(componentId) || [])) {
+            const v = lookupProperty(id, attributeName);
+            if (v !== undefined) return v;
+        }
+        for (const id of structureSources(componentId)) {
+            const v = lookupProperty(id, attributeName);
+            if (v !== undefined) return v;
         }
         return undefined;
     }
@@ -750,16 +910,17 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
 
     // Fallback for a DiscProfile-symbol label whose own Text carries no
     // Template: substitute <PlaceholderName> tokens in the matching symbol
-    // variant's Profile/LabelTemplate.Text against representedId's own (or,
-    // failing that, a nearby related object's - see lookupProperty() above)
-    // Data properties. Handles two placeholder forms:
+    // variant's Profile/LabelTemplate.Text against the Data properties of the
+    // object the label names for each attribute. Handles two placeholder forms:
     //   <AttributeName>                 e.g. "<ObjectDisplayName>",
     //                                    "<ProcessPlantIdentificationCode>-<PlantSystemIdentificationCode>"
-    //                                    - looked up via lookupProperty(),
-    //                                    which searches outward from
-    //                                    representedId (its own data first,
-    //                                    then nested children/references)
-    //                                    for the nearest object that has it.
+    //                                    - read from representedId (the component
+    //                                    the label belongs to) or, failing that,
+    //                                    the plant structure items it references
+    //                                    (ParentStructure chain / PlantSystem, see
+    //                                    structureSources()), only where the
+    //                                    attribute is valid for that object's
+    //                                    class (lookupProperty()); otherwise blank.
     //   ClassName:<AttributeName>       e.g. "H=' & SignalConveyingFunction:<AlarmValue>"
     //                                    - some DISC-added attributes (like
     //                                    AlarmValue, a ClassExtension on
@@ -825,6 +986,11 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         // an empty string (e.g. DiscProfile/TagSuffix="") - that's a
         // successful resolution.
         let unresolved = false;
+        // Template literals (e.g. the "-" in "<ProcessPlantIdentificationCode>-
+        // <PlantSystemIdentificationCode>", or "SP = ") are only shown next to
+        // at least one resolved value - a line whose attributes are all blank
+        // is suppressed rather than showing its separators/prefix on their own.
+        let anyValue = false;
         const text = labelTemplateText.replace(/(?:([A-Za-z][A-Za-z0-9_]*):)?<([^<>]+)>/g, (_m, roleName, attrName) => {
             if (roleName) {
                 const targetId = pickRoleChild(representedId, roleName, roleCounters, portStatusHint);
@@ -842,14 +1008,22 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
                 // same parent) - bleeding L's value into HH's label. A
                 // missing attribute on the matched object should read as
                 // blank, not "search elsewhere".
-                return fragmentValueToText(ownProperty(targetId, attrName), "Value");
+                // the connected object exists (e.g. the SignalConveyingFunction
+                // with the matching PortStatus): show the template line - at
+                // least its literal ("HH=") - plus the value with its units
+                // once the object has one
+                anyValue = true;
+                return fragmentValueToText(lookupProperty(targetId, attrName), "ValueAndUnits");
             }
             // A bare placeholder renders blank when unresolved, rather than
             // suppressing the whole (possibly multi-field) template - see
             // the comment above.
-            return fragmentValueToText(lookupProperty(representedId, attrName), "Value");
+            const valueText = fragmentValueToText(componentAttribute(representedId, attrName), "Value");
+            if (valueText) anyValue = true;
+            return valueText;
         });
-        return unresolved ? null : text;
+        if (unresolved || !anyValue) return null;
+        return text;
     }
 
     // Computes primitive.profileText (from its own Template, if any) right
@@ -979,7 +1153,7 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         // is annotation text and should highlight orange (elementRole "label"),
         // not the primary red used for symbol outlines.
         const groupType = groupNode.getAttribute ? (groupNode.getAttribute("type") || "") : "";
-        const isLabelGroup = groupType === "Core/Diagram.Label";
+        const isLabelGroup = isLabelType(groupType);
 
         const localRepresents = resolveRepresentedId(groupNode, currentRepresents);
         directComponentsObjects(groupNode, "Elements").forEach((el, i) => {
@@ -988,7 +1162,7 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
                 pushSymbolUsage(referenceTargets(el, "Symbol")[0] || null, el, localRepresents, `${keyPrefix}_su_${i}`, isLabelGroup ? "label" : "symbol");
             } else if (type === "Core/Diagram.ShapeUsage") {
                 pushSymbolUsage(referenceTargets(el, "Shape")[0] || null, el, localRepresents, `${keyPrefix}_shu_${i}`, isLabelGroup ? "label" : "symbol");
-            } else if (type === "Core/Diagram.Label") {
+            } else if (isLabelType(type)) {
                 // Label as a direct Element child (less common â€" most files put Labels in Groups)
                 const labelRepresents = resolveRepresentedId(el, localRepresents);
                 directComponentsObjects(el, "Elements").forEach((lel, li) => {
@@ -1094,12 +1268,54 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
     // symbol actually defines LabelTemplate placeholders at all - an
     // unmodelled symbol (no LabelTemplates in this profile) imposes no
     // restriction, same as PRF-E06's own scoping.
-    function resolveFilteredTemplateFragments(fragments) {
+    // Literal pieces a DiscProfile symbol's LabelTemplates define (e.g. "P = "
+    // in "'P = ' & <SetPressureHigh>", "-" in "<A>-<B>", "EL: " in "EL: <A>").
+    const labelTemplateLiteralsCache = new Map();
+    function labelTemplateLiteralsForSymbol(symbol) {
+        if (!symbol) return null;
+        if (labelTemplateLiteralsCache.has(symbol.key)) return labelTemplateLiteralsCache.get(symbol.key);
+        const lits = new Set();
+        (symbol.variants || []).forEach(v => (v.labelTemplates || []).forEach(lt => {
+            if (!lt.text) return;
+            String(lt.text).split(/\r?\n/).forEach(row => {
+                unwrapLabelFormula(row).split(/(?:[A-Za-z][A-Za-z0-9_]*:)?<[^<>]+>/).forEach(piece => {
+                    if (piece) { lits.add(piece); lits.add(piece.trim()); }
+                });
+            });
+        }));
+        labelTemplateLiteralsCache.set(symbol.key, lits);
+        return lits;
+    }
+
+    // With a profile loaded, a label's literal Fragment is shown only when it
+    // matches a literal of the profile LabelTemplates defined for the label's
+    // symbols (whitespace-only separators are kept). Without a profile, for an
+    // element placed with no profile symbol that has LabelTemplates, or for
+    // a Core/Note label (never profile-governed), every literal is shown.
+    function resolveFilteredTemplateFragments(fragments, representedId = null) {
         if (!fragments || !fragments.length) return null;
+        const noteLabel = (representedId && objectTypeMap.get(representedId) === "Core/Note")
+            || fragments.some(f => f.kind === "attr" && f.objectId && objectTypeMap.get(f.objectId) === "Core/Note");
+        let allowedLiterals = null;
+        if (discDoc && !noteLabel) {
+            const syms = ((representedId && discSymbolsByRepresentedId.get(representedId)) || [])
+                .filter(sym => (sym.variants || []).some(v => (v.labelTemplates || []).length));
+            // no profile symbol with LabelTemplates for this element: nothing to match against
+            if (syms.length) allowedLiterals = new Set(syms.flatMap(sym => [...(labelTemplateLiteralsForSymbol(sym) || [])]));
+        }
         return fragments.map(f => {
-            if (f.kind === "literal") return f.text || "";
+            if (f.kind === "literal") {
+                const t = f.text || "";
+                if (!allowedLiterals || !t.trim()) return t;
+                return (allowedLiterals.has(t) || allowedLiterals.has(t.trim())) ? t : "";
+            }
             if (f.kind === "attr") {
-                const symsForFrag = f.objectId ? discSymbolsByRepresentedId.get(f.objectId) : null;
+                // The symbols that own this label (placed for the label's own
+                // represented object) decide which attributes are valid for it;
+                // only when the label's object has none, fall back to the symbols
+                // of the object the Fragment names.
+                const symsForFrag = (representedId && discSymbolsByRepresentedId.get(representedId))
+                    || (f.objectId ? discSymbolsByRepresentedId.get(f.objectId) : null);
                 const allowed = symsForFrag
                     ? new Set(symsForFrag.flatMap(sym => [...(labelTemplateAttrsForSymbol(sym) || [])]))
                     : null;
@@ -1107,6 +1323,8 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
                     const bare = f.attributeName.split("/").pop();
                     if (!allowed.has(f.attributeName) && !allowed.has(bare)) return "";
                 }
+                // only the labelled component's own attributes (see isLabelReferenceAllowed())
+                if (!isLabelReferenceAllowed(representedId, f.objectId)) return "";
                 return fragmentValueToText(lookupProperty(f.objectId, f.attributeName), f.repType);
             }
             return "";
@@ -1230,8 +1448,72 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
     drawn.forEach(el => {
         if (el.elementRole !== "label" || el.kind !== "primitive" || el.primitive?.kind !== "text") return;
         el.primitive.rawProfileText = el.primitive.profileText;
-        el.primitive.validRawProfileText = resolveFilteredTemplateFragments(el.primitive.templateFragments);
+        el.primitive.validRawProfileText = resolveFilteredTemplateFragments(el.primitive.templateFragments, el.representedId);
+        // A label of a component (its represented object exists in the model)
+        // shows ONLY the values of the attributes it references on the related
+        // object - never the literal <Data property="Text"> string stored in
+        // the file. Attribute references are resolved strictly (lookupProperty():
+        // only on the object named, only if the attribute is valid for its
+        // class) and only for attributes the component's placed DiscProfile
+        // symbols offer (resolveFilteredTemplateFragments()). A label Text with
+        // no attribute reference at all shows nothing. Used by App.jsx's
+        // renderPrimitive() in both "Profile labels" states.
+        el.primitive.isComponentLabel = !!(el.representedId && objectTypeMap.has(el.representedId));
+        const hasAttrRef = !!(el.primitive.templateFragments && el.primitive.templateFragments.some(f => f.kind === "attr"));
+        // No attribute referenced: without a profile the label's stored text is
+        // shown; with a profile loaded every label is defined by attributes, so
+        // nothing is shown.
+        el.primitive.componentText = hasAttrRef
+            ? (el.primitive.validRawProfileText ?? "")
+            : (discDoc ? "" : (el.primitive.value ?? ""));
     });
+
+    // Any other drawn Text whose template references attributes (outside a
+    // label group) is a label too: it shows only the component's attribute
+    // values, the same way - never its stored <Data property="Text"> string.
+    drawn.forEach(el => {
+        if (el.elementRole === "label" || el.kind !== "primitive" || el.primitive?.kind !== "text") return;
+        const fragments = el.primitive.templateFragments;
+        if (!el.representedId || !objectTypeMap.has(el.representedId)) return;
+        if (!fragments || !fragments.some(f => f.kind === "attr")) return;
+        el.primitive.isComponentLabel = true;
+        el.primitive.componentText = resolveFilteredTemplateFragments(fragments, el.representedId) ?? "";
+    });
+
+    // Profile selected: a label is shown only when it belongs to a profile
+    // symbol or profile label symbol - its represented object must be placed
+    // with a valid DiscProfile symbol reference that defines LabelTemplates.
+    // The only labels allowed without a symbol are those linked to a Core/Note:
+    // they must reference a valid attribute of the Note (e.g. NoteText,
+    // LocalNoteIdentifier) and may carry literal text.
+    if (discDoc) {
+        const hasProfileSymbol = id => !!id && (discSymbolsByRepresentedId.get(id) || []).some(sym =>
+            sym && (sym.variants || []).some(v => (v.labelTemplates || []).length));
+        drawn.forEach(el => {
+            if (el.kind !== "primitive" || el.primitive?.kind !== "text") return;
+            const fragments = el.primitive.templateFragments || [];
+            const isLabel = el.elementRole === "label" || fragments.some(f => f.kind === "attr");
+            if (!isLabel) return;
+            const noteFrags = fragments.filter(f => f.kind === "attr" && f.objectId && objectTypeMap.get(f.objectId) === "Core/Note");
+            const representsNote = !!el.representedId && objectTypeMap.get(el.representedId) === "Core/Note";
+            el.primitive.isComponentLabel = true;
+            if (noteFrags.length || representsNote) {
+                // Note label: literals plus the Note's own valid attributes only
+                const validNote = noteFrags.some(f => isAttributeValidFor(f.objectId, f.attributeName));
+                el.primitive.isDiscProfileLabel = false;
+                el.primitive.componentText = validNote
+                    ? fragments.map(f => f.kind === "literal" ? (f.text || "")
+                        : (f.kind === "attr" && objectTypeMap.get(f.objectId) === "Core/Note")
+                            ? fragmentValueToText(lookupProperty(f.objectId, f.attributeName), f.repType)
+                            : "").join("")
+                    : "";
+                return;
+            }
+            if (!hasProfileSymbol(el.representedId) || !fragments.some(f => f.kind === "attr")) {
+                el.primitive.componentText = "";
+            }
+        });
+    }
 
     // Some source files export several visually-distinct label Text pieces
     // (e.g. a plant/system prefix, a tag-type code, and a sequence number,

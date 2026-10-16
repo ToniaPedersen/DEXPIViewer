@@ -25,7 +25,7 @@ const HIDE_ISSUES_KEY = "dexpiViewer.hideIssues";
 // Image compare (PNG vs DEXPI) UI: the Compare button / Compare layer
 // checkbox in BG Controls and the Compare tabs. Auto-fit and Save placement
 // stay available either way. Set to true to bring the compare back.
-const SHOW_IMAGE_COMPARE = false;
+const SHOW_IMAGE_COMPARE = true;
 // Default code set for the Custom mode (fill in, e.g. ["VAX-003", "ERR-E02"]).
 const DEFAULT_CUSTOM_HIDE_CODES = [];
 const HIDE_ISSUES_DEFAULT = { enabled: false, mode: "AllErrors", codes: DEFAULT_CUSTOM_HIDE_CODES };
@@ -460,11 +460,20 @@ function renderPrimitive(primitive, key, textColorOverride = null, strokeMult = 
         // DiscProfile.xml is loaded at all, or for a label with neither a
         // catalogued symbol nor its own TextTemplate (isProfileGoverned is
         // always false in both cases).
-        const displayText = showProfileLabels
-            ? ((primitive.isDiscProfileLabel || primitive.isProfileGoverned) ? "" : primitive.value)
-            : (primitive.isProfileGoverned
-                ? (primitive.hasProfileAttributeBacking ? (primitive.validRawProfileText ?? primitive.value) : "")
-                : primitive.value);
+        // A component's label (primitive.isComponentLabel, see dexpiParser.js)
+        // never shows the file's literal Text string - only the values of the
+        // attributes it references on the related object (primitive.
+        // componentText). With "Profile labels" checked, a catalogued
+        // DiscProfile symbol's label still defers to the symbol's own
+        // LabelTemplate overlay instead. Labels that belong to no component
+        // keep the behaviour below.
+        const displayText = primitive.isComponentLabel
+            ? ((showProfileLabels && primitive.isDiscProfileLabel) ? "" : (primitive.componentText ?? ""))
+            : showProfileLabels
+                ? ((primitive.isDiscProfileLabel || primitive.isProfileGoverned) ? "" : primitive.value)
+                : (primitive.isProfileGoverned
+                    ? (primitive.hasProfileAttributeBacking ? (primitive.validRawProfileText ?? primitive.value) : "")
+                    : primitive.value);
         // "LabelTemplates and TextTemplate should not scale": a Text
         // primitive driven by a Core/Diagram.TextTemplate (templateFragments)
         // that lives inside a symbol's own catalog primitives (SymbolGraphic
@@ -897,14 +906,62 @@ function HeatTracePIF({ el }) {
 // renderPrimitive's more narrowly-scoped templateFragments check) and to
 // fold the label's total effective rotation (placement + the LabelTemplate's
 // own local Rotation) into a readable orientation.
+// Where a profile LabelTemplate is drawn on a placed symbol.
+//
+// The template defines the label for the symbol at rotation 0, not mirrored.
+// On the drawing the text is always kept readable (left to right, or bottom to
+// top beside a vertical symbol), so a symbol turned over by its rotation (90
+// or 180) cannot simply carry its label with it. Per axis of the symbol:
+//   * where the symbol extends to both sides of its origin (e.g. the box of an
+//     ND0009 off-page connector), the label keeps the side it has at 0 - a
+//     connector at 180 still has its descriptor above and its number in the box;
+//   * where the symbol lies on one side of its origin (e.g. the "house" of an
+//     ND0249A shutdown symbol, a nozzle), the label follows the symbol - the tag
+//     stays inside the rectangle, the type code inside the roof.
+// Mirroring and scaling act on the label like on the symbol. Left/Right and
+// Top/Bottom are then chosen so the text extends from its anchor in the same
+// direction, relative to the symbol, as the template intends (so it grows away
+// from the symbol, never across it). This matches where the drafters placed
+// their own labels on rotated and mirrored symbols in the SPPID exports.
+function readableAngle(a) {
+    a = ((a % 360) + 360) % 360;
+    if (a >= 90 && a < 270) return a - 180;   // [-90, 90)
+    return a >= 270 ? a - 360 : a;
+}
+function labelOverlayPlacement(ov, el) {
+    const deg = Math.PI / 180;
+    const v = el.variant || {};
+    const bothSides = (lo, hi) => { const len = Math.abs((hi || 0) - (lo || 0)) || 1; return Math.min(lo || 0, hi || 0) < -0.05 * len && Math.max(lo || 0, hi || 0) > 0.05 * len; };
+    const R = el.rotation || 0;
+    const Reff = readableAngle(R);
+    const turnedOver = Math.abs((((Reff - R) % 360) + 360) % 360 - 180) < 0.01;
+    const rx = (turnedOver && bothSides(v.minX, v.maxX)) ? -1 : 1;
+    const ry = (turnedOver && bothSides(v.minY, v.maxY)) ? -1 : 1;
+    const sx = Math.sign((el.scaleX || 1) * (el.isMirrored ? -1 : 1)) || 1;
+    const sy = Math.sign(el.scaleY || 1) || 1;
+    const rot = (x, y, a) => [x * Math.cos(a * deg) - y * Math.sin(a * deg), x * Math.sin(a * deg) + y * Math.cos(a * deg)];
+    const dot = (p, q) => p[0] * q[0] + p[1] * q[1];
+    // world direction of a direction given in the template's frame
+    const L = ([x, y]) => rot(x * sx * rx, y * sy * ry, R);
+    const t = ov.rotation || 0;
+    const readable = readableTextOrientation(Reff, t, "start", "hanging");
+    const worldAngle = Reff + readable.rotation;
+    const D = rot(1, 0, worldAngle), Dn = rot(0, 1, worldAngle);   // text reading / text down directions
+    const ex = L(rot(1, 0, t)), ey = L(rot(0, 1, t));              // template text x / down directions
+    const align = ov.alignment || "CenterCenter";
+    let anchor = "middle", baseline = "middle";
+    if (align.startsWith("Left")) anchor = dot(ex, D) > 0 ? "start" : "end";
+    else if (align.startsWith("Right")) anchor = dot(ex, D) > 0 ? "end" : "start";
+    if (align.endsWith("Top")) baseline = dot(ey, Dn) > 0 ? "hanging" : "baseline";
+    else if (align.endsWith("Bottom")) baseline = dot(ey, Dn) > 0 ? "baseline" : "hanging";
+    return { x: rx * ov.position.x, y: ry * ov.position.y, rotation: worldAngle - R, anchor, baseline };
+}
+
 function renderLabelOverlay(ov, key, el) {
-    const align = (ov.alignment || "").toLowerCase();
-    const rawAnchor = align.includes("left") ? "start" : align.includes("right") ? "end" : "middle";
-    const rawBaseline = align.includes("bottom") ? "baseline" : align.includes("top") ? "hanging" : "middle";
+    const { x, y, rotation, anchor, baseline } = labelOverlayPlacement(ov, el);
     const mirror = el.isMirrored ? -1 : 1;
-    const { rotation, anchor, baseline } = readableTextOrientation(el.rotation, ov.rotation, rawAnchor, rawBaseline);
     return renderMultilineText({
-        key, x: ov.position.x, y: ov.position.y, rotation,
+        key, x, y, rotation,
         fontFamily: ov.font, fontSize: ov.size, fill: parseColor(ov.color), anchor, baseline,
         counterScale: { sx: el.scaleX * mirror, sy: el.scaleY },
     }, ov.text);
