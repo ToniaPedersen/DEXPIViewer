@@ -23,6 +23,12 @@ Changes from version 2.0 (commit `a6c414b` "Version 2.0", 2026-10-14).
 - **No profile loaded**: a label with attribute references shows the component values and its literals; a label with no attribute reference shows its stored text.
 - Alarm rows (`HH=` / `H=` / `L=` / `LL=`) show the literal as soon as the matching `SignalConveyingFunction` (by `PortStatus`) exists, and the value with its unit once it has an `AlarmValue`.
 
+### Only graphics that belong to a model object are drawn
+
+- Every drawn element (symbol, label text, line, connector line) must sit in a group that represents an existing model object. Bare graphics exported without a component behind them - SPPID's `DrawingLabels` polylines (frames, table lines, interface markers), free text not turned into a `Core/Note` - and anything whose `Represents` target does not exist in the file are not drawn.
+- With a profile loaded, a bare polyline or polygon is drawn only when it is a piping or signal line drawn without a symbol, or an open line (a leader) in a group that has a profile symbol. A closed shape next to a symbol duplicates the symbol's own graphics (SPPID exports its slope triangle beside the ND0224 symbol usage and its flow arrow beside ND0010) and is not drawn; nor are frames, tables or package boundaries drawn without a symbol.
+- `scripts/Convert-DexpiTextToNotes.ps1` (new) turns the free text of the `DrawingLabels` group into `Core/Note` components (NoteText = the text as shown, `LocalNoteIdentifier` from `NOTE n` flags), each in its own RepresentationGroup that represents the Note, so notes, note flags and title block texts stay visible. Texts in labels holding graphics (revision table, change-flag table) are skipped and reported.
+
 ### Profile labels - placement under rotation and mirroring
 
 - A profile label template is defined for the symbol at rotation 0, not mirrored. On the drawing the text is always kept readable (left to right, or bottom to top beside a vertical symbol), and never turned upside down or right to left.
@@ -44,4 +50,4 @@ Copy features are opt-in and off by default: `-BackfillValues` (write values rea
 
 ### Files changed
 
-`package.json`, `package-lock.json`, `ChangeLog_2.0_to_2.1.md` (new), `public/UserGuide.md`, `public/UserGuide.html`, `src/App.jsx`, `src/dexpiParser.js`, `src/unitSymbols.js` (new), `scripts/genUnitSymbols.py` (new), `scripts/Update-DexpiLabels.ps1` (new).
+`package.json`, `package-lock.json`, `ChangeLog_2.0_to_2.1.md` (new), `public/UserGuide.md`, `public/UserGuide.html`, `src/App.jsx`, `src/dexpiParser.js`, `src/unitSymbols.js` (new), `scripts/genUnitSymbols.py` (new), `scripts/Update-DexpiLabels.ps1` (new), `scripts/Convert-DexpiTextToNotes.ps1` (new).

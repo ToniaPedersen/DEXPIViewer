@@ -1599,7 +1599,51 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         if (overlays.length) el.labelOverlays = overlays;
     });
 
-    return { elements: drawn, nodePosMap, nodePositionsByNodeId };
+    // Only graphics that belong to a model object are shown: every drawn
+    // element must sit in a group that represents an existing object (symbol,
+    // label, connector line, note text alike). Bare graphics exported without a
+    // component behind them - e.g. SPPID's 'DrawingLabels' polylines, frames,
+    // interface markers, free text not turned into a Core/Note - are dropped,
+    // as is anything whose Represents target does not exist in the file.
+    const linked = drawn.filter(el => el.representedId && objectTypeMap.has(el.representedId));
+
+    // With a profile loaded, bare polylines / polygons are drawn only when they are
+    //  * a piping or signal line (the represented object is a pipe, piping
+    //    network segment or signal conveying function) drawn without a symbol, or
+    //  * part of a graphic that has a profile symbol (a Profile/SymbolUsage or
+    //    ShapeUsage in the same group) AND an open line - a leader line.
+    // A closed shape next to a symbol duplicates the symbol's own graphics
+    // (e.g. SPPID exports the slope triangle as polylines beside the ND0224
+    // symbol usage) and is dropped, as is every other free polyline (frames,
+    // tables, package boundaries drawn without a symbol).
+    const PIPING_OR_SIGNAL = /Plant\/Piping\.(Pipe|PipingNetworkSegment|PipingNetworkSystem|PipingConnection)$|Plant\/Instrumentation\.(SignalConveyingFunction|SignalLineFunction|MeasuringLineFunction)$/;
+    const groupKeyOf = key => key.replace(/_(p|su|shu|lblsym|lbltxt|lblshape|cl)_\d+(_\d+)?$/, "");
+    const groupsWithSymbol = new Set();
+    linked.forEach(el => { if (el.kind === "symbolUsage") groupsWithSymbol.add(groupKeyOf(el.key)); });
+    const endpointCounts = new Map();   // groupKey -> Map("x,y" -> count) over polyline end points
+    const ptKey = pt => `${Math.round(pt.x * 100) / 100},${Math.round(pt.y * 100) / 100}`;
+    linked.forEach(el => {
+        if (el.kind !== "primitive" || el.primitive?.kind !== "polyline" || !el.primitive.points?.length) return;
+        const g = groupKeyOf(el.key);
+        if (!endpointCounts.has(g)) endpointCounts.set(g, new Map());
+        const m = endpointCounts.get(g);
+        const pts = el.primitive.points;
+        for (const pt of [pts[0], pts[pts.length - 1]]) { const k = ptKey(pt); m.set(k, (m.get(k) || 0) + 1); }
+    });
+    const isAllowedLine = el => {
+        if (el.kind !== "primitive" || !["polyline", "polygon"].includes(el.primitive?.kind)) return true;
+        const g = groupKeyOf(el.key);
+        if (!groupsWithSymbol.has(g)) return PIPING_OR_SIGNAL.test(objectTypeMap.get(el.representedId) || "");
+        if (el.primitive.kind === "polygon") return false;
+        const pts = el.primitive.points || [];
+        if (pts.length < 2) return false;
+        const m = endpointCounts.get(g) || new Map();
+        const closed = (m.get(ptKey(pts[0])) || 0) >= 2 && (m.get(ptKey(pts[pts.length - 1])) || 0) >= 2;
+        return !closed;
+    };
+    const elements = discDoc ? linked.filter(isAllowedLine) : linked;
+
+    return { elements, nodePosMap, nodePositionsByNodeId, unlinkedCount: drawn.length - elements.length };
 }
 
 /**

@@ -252,6 +252,8 @@ Once a DiscProfile.xml is loaded, a **Profile labels** checkbox appears in the c
 
 **Checked** — labels are drawn from the loaded profile's own `Profile/LabelTemplate` definitions for the placed symbol, at the position the profile defines, resolved against the represented object (e.g. `<ObjectDisplayName>`, `<ReferencedDrawingNumber>`, `'HH=' & SignalConveyingFunction:<AlarmValue>`). Labels stored in the file for that symbol are hidden, so the drawing shows the profile's intended layout. A label is shown only for an element placed with a profile symbol that has label templates; the exception is a label linked to a Note, which is shown when it references a valid Note attribute and may carry literal text.
 
+Only graphics that belong to a model object are drawn at all: a symbol, label, line or text is shown when it sits in a group that represents an existing object in the file. Bare graphics exported without a component behind them (frames, table lines, interface markers, free text that is not a Note) are not drawn. The `Convert-DexpiTextToNotes.ps1` script (section 10.7) turns a drawing's free text into Note components so that notes and title block text stay visible. With a profile loaded, a plain line is drawn only when it is a piping or signal line or a leader line belonging to a symbol; a shape exported as lines next to its own symbol (a duplicate slope triangle or flow arrow) is not drawn.
+
 **Unchecked** — labels stored in the file are drawn where the file puts them (position, rotation and alignment exactly as written), but still with the component's attribute values rather than the stored text. A label with no attribute reference shows nothing while a profile is loaded, and its stored text when no profile is loaded. A literal inside a label is shown only when the profile's label template for that symbol defines it.
 
 #### Rotation and mirroring
@@ -521,6 +523,14 @@ The script creates a timestamped output folder automatically and writes a `valid
 ```
 
 For each file, in order: label references to `ItemTag` are switched to `ObjectDisplayName` where the symbol allows it; label lines that reference no valid attribute of the symbol's label templates are removed; labels that reference the right attributes on the wrong lines are relinked; elements without a valid label get the profile label added, placed with the rotation and mirroring rule described in section 5.10 (including instrument plant/system codes and alarm rows); and the labels of operated valves, safety valves and check valves are completed with the attributes of their template rows. Existing labels are never moved and component values are never changed unless the `-BackfillValues` / `-CorrectDisplayNames` switches are given. Run the script with `-?` for all options.
+
+### 10.7 Text to Notes Script
+
+`scripts/Convert-DexpiTextToNotes.ps1` (PowerShell 7) converts the free text of a drawing — notes, note flags, title block entries exported by SPPID in the `DrawingLabels` group — into `Core/Note` components. Each text becomes a Note whose `NoteText` is the text as shown (a `NOTE 12` flag also gets `LocalNoteIdentifier` 12), the text is linked to the Note's `NoteText` attribute and placed in its own group that represents the Note, keeping its position. Texts in labels that contain graphics (revision and change-flag tables) are left alone and listed in the report. Updated copies go to `<folder>\NotesAdded` with `NoteReport.csv`.
+
+```powershell
+.\scripts\Convert-DexpiTextToNotes.ps1 -InputFolder C:\DEXPI\Export
+```
 
 ## 11. Troubleshooting
 
