@@ -909,20 +909,21 @@ function HeatTracePIF({ el }) {
 // Where a profile LabelTemplate is drawn on a placed symbol.
 //
 // The template defines the label for the symbol at rotation 0, not mirrored.
-// On the drawing the text is always kept readable (left to right, or bottom to
-// top beside a vertical symbol), so a symbol turned over by its rotation (90
-// or 180) cannot simply carry its label with it. Per axis of the symbol:
-//   * where the symbol extends to both sides of its origin (e.g. the box of an
-//     ND0009 off-page connector), the label keeps the side it has at 0 - a
-//     connector at 180 still has its descriptor above and its number in the box;
-//   * where the symbol lies on one side of its origin (e.g. the "house" of an
-//     ND0249A shutdown symbol, a nozzle), the label follows the symbol - the tag
-//     stays inside the rectangle, the type code inside the roof.
-// Mirroring and scaling act on the label like on the symbol. Left/Right and
-// Top/Bottom are then chosen so the text extends from its anchor in the same
-// direction, relative to the symbol, as the template intends (so it grows away
-// from the symbol, never across it). This matches where the drafters placed
-// their own labels on rotated and mirrored symbols in the SPPID exports.
+// On the drawing the text is always kept readable (left to right at 0/180,
+// bottom to top at 90/270), so a symbol turned over by its rotation cannot
+// simply carry its label with it. DISC DEXPI rule 'B' (requirements document
+// ANNEX B: Profile Label Text under Rotation and Mirroring), for EVERY symbol:
+//   * the template's y offset (above / below) follows the symbol's full
+//     rotation - a label above the symbol at 0 is below its origin at 180,
+//     still on the symbol body;
+//   * the template's x offset (left / right) follows the readable text
+//     direction: it is mirrored with the symbol, and flipped whenever the text
+//     had to be turned over (90/180) to stay readable - a label left of the
+//     symbol at 0 is still left of it at 180 and below it at 90.
+// Left/Right and Top/Bottom are then chosen so the text extends from its
+// anchor in the same direction, relative to the symbol, as the template
+// intends (it grows away from the symbol, never across it): Left/Right swap
+// for a mirrored symbol, Top/Bottom swap when the text is turned over.
 function readableAngle(a) {
     a = ((a % 360) + 360) % 360;
     if (a >= 90 && a < 270) return a - 180;   // [-90, 90)
@@ -930,13 +931,12 @@ function readableAngle(a) {
 }
 function labelOverlayPlacement(ov, el) {
     const deg = Math.PI / 180;
-    const v = el.variant || {};
-    const bothSides = (lo, hi) => { const len = Math.abs((hi || 0) - (lo || 0)) || 1; return Math.min(lo || 0, hi || 0) < -0.05 * len && Math.max(lo || 0, hi || 0) > 0.05 * len; };
     const R = el.rotation || 0;
     const Reff = readableAngle(R);
     const turnedOver = Math.abs((((Reff - R) % 360) + 360) % 360 - 180) < 0.01;
-    const rx = (turnedOver && bothSides(v.minX, v.maxX)) ? -1 : 1;
-    const ry = (turnedOver && bothSides(v.minY, v.maxY)) ? -1 : 1;
+    // rule 'B': x offset follows the readable text direction, y offset follows the symbol
+    const rx = turnedOver ? -1 : 1;
+    const ry = 1;
     const sx = Math.sign((el.scaleX || 1) * (el.isMirrored ? -1 : 1)) || 1;
     const sy = Math.sign(el.scaleY || 1) || 1;
     const rot = (x, y, a) => [x * Math.cos(a * deg) - y * Math.sin(a * deg), x * Math.sin(a * deg) + y * Math.cos(a * deg)];

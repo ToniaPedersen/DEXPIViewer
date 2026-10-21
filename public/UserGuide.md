@@ -2,7 +2,7 @@
 
 A browser-based viewer and validation engine for [DEXPI 2.0](https://dexpi.org) intelligent P&ID files, with full support for DISC profile validation.
 
-**Version 2.1**
+**Version 2.2** — see `ChangeLog_2.1_to_2.2.md` for the changes since 2.1.
 
 Developed by **Tonia Pedersen** at **[Draga AS](https://draga.no)**.
 
@@ -248,7 +248,7 @@ Selecting a decorated line, or highlighting it via Connectivity mode, recolours 
 
 ### 5.10 Profile Labels
 
-Once a DiscProfile.xml is loaded, a **Profile labels** checkbox appears in the centre toolbar. Whatever its state, a label never shows the literal text stored in the DEXPI file: the text shown is always built from the values of the attributes the label references on the component it belongs to, so the drawing reflects what an intelligent tool linked to an asset register would show. If the referenced attribute has no value, nothing is shown. Units are shown with their symbol (`barg`, `°C`, `m³/h`).
+Once a DiscProfile.xml is loaded, a **Profile labels** checkbox appears in the centre toolbar. Whatever its state, a label never shows the literal text stored in the DEXPI file: the text shown is always built from the values of the attributes the label references on the component it belongs to, so the drawing reflects what an intelligent tool linked to an asset register would show. If the referenced attribute has no value, nothing is shown. Units are shown with their symbol (`barg`, `°C`, `m³/h`). Set point and alarm labels (`SP = `, `HH=`, `H=`, `L=`, `LL=`) always show the value with its unit, e.g. `SP = 6 barg`. A pressure at full vacuum (−1.01325 barg, or 0 in an absolute unit) is shown as `FV`.
 
 **Checked** — labels are drawn from the loaded profile's own `Profile/LabelTemplate` definitions for the placed symbol, at the position the profile defines, resolved against the represented object (e.g. `<ObjectDisplayName>`, `<ReferencedDrawingNumber>`, `'HH=' & SignalConveyingFunction:<AlarmValue>`). Labels stored in the file for that symbol are hidden, so the drawing shows the profile's intended layout. A label is shown only for an element placed with a profile symbol that has label templates; the exception is a label linked to a Note, which is shown when it references a valid Note attribute and may carry literal text.
 
@@ -260,11 +260,26 @@ Only graphics that belong to a model object are drawn at all: a symbol, label, l
 
 A profile label template describes the label for the symbol in its upright, unmirrored position. When the symbol is placed rotated or mirrored, the profile label is placed so that:
 
-- the text stays readable — left to right for a horizontal symbol, bottom to top for a vertical one, never upside down or right to left;
-- the label stays on the side of the symbol the profile intends: text above a symbol stays above it when the symbol is turned 180°, and moves beside it when the symbol is vertical; for a symbol whose body lies to one side of its connection point (a nozzle, a shutdown symbol), the label follows the body;
-- a mirrored symbol has its labels mirrored with it, with the text alignment adjusted so the label still grows away from the symbol.
+- the text stays readable — left to right when the symbol is at 0° or 180°, bottom to top at 90° or 270°, never upside down or right to left;
+- a label **above or below** the symbol follows the symbol's rotation: text above a symbol at 0° is below its origin at 180° (still on the symbol body) and beside it at 90° and 270°;
+- a label **left or right** of the symbol follows the reading direction of the text: text left of a symbol at 0° is still left of it at 180°, and below it at 90°;
+- a mirrored symbol has its labels mirrored with it;
+- the alignment is adjusted so the text always grows away from the symbol, never across it: Left/Right swap for a mirrored symbol, Top/Bottom swap when the text had to be turned over to stay readable (at 90° and 180°).
+
+This is DISC DEXPI rule 'B' (requirements document, ANNEX B *Profile Label Text under Rotation and Mirroring*). It applies to every symbol; whether the symbol extends to one or both sides of its origin no longer matters.
 
 In short, the profile label text alignment is adjusted with the instance's mirroring and rotation. The same placement is used by the label update script (section 10.6) for the labels it adds, so a file processed by the script displays the same whether **Profile labels** is checked or not.
+
+#### Equipment boxes
+
+An equipment box (DiscProfile 0.6.6, ND0300–ND0310) is drawn in two parts:
+
+- the **'A' part** (`ND03xxA`, the frame with the captions) is a drawing element of the drawing itself. It is placed directly in the diagram with no reference to an equipment and is drawn whenever its symbol is in the loaded profile. It cannot be selected;
+- the **'B' part** (`ND03xxB`, the value column) is a label of the equipment it describes and shows that equipment's values.
+
+Values the equipment does not carry itself are read from its **Chambers**. In a box that repeats a line per side (ND0309B heat exchanger: the design pressure and temperature lines), the first occurrence shows the hot side — the Chamber with `ChamberFunction` **Cooling** — and the second the cold side — the Chamber with `ChamberFunction` **Heating**. When no Chamber carries the expected function, the Chambers are used in file order. A side with no Chamber stays blank rather than repeating the other side's values.
+
+In the value column numbers are shown with **1 decimal** (`130` → `130.0`, `56.55` → `56.6`), and the separators of the template are shown between the values: `<LowerLimitDesignPressure> & <UpperLimitDesignPressure> / <NormalOperatingPressure>` is shown as `FV & 130.0 / 90.0`. This applies both to the **Profile labels** overlay and to the box's own label texts.
 
 ### 5.11 Draw Order — Send to Back
 
@@ -522,7 +537,7 @@ The script creates a timestamped output folder automatically and writes a `valid
 .\scripts\Update-DexpiLabels.ps1 -InputFolder C:\DEXPI\Export -ProfileFolder C:\GitHub\DISCDEXPI_2026Pack\Profile\xml
 ```
 
-For each file, in order: label references to `ItemTag` are switched to `ObjectDisplayName` where the symbol allows it; label lines that reference no valid attribute of the symbol's label templates are removed; labels that reference the right attributes on the wrong lines are relinked; elements without a valid label get the profile label added, placed with the rotation and mirroring rule described in section 5.10 (including instrument plant/system codes and alarm rows); and the labels of operated valves, safety valves and check valves are completed with the attributes of their template rows. Existing labels are never moved and component values are never changed unless the `-BackfillValues` / `-CorrectDisplayNames` switches are given. Run the script with `-?` for all options.
+For each file, in order: label references to `ItemTag` are switched to `ObjectDisplayName` where the symbol allows it; label lines that reference no valid attribute of the symbol's label templates are removed; labels that reference the right attributes on the wrong lines are relinked; elements without a valid label get the profile label added, placed with the rotation and mirroring rule 'B' described in section 5.10 (including instrument plant/system codes and alarm rows); and the labels of operated valves, safety valves and check valves are completed with the attributes of their template rows. Existing labels are never moved and component values are never changed unless the `-BackfillValues` / `-CorrectDisplayNames` switches are given. Run the script with `-?` for all options.
 
 ### 10.7 Text to Notes Script
 

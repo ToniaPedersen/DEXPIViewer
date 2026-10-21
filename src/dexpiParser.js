@@ -627,6 +627,11 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
     // (xxOffPageConnectorReferenceByNumber), which carry the connector label's
     // ReferencedDrawingNumber / ReferencedDrawingDescriptor / ReferencedDrawingMainTag
     const connectorRefsById = new Map();
+    // equipment id -> ids of its composed Chamber objects (Components
+    // property="Chambers", document order) - e.g. the HotSide / ColdSide
+    // chambers of a heat exchanger, which carry the design / operating
+    // pressures and temperatures an equipment box label (ND0309B) shows.
+    const chambersById = new Map();
     qsa(mainDoc, "Object[id]").forEach(el => {
         const id = el.getAttribute("id");
         objectTypeMap.set(id, el.getAttribute("type") || "");
@@ -650,6 +655,10 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
             if (holder && typeof holder.getAttribute === "function" && holder.getAttribute("property") === "ConnectorReference") {
                 if (!connectorRefsById.has(parentId)) connectorRefsById.set(parentId, []);
                 connectorRefsById.get(parentId).push(id);
+            }
+            if (holder && typeof holder.getAttribute === "function" && holder.getAttribute("property") === "Chambers") {
+                if (!chambersById.has(parentId)) chambersById.set(parentId, []);
+                chambersById.get(parentId).push(id);
             }
         }
         const structureRefs = {
@@ -729,6 +738,8 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         if (objectId === representedId) return true;
         if (structureSources(representedId).includes(objectId)) return true;
         if ((connectorRefsById.get(representedId) || []).includes(objectId)) return true;
+        // the component's own Chambers (a heat exchanger label's hot/cold side values)
+        if ((chambersById.get(representedId) || []).includes(objectId)) return true;
         if (isRoleChildOf(representedId, objectId)) return true;
         return objectTypeMap.get(objectId) === "Core/Note";
     }
@@ -782,15 +793,65 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         return out;
     }
 
+    // Hot / cold side of an equipment box (ND0309B heat exchanger: the 1st
+    // occurrence of a repeated template is the hot side, the 2nd the cold
+    // side) is picked by the Chamber's ChamberFunction, not document order:
+    //   hot side  -> ChamberFunctionClassification.Cooling
+    //   cold side -> ChamberFunctionClassification.Heating
+    // Falls back to the Nth Chamber when none carries the expected function.
+    const CHAMBER_SIDE_FUNCTIONS = ["Cooling", "Heating"];
+    function chamberFunctionOf(chamberId) {
+        const raw = ownProperty(chamberId, "ChamberFunction");
+        const ref = typeof raw === "string" ? raw : (raw && raw.value) || "";
+        return String(ref).split(".").pop();
+    }
+    function chamberForSide(componentId, n) {
+        const chambers = chambersById.get(componentId) || [];
+        const want = CHAMBER_SIDE_FUNCTIONS[n];
+        const byFunction = want ? chambers.find(id => chamberFunctionOf(id) === want) : undefined;
+        if (byFunction) return byFunction;
+        // no Chamber with this side's function: take the Nth of the Chambers
+        // not claimed by another side's function, so one Chamber never feeds
+        // both the hot and the cold side rows
+        const claimed = new Set(CHAMBER_SIDE_FUNCTIONS
+            .map((f, i) => i === n ? undefined : chambers.find(id => chamberFunctionOf(id) === f))
+            .filter(Boolean));
+        const free = chambers.filter(id => !claimed.has(id));
+        const sidesBefore = CHAMBER_SIDE_FUNCTIONS.slice(0, n)
+            .filter((f, i) => !chambers.some(id => chamberFunctionOf(id) === CHAMBER_SIDE_FUNCTIONS[i])).length;
+        return free[sidesBefore];
+    }
+
     // Value of a label placeholder: the component's own attribute, else the
     // same attribute on one of its plant structure items (structureSources()),
     // each only when the attribute is valid for that object's class.
-    function componentAttribute(componentId, attributeName) {
+    // chamberIndex (0-based) picks one specific Chamber of the component for
+    // attributes the component itself doesn't carry - see the third pass
+    // below: a LabelTemplate repeated in the same symbol variant (ND0309B's
+    // "<LowerLimitDesignPressure> & ..." line once for the hot side, once for
+    // the cold side) reads its Nth occurrence from the Chamber chosen by
+    // chamberForSide() (Cooling = hot side, Heating = cold side). null =
+    // the first Chamber that has the attribute.
+    function componentAttribute(componentId, attributeName, chamberIndex = null) {
         const own = lookupProperty(componentId, attributeName);
         if (own !== undefined) return own;
         for (const id of (connectorRefsById.get(componentId) || [])) {
             const v = lookupProperty(id, attributeName);
             if (v !== undefined) return v;
+        }
+        const chambers = chambersById.get(componentId) || [];
+        if (chamberIndex !== null) {
+            // a repeated template with no Chamber left for it stays blank
+            // rather than repeating another chamber's values
+            if (chambers.length) {
+                const id = chamberForSide(componentId, chamberIndex);
+                return id ? lookupProperty(id, attributeName) : undefined;
+            }
+        } else {
+            for (const id of chambers) {
+                const v = lookupProperty(id, attributeName);
+                if (v !== undefined) return v;
+            }
         }
         for (const id of structureSources(componentId)) {
             const v = lookupProperty(id, attributeName);
@@ -802,14 +863,48 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
     // Render a resolved Data value (string / number / boolean / DataReference /
     // PhysicalQuantity / SingleLanguageString) down to display text, honouring
     // an AttributeRepresentation fragment's Type (Value | Units | ValueAndUnits).
-    function fragmentValueToText(raw, repType) {
+    // decimals (optional): numeric values (numbers and PhysicalQuantity
+    // values) are shown with exactly this many decimals - the equipment box
+    // value columns (ND0300B..ND0310B) use 1, e.g. 130 -> "130.0".
+    function formatNumber(v, decimals) {
+        const n = typeof v === "number" ? v : (typeof v === "string" && v.trim() !== "" ? Number(v) : NaN);
+        if (decimals === null || decimals === undefined || !Number.isFinite(n)) return String(v);
+        // round half away from zero on the decimal value (56.55 -> 56.6), not
+        // on its binary approximation as toFixed() alone does (-> 56.5)
+        const r = Math.sign(n) * Number(Math.round(Number(Math.abs(n) + "e" + decimals)) + "e-" + decimals);
+        return r.toFixed(decimals);
+    }
+    // Full vacuum: a pressure label shows the literal "FV" (the P&ID / data
+    // sheet convention) instead of the number - a gauge pressure of -1 atm
+    // (-1.01325 barg, also accepting the usual rounded -1.0 / -1.013 barg,
+    // i.e. within 1.5%) or an absolute pressure of 0.
+    const FULL_VACUUM_GAUGE = { Bar: -1.01325, Millibar: -1013.25, Kilopascal: -101.325, Megapascal: -0.101325, Pascal: -101325, PoundForcePerInchSquared: -14.6959 };
+    function isFullVacuum(value, unitRef) {
+        const n = typeof value === "number" ? value : Number(value);
+        if (!Number.isFinite(n) || !unitRef) return false;
+        const [unitType, literal] = String(unitRef).split("/").pop().split(".").slice(-2);
+        if (unitType === "PressureAbsoluteUnit") return n === 0;
+        if (unitType !== "PressureGaugeUnit" || !(literal in FULL_VACUUM_GAUGE)) return false;
+        const fv = FULL_VACUUM_GAUGE[literal];
+        return Math.abs(n - fv) <= Math.abs(fv) * 0.015;
+    }
+    // Set point (SP = ) and alarm (H/HH/L/LL=) labels always show the value's
+    // unit of measure (e.g. "SP = 6 barg"), whatever the template or the
+    // instance AttributeRepresentation Type asks for.
+    const UNIT_LABEL_ATTRIBUTES = new Set(["SetPoint", "AlarmValue"]);
+    function labelRepType(attributeName, repType) {
+        const bare = String(attributeName || "").split("/").pop().replace(/AssignmentClass$/, "");
+        return UNIT_LABEL_ATTRIBUTES.has(bare) && repType !== "Units" ? "ValueAndUnits" : repType;
+    }
+    function fragmentValueToText(raw, repType, decimals = null) {
         if (raw === null || raw === undefined) return "";
         if (typeof raw === "string") return raw;
-        if (typeof raw === "number") return String(raw);
+        if (typeof raw === "number") return formatNumber(raw, decimals);
         if (typeof raw === "boolean") return raw ? "true" : "false";
         if (raw.kind === "DataReference") return enumDisplayName(raw, enumAbbreviations);
         if (raw.kind === "PhysicalQuantity") {
-            const val = raw.value !== null && raw.value !== undefined ? String(raw.value) : "";
+            if (isFullVacuum(raw.value, raw.unitRef)) return repType === "Units" ? "" : "FV";
+            const val = raw.value !== null && raw.value !== undefined ? formatNumber(raw.value, decimals) : "";
             if (repType === "Units") return raw.unit || "";
             if (repType === "ValueAndUnits") return [val, raw.unit].filter(Boolean).join(" ");
             return val;
@@ -826,7 +921,7 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         if (!fragments || !fragments.length) return null;
         return fragments.map(f => {
             if (f.kind === "literal") return f.text || "";
-            if (f.kind === "attr") return fragmentValueToText(lookupProperty(f.objectId, f.attributeName), f.repType);
+            if (f.kind === "attr") return fragmentValueToText(lookupProperty(f.objectId, f.attributeName), labelRepType(f.attributeName, f.repType));
             return "";
         }).join("");
     }
@@ -890,7 +985,10 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
     // trimmed. Unbalanced edge quotes from older profiles ("H=' & ...")
     // are dropped. Text with no "&" and no quotes is returned unchanged.
     function unwrapLabelFormula(text) {
-        if (!/[&']/.test(text)) return text;
+        // Only a quoted literal makes a formula: "<A> & <B> / <C>" (the
+        // ND0300B..ND0309B equipment box design pressure/temperature lines)
+        // has no quotes, so its "&" is plain text shown between the values.
+        if (!/'/.test(text)) return text;
         if ((text.match(/'/g) || []).length % 2) return text.replace(/'\s*&\s*/g, "").replace(/^'|'$/g, "");
         const parts = [];
         let cur = "", inQuote = false;
@@ -937,7 +1035,7 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
     // belonging to the same symbol placement, so positional pairing (the
     // pickRoleChild() fallback) advances correctly across e.g. a symbol's
     // H/HH/L/LL templates instead of every one reusing the first match.
-    function resolveProfileLabelFallback(rawLabelTemplateText, representedId, roleCounters = {}) {
+    function resolveProfileLabelFallback(rawLabelTemplateText, representedId, roleCounters = {}, chamberIndex = null, decimals = null) {
         if (!rawLabelTemplateText) return null;
         // Some DiscProfile.xml LabelTemplate.Text values embed a VB-style
         // string-concatenation formula fragment, e.g.
@@ -1018,7 +1116,7 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
             // A bare placeholder renders blank when unresolved, rather than
             // suppressing the whole (possibly multi-field) template - see
             // the comment above.
-            const valueText = fragmentValueToText(componentAttribute(representedId, attrName), "Value");
+            const valueText = fragmentValueToText(componentAttribute(representedId, attrName, chamberIndex), labelRepType(attrName, "Value"), decimals);
             if (valueText) anyValue = true;
             return valueText;
         });
@@ -1202,6 +1300,14 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
     }
 
     qsa(mainDoc, 'Object[type="Core/Diagram.RepresentationGroup"]').forEach((g, i) => traverseGroup(g, null, `rg_${i}`));
+    // Static / Label groups placed directly in the Diagram's Groups (no
+    // RepresentationGroup around them) - e.g. the 'A' part of an equipment
+    // box (ND0300A..ND0310A), which is a drawing element that belongs to the
+    // drawing itself and has no Represents reference.
+    qsa(mainDoc, 'Object[type="Core/Diagram.Diagram"]').forEach((d, di) => directComponentsObjects(d, "Groups").forEach((g, i) => {
+        const t = g.getAttribute("type") || "";
+        if (t === "Core/Diagram.Static" || isLabelType(t)) traverseGroup(g, null, `dg_${di}_${i}`);
+    }));
 
     // Second pass — "Profile labels": now that every Profile/SymbolUsage in
     // the drawing has been collected, mark which label Text primitives
@@ -1287,25 +1393,79 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         return lits;
     }
 
+    // Separator a DiscProfile symbol's LabelTemplates put between two adjacent
+    // placeholders: "<A>|<B>" -> literal, e.g. ND0309B's "<LowerLimitDesignPressure>
+    // & <UpperLimitDesignPressure> / <NormalOperatingPressure>" gives
+    // "LowerLimitDesignPressure|UpperLimitDesignPressure" -> " & ". Used by
+    // resolveFilteredTemplateFragments() so an instance label that joins the
+    // same two attributes with its own separator (e.g. ", ") shows the
+    // profile's separator instead of dropping it and running the values together.
+    const labelTemplateGapsCache = new Map();
+    function labelTemplateGapsForSymbol(symbol) {
+        if (!symbol) return null;
+        if (labelTemplateGapsCache.has(symbol.key)) return labelTemplateGapsCache.get(symbol.key);
+        const gaps = new Map();
+        (symbol.variants || []).forEach(v => (v.labelTemplates || []).forEach(lt => {
+            if (!lt.text) return;
+            String(lt.text).split(/\r?\n/).forEach(row => {
+                const re = /(?:[A-Za-z][A-Za-z0-9_]*:)?<([^<>]+)>/g;
+                const text = unwrapLabelFormula(row);
+                let m, prev = null, prevEnd = 0;
+                while ((m = re.exec(text)) !== null) {
+                    if (prev !== null) {
+                        const key = `${prev}|${m[1]}`;
+                        if (!gaps.has(key)) gaps.set(key, text.slice(prevEnd, m.index));
+                    }
+                    prev = m[1];
+                    prevEnd = m.index + m[0].length;
+                }
+            });
+        }));
+        labelTemplateGapsCache.set(symbol.key, gaps);
+        return gaps;
+    }
+
     // With a profile loaded, a label's literal Fragment is shown only when it
     // matches a literal of the profile LabelTemplates defined for the label's
     // symbols (whitespace-only separators are kept). Without a profile, for an
     // element placed with no profile symbol that has LabelTemplates, or for
     // a Core/Note label (never profile-governed), every literal is shown.
-    function resolveFilteredTemplateFragments(fragments, representedId = null) {
+    function resolveFilteredTemplateFragments(fragments, representedId = null, decimals = null) {
         if (!fragments || !fragments.length) return null;
         const noteLabel = (representedId && objectTypeMap.get(representedId) === "Core/Note")
             || fragments.some(f => f.kind === "attr" && f.objectId && objectTypeMap.get(f.objectId) === "Core/Note");
         let allowedLiterals = null;
+        let gapLiterals = null;
         if (discDoc && !noteLabel) {
             const syms = ((representedId && discSymbolsByRepresentedId.get(representedId)) || [])
                 .filter(sym => (sym.variants || []).some(v => (v.labelTemplates || []).length));
             // no profile symbol with LabelTemplates for this element: nothing to match against
-            if (syms.length) allowedLiterals = new Set(syms.flatMap(sym => [...(labelTemplateLiteralsForSymbol(sym) || [])]));
+            if (syms.length) {
+                allowedLiterals = new Set(syms.flatMap(sym => [...(labelTemplateLiteralsForSymbol(sym) || [])]));
+                gapLiterals = new Map();
+                syms.forEach(sym => (labelTemplateGapsForSymbol(sym) || new Map()).forEach((lit, key) => { if (!gapLiterals.has(key)) gapLiterals.set(key, lit); }));
+            }
         }
-        return fragments.map(f => {
+        const bareAttr = f => (f.attributeName || "").split("/").pop();
+        // the profile separator for the gap holding literal fragment k, or
+        // undefined when the profile doesn't put these two attributes side by
+        // side. Only the first literal of a gap gets it; the rest are blank.
+        const gapLiteralAt = k => {
+            if (!gapLiterals) return undefined;
+            let a = k - 1;
+            while (a >= 0 && fragments[a].kind === "literal") a--;
+            let b = k + 1;
+            while (b < fragments.length && fragments[b].kind === "literal") b++;
+            if (a < 0 || b >= fragments.length || fragments[a].kind !== "attr" || fragments[b].kind !== "attr") return undefined;
+            const lit = gapLiterals.get(`${bareAttr(fragments[a])}|${bareAttr(fragments[b])}`);
+            if (lit === undefined) return undefined;
+            return k === a + 1 ? lit : "";
+        };
+        return fragments.map((f, k) => {
             if (f.kind === "literal") {
                 const t = f.text || "";
+                const gap = gapLiteralAt(k);
+                if (gap !== undefined) return gap;
                 if (!allowedLiterals || !t.trim()) return t;
                 return (allowedLiterals.has(t) || allowedLiterals.has(t.trim())) ? t : "";
             }
@@ -1325,7 +1485,7 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
                 }
                 // only the labelled component's own attributes (see isLabelReferenceAllowed())
                 if (!isLabelReferenceAllowed(representedId, f.objectId)) return "";
-                return fragmentValueToText(lookupProperty(f.objectId, f.attributeName), f.repType);
+                return fragmentValueToText(lookupProperty(f.objectId, f.attributeName), labelRepType(f.attributeName, f.repType), decimals);
             }
             return "";
         }).join("");
@@ -1445,10 +1605,27 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
     // ND0192A-represented object) never shows its resolved value there, even
     // though App.jsx's CHECKED-state display still uses the unfiltered
     // profileText.
+    // Equipment box value columns (ND0300B..ND0310B) show numeric values with
+    // 1 decimal - in the "Profile labels" overlay (third pass below) and in
+    // the box's own label Texts: those placed in the same Core/Diagram.Label
+    // as the equipment box SymbolUsage (same traversal scope, see
+    // traverseGroup()'s keys).
+    const EQUIPMENT_BOX_SYMBOL_KEY_RE = /^DiscProfile\/ND03(0\d|10)B$/;
+    const labelScopeOf = key => {
+        let m = /^(.*)_(?:lbltxt|lblsym|lblshape)_(\d+)_\d+$/.exec(key);
+        if (m) return `${m[1]}#${m[2]}`;
+        m = /^(.*)_(?:p|su|shu)_\d+$/.exec(key);
+        return m ? m[1] : key;
+    };
+    const equipmentBoxScopes = new Set(drawn
+        .filter(el => el.kind === "symbolUsage" && EQUIPMENT_BOX_SYMBOL_KEY_RE.test(el.symbol?.key || ""))
+        .map(el => labelScopeOf(el.key)));
+    const labelDecimals = el => (equipmentBoxScopes.has(labelScopeOf(el.key)) ? 1 : null);
+
     drawn.forEach(el => {
         if (el.elementRole !== "label" || el.kind !== "primitive" || el.primitive?.kind !== "text") return;
         el.primitive.rawProfileText = el.primitive.profileText;
-        el.primitive.validRawProfileText = resolveFilteredTemplateFragments(el.primitive.templateFragments, el.representedId);
+        el.primitive.validRawProfileText = resolveFilteredTemplateFragments(el.primitive.templateFragments, el.representedId, labelDecimals(el));
         // A label of a component (its represented object exists in the model)
         // shows ONLY the values of the attributes it references on the related
         // object - never the literal <Data property="Text"> string stored in
@@ -1477,7 +1654,7 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         if (!el.representedId || !objectTypeMap.has(el.representedId)) return;
         if (!fragments || !fragments.some(f => f.kind === "attr")) return;
         el.primitive.isComponentLabel = true;
-        el.primitive.componentText = resolveFilteredTemplateFragments(fragments, el.representedId) ?? "";
+        el.primitive.componentText = resolveFilteredTemplateFragments(fragments, el.representedId, labelDecimals(el)) ?? "";
     });
 
     // Profile selected: a label is shown only when it belongs to a profile
@@ -1593,8 +1770,24 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         // matching child rather than all resolving to the same one - see
         // pickRoleChild()/resolveProfileLabelFallback() above.
         const roleCounters = {};
+        // Equipment boxes with several Chambers repeat the same template text
+        // once per chamber (ND0309B: hot side, then cold side) - the 1st
+        // occurrence reads attributes the equipment lacks from the Cooling
+        // (hot side) Chamber, the 2nd from the Heating (cold side) Chamber -
+        // see chamberForSide().
+        // Equipment box value columns (ND0300B..ND0310B) show numeric values
+        // rounded to 1 decimal.
+        const decimals = EQUIPMENT_BOX_SYMBOL_KEY_RE.test(el.symbol.key) ? 1 : null;
+        const textCounts = new Map();
+        templates.forEach(lt => textCounts.set(lt.text, (textCounts.get(lt.text) || 0) + 1));
+        const textSeen = new Map();
         const overlays = templates
-            .map(lt => ({ text: resolveProfileLabelFallback(lt.text, el.representedId, roleCounters), position: lt.position, rotation: lt.rotation, alignment: lt.alignment, font: lt.font, size: lt.size, color: lt.color }))
+            .map(lt => {
+                const n = textSeen.get(lt.text) || 0;
+                textSeen.set(lt.text, n + 1);
+                const chamberIndex = textCounts.get(lt.text) > 1 ? n : null;
+                return { text: resolveProfileLabelFallback(lt.text, el.representedId, roleCounters, chamberIndex, decimals), position: lt.position, rotation: lt.rotation, alignment: lt.alignment, font: lt.font, size: lt.size, color: lt.color };
+            })
             .filter(o => o.text);
         if (overlays.length) el.labelOverlays = overlays;
     });
@@ -1605,7 +1798,16 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
     // component behind them - e.g. SPPID's 'DrawingLabels' polylines, frames,
     // interface markers, free text not turned into a Core/Note - are dropped,
     // as is anything whose Represents target does not exist in the file.
-    const linked = drawn.filter(el => el.representedId && objectTypeMap.has(el.representedId));
+    // Exception: a symbol from the loaded DiscProfile catalogue placed with no
+    // Represents of its own (e.g. the static caption/header half of an equipment
+    // box, ND0309A, placed as a Core/Diagram.Static in the 'DrawingLabels' group)
+    // is an intentional profile graphic and is kept, unlinked - one header box is
+    // often shared by several value boxes (ND0309B ...) placed side by side, so it
+    // is not tied to any one object and is not selectable. One whose Represents
+    // names a missing object is still dropped.
+    const isProfileSymbol = el => el.kind === "symbolUsage" && el.symbol?.key?.startsWith("DiscProfile/");
+    const isLinkedEl = el => el.representedId && objectTypeMap.has(el.representedId);
+    const linked = drawn.filter(el => isLinkedEl(el) || (isProfileSymbol(el) && !el.representedId));
 
     // With a profile loaded, bare polylines / polygons are drawn only when they are
     //  * a piping or signal line (the represented object is a pipe, piping
