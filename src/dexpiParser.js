@@ -835,6 +835,16 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
     function componentAttribute(componentId, attributeName, chamberIndex = null) {
         const own = lookupProperty(componentId, attributeName);
         if (own !== undefined) return own;
+        // a value the component itself carries for a label template attribute
+        // (only template placeholders reach here, never tool-specific names
+        // like "SPPID: ItemTag") is shown even when the loaded profile's class
+        // model does not list it for the component's class - e.g. an ND0040
+        // line label's <ObjectDisplayName> on a PipingNetworkSegment (the
+        // profile only extends PipingNetworkSystem with it). The value is
+        // never taken from the segment's PipingNetworkSystem or any other
+        // owner: the label's referenced item is the segment itself.
+        const ownData = ownProperty(componentId, attributeName);
+        if (ownData !== undefined) return ownData;
         for (const id of (connectorRefsById.get(componentId) || [])) {
             const v = lookupProperty(id, attributeName);
             if (v !== undefined) return v;
@@ -904,9 +914,11 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         if (raw.kind === "DataReference") return enumDisplayName(raw, enumAbbreviations);
         if (raw.kind === "PhysicalQuantity") {
             if (isFullVacuum(raw.value, raw.unitRef)) return repType === "Units" ? "" : "FV";
-            const val = raw.value !== null && raw.value !== undefined ? formatNumber(raw.value, decimals) : "";
+            const val = raw.value !== null && raw.value !== undefined && raw.value !== "" ? formatNumber(raw.value, decimals) : "";
             if (repType === "Units") return raw.unit || "";
-            if (repType === "ValueAndUnits") return [val, raw.unit].filter(Boolean).join(" ");
+            // a quantity with no value shows nothing - not its unit on its own
+            // (a SetPoint with only a Unit must not give "SP = barg")
+            if (repType === "ValueAndUnits") return val ? [val, raw.unit].filter(Boolean).join(" ") : "";
             return val;
         }
         if (typeof raw === "object" && typeof raw.value === "string") return raw.value; // SingleLanguageString
@@ -1461,7 +1473,15 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
             if (lit === undefined) return undefined;
             return k === a + 1 ? lit : "";
         };
-        return fragments.map((f, k) => {
+        // As in resolveProfileLabelFallback(): the label's literals ("SP = ",
+        // "EL: ", separators) are shown only next to at least one resolved
+        // value - a label whose attributes are all blank shows nothing (no
+        // "SP = " without a SetPoint). An H/HH/L/LL alarm literal is the one
+        // exception: it stays once its SignalConveyingFunction (a role child of
+        // the component) exists, even before that has an AlarmValue.
+        const hasAttr = fragments.some(f => f.kind === "attr");
+        let anyValue = false;
+        const text = fragments.map((f, k) => {
             if (f.kind === "literal") {
                 const t = f.text || "";
                 const gap = gapLiteralAt(k);
@@ -1485,10 +1505,22 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
                 }
                 // only the labelled component's own attributes (see isLabelReferenceAllowed())
                 if (!isLabelReferenceAllowed(representedId, f.objectId)) return "";
-                return fragmentValueToText(lookupProperty(f.objectId, f.attributeName), labelRepType(f.attributeName, f.repType), decimals);
+                // a profile label attribute named on the labelled component
+                // itself is resolved like the profile's own LabelTemplate
+                // placeholder (componentAttribute()): the component's own
+                // value even where the profile's class model doesn't list the
+                // attribute for its class (a segment's ObjectDisplayName for
+                // an ND0040 line label)
+                const raw = (allowed && allowed.size && f.objectId === representedId)
+                    ? componentAttribute(f.objectId, f.attributeName)
+                    : lookupProperty(f.objectId, f.attributeName);
+                const valueText = fragmentValueToText(raw, labelRepType(f.attributeName, f.repType), decimals);
+                if (valueText || isRoleChildOf(representedId, f.objectId)) anyValue = true;
+                return valueText;
             }
             return "";
         }).join("");
+        return (hasAttr && !anyValue) ? "" : text;
     }
 
     drawn.forEach(el => {
