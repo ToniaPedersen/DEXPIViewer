@@ -956,6 +956,21 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         const m = /^\s*(HHH|HH|H|LLL|LL|L)\s*=/.exec(text || "");
         return m ? PORT_STATUS_HINTS[m[1]] : null;
     }
+    // A purely literal alarm-level LabelTemplate - e.g. DISCDEXPI_2026Pack's
+    // ND0006 "'H'" / "'L'" (no AlarmValue placeholder at all) - names the
+    // same alarm level as an "H=" prefix does, so it is only shown when the
+    // ProcessInstrumentationFunction actually has a SignalConveyingFunction
+    // with that PortStatus (see resolveProfileLabelFallback()).
+    function literalPortStatusHint(text) {
+        const m = /^\s*(HHH|HH|H|LLL|LL|L)\s*=?\s*$/.exec(text || "");
+        return m ? PORT_STATUS_HINTS[m[1]] : null;
+    }
+    function hasSignalWithPortStatus(parentId, portStatus) {
+        if (!parentId) return false;
+        return (childrenByParentId.get(parentId) || []).some(c =>
+            c.type && c.type.split(/[./]/).pop() === "SignalConveyingFunction"
+            && refName(ownProperty(c.id, "PortStatus")) === portStatus);
+    }
 
     // Picks the child of parentId whose type suffix matches roleName (e.g.
     // "SignalConveyingFunction") that should supply a "ClassName:<Attr>"
@@ -1062,7 +1077,13 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         // quote must go too, not just the "' & " joint; otherwise the label
         // renders as "'SP = 5". See unwrapLabelFormula() above.
         const labelTemplateText = unwrapLabelFormula(rawLabelTemplateText);
-        if (!/[<>]/.test(labelTemplateText)) return labelTemplateText;
+        if (!/[<>]/.test(labelTemplateText)) {
+            // an alarm-level literal ("H", "HH", "L", "LL", ...) needs its
+            // SignalConveyingFunction with the matching PortStatus
+            const literalHint = literalPortStatusHint(labelTemplateText);
+            if (literalHint && !hasSignalWithPortStatus(representedId, literalHint)) return null;
+            return labelTemplateText;
+        }
         const portStatusHint = extractPortStatusHint(labelTemplateText);
         // Only ONE failure mode suppresses the whole template (returns null
         // instead of rendering with the unresolved token silently blanked,
