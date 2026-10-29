@@ -1,5 +1,86 @@
 # Changelog
 
+## 2.2.2
+
+Changes from version 2.2.1.
+
+### Version
+
+- The app is versioned as **2.2.2** (`package.json` / `package-lock.json` 2.2.2).
+- The version shows next to the title in the left panel and in the User Guide.
+
+### Heat trace ring on ND0248B tag bubbles
+
+An ND0248B tag bubble now shows heat tracing the same way as an ND0248A instrument bubble: a dashed ring 1 mm outside its circle. The ring is drawn when the object the bubble represents (e.g. a valve) has an active `HeatTracingType`.
+
+| Case | 2.2.1 | 2.2.2 |
+|---|---|---|
+| ND0248B in a label group, tagged object heat traced | no overlay | dashed ring outside the bubble |
+| ND0248B in a symbol group, tagged object heat traced (inline) | straight dashed line under the bubble | dashed ring outside the bubble |
+| ND0248B, tagged object not heat traced | no overlay | unchanged |
+| ND0248A, other symbols and other labels | as before | unchanged |
+
+Implementation:
+
+- `src/dexpiParser.js`: new `HEAT_TRACE_RING_LABEL_SYMBOLS` (`ND0248B`) and `isHeatTraceRingLabel()`, which matches a symbol usage on its DiscProfile symbol name.
+- `src/App.jsx`: the heat-trace overlay lets these bubbles through the "no overlay on labels" rule and draws them with `HeatTracePIF`.
+- `src/imageCompare.js`: the PNG compare expects a ring around an ND0248B bubble when the tagged object is heat traced, and no ring otherwise.
+
+### User Guide
+
+- `public/UserGuide.md`: version 2.2.2; section 5.5 *Heat Trace Overlay* describes the actual overlay shapes and the ND0248B tag-bubble ring.
+- `public/UserGuide.html`: version 2.2.2 in the title and heading.
+
+### Files changed
+
+`package.json`, `package-lock.json`, `ChangeLog_2.1_to_2.2.md` (this section), `public/UserGuide.md`, `public/UserGuide.html`, `src/App.jsx`, `src/dexpiParser.js`, `src/imageCompare.js`.
+
+## 2.2.1
+
+Changes from version 2.2 (commit `a26e737`, 2026-10-22).
+
+### Version
+
+- The app is versioned as **2.2.1** (`package.json` / `package-lock.json` 2.2.1).
+- The version shows next to the title in the left panel and in the User Guide.
+
+### Linked text only - the stored Text string is never drawn
+
+The drawings are imported into an intelligent CAD tool that rebuilds every label from the attribute database. The viewer therefore draws only text that tool can rebuild: a **link**, never a cached string.
+
+Every drawn text now comes from one of these sources:
+
+- the **attribute references** of the Text's own `Core/Diagram.TextTemplate` (`Core/Diagram.AttributeRepresentation`), resolved against the referenced object's value; or
+- **literals that belong to the symbol**: text in the symbol's own catalogue graphics, `Profile/LabelTemplate` literals, and `Core/Diagram.LiteralText` fragments that match them (any `LiteralText` fragment when no profile is loaded).
+
+The stored `Core/Diagram.Text` → `Data property="Text"` value is **never drawn**, in any state.
+
+| Case | 2.2 | 2.2.1 |
+|---|---|---|
+| No profile loaded, label Text without attribute reference | stored Text shown | nothing shown |
+| No profile loaded, label Text with attribute references | resolved references | unchanged |
+| Profile loaded, label Text without attribute reference | nothing shown | unchanged |
+| Text outside a `Core/Diagram.Label` group, no attribute reference (e.g. a Text primitive in a `Core/Diagram.Static` group of a model object) | stored Text shown | nothing shown |
+| Text outside a label group with attribute references | resolved references | unchanged |
+| Text inside a symbol / shape catalogue definition | symbol's own text | unchanged |
+| Profile labels checked, catalogued symbol | `Profile/LabelTemplate` overlay | unchanged |
+
+Implementation:
+
+- `src/dexpiParser.js`: a label without an attribute reference gets an empty `componentText` with or without a profile (it used to fall back to the stored text when no profile was loaded). A new final **"No Text.Text"** pass in `collectGraphicalElements()` marks every remaining drawn instance Text as `isComponentLabel` and gives it the filtered resolution of its attribute fragments, or nothing.
+- `src/App.jsx`: `renderPrimitive()` draws `componentText` for every instance Text. `primitive.value` (the stored string) is used only for symbol catalogue primitives drawn by `SymbolGraphic`. The old `isProfileGoverned` / `hasProfileAttributeBacking` branches, which could no longer be reached, are removed. The **Profile labels** tooltip now matches the behaviour.
+
+Visible effect: a label whose links are wrong in the file now shows that. Example from UPP-AIL-P-XB-20010-01: 41 of the 43 multi-Text instrument labels give every Text the same template. In 18 of them all three Texts reference `ProcessPlantIdentificationCode` + `PlantSystemIdentificationCode`, so each shows `A20` instead of `A-20` / `PST` / `0002A`. With **Profile labels** checked the profile's LabelTemplates show the intended tag. The fix belongs in the export, which must give each Text its own links.
+
+### User Guide
+
+- `public/UserGuide.md`: version 2.2.1; section 5.10 *Profile Labels* restructured into *Linked text only* and *The Profile labels checkbox*.
+- `public/UserGuide.html`: version 2.2.1 in the title and heading.
+
+### Files changed
+
+`package.json`, `package-lock.json`, `ChangeLog_2.1_to_2.2.md` (this section), `public/UserGuide.md`, `public/UserGuide.html`, `src/App.jsx`, `src/dexpiParser.js`.
+
 ## 2.2
 
 Changes from version 2.1 (commit `d43693f` "version 2.1", 2026-10-16).

@@ -1,3 +1,4 @@
+import { isHeatTraceRingLabel } from "./dexpiParser.js";
 // ---------------------------------------------------------------------------
 // PNG <-> DEXPI image compare + auto-fit engine.
 //
@@ -387,6 +388,12 @@ export function buildCompareGeometry(parsed) {
                 if (htType === "inline" || htType === "nozzle") item.ht = { expected: true, pts: Float32Array.from(heatTraceSymbolSamples(el)) };
                 else if (htType === "pif") item.ht = { expected: true, pts: Float32Array.from(heatTracePifSamples(el)) };
                 else if (el.representedId) item.ht = { expected: false, pts: Float32Array.from(heatTraceSymbolSamples(el)) };
+            }
+            // Tag-bubble labels (ND0248B): heat trace is a dashed ring outside the
+            // bubble (as for an ND0248A PIF), whatever group role the usage has.
+            if (isHeatTraceRingLabel(el) && el.representedId) {
+                const htType = htSet.get(el.representedId);
+                item.ht = { expected: !!htType, pts: Float32Array.from(heatTracePifSamples(el)) };
             }
             items.push(item);
         } else if (el.kind === "connectorLine") {

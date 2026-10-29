@@ -1690,12 +1690,12 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         // renderPrimitive() in both "Profile labels" states.
         el.primitive.isComponentLabel = !!(el.representedId && objectTypeMap.has(el.representedId));
         const hasAttrRef = !!(el.primitive.templateFragments && el.primitive.templateFragments.some(f => f.kind === "attr"));
-        // No attribute referenced: without a profile the label's stored text is
-        // shown; with a profile loaded every label is defined by attributes, so
-        // nothing is shown.
+        // No attribute referenced: nothing is shown, with or without a
+        // profile. The stored <Data property="Text"> string is never drawn -
+        // see the "No Text.Text" pass below.
         el.primitive.componentText = hasAttrRef
             ? (el.primitive.validRawProfileText ?? "")
-            : (discDoc ? "" : (el.primitive.value ?? ""));
+            : "";
     });
 
     // Any other drawn Text whose template references attributes (outside a
@@ -1744,6 +1744,25 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
             }
         });
     }
+
+    // No Text.Text: drawing text must be linked, never a stored string. A
+    // drawn instance Text shows only (a) the resolved AttributeRepresentation
+    // references of its TextTemplate (plus LiteralText fragments that the
+    // profile's LabelTemplates allow), or (b) nothing. The stored
+    // <Data property="Text"> value is a cached export result that an
+    // intelligent CAD import regenerates from the attribute database, so it
+    // is never displayed. The only literal text drawn is text that belongs
+    // to a symbol/shape definition itself (catalogue primitives, rendered by
+    // App.jsx's SymbolGraphic) and Profile/LabelTemplate overlays.
+    drawn.forEach(el => {
+        if (el.kind !== "primitive" || el.primitive?.kind !== "text") return;
+        if (el.primitive.isComponentLabel) return;
+        el.primitive.isComponentLabel = true;
+        const fragments = el.primitive.templateFragments;
+        el.primitive.componentText = (fragments && fragments.some(f => f.kind === "attr"))
+            ? (resolveFilteredTemplateFragments(fragments, el.representedId, labelDecimals(el)) ?? "")
+            : "";
+    });
 
     // Some source files export several visually-distinct label Text pieces
     // (e.g. a plant/system prefix, a tag-type code, and a sequence number,
@@ -2047,6 +2066,18 @@ function buildHtEligibility(discDoc) {
         const suffix = type.split(/[./]/).pop();
         return eligible.has(suffix);
     };
+}
+
+// Tag-bubble LABEL symbols whose own circle should get the same dashed
+// heat-trace ring as an ND0248A instrument bubble when the object they
+// represent is heat traced (e.g. DISC ND0248B tagging a heat-traced valve).
+// Matched on the DiscProfile symbol name, regardless of whether the usage
+// sits in a label group (elementRole "label") or a symbol group.
+export const HEAT_TRACE_RING_LABEL_SYMBOLS = new Set(["ND0248B"]);
+export function isHeatTraceRingLabel(el) {
+    if (!el || el.kind !== "symbolUsage") return false;
+    const name = el.symbol?.name || String(el.symbol?.key || "").split("/").pop();
+    return HEAT_TRACE_RING_LABEL_SYMBOLS.has(name);
 }
 
 export function buildHeatTraceSet(tree, discDoc = null) {

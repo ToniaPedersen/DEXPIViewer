@@ -2,7 +2,7 @@
 
 A browser-based viewer and validation engine for [DEXPI 2.0](https://dexpi.org) intelligent P&ID files, with full support for DISC profile validation.
 
-**Version 2.2** — see `ChangeLog_2.1_to_2.2.md` for the changes since 2.1.
+**Version 2.2.2** — see `ChangeLog_2.1_to_2.2.md` for the changes since 2.1.
 
 Developed by **Tonia Pedersen** at **[Draga AS](https://draga.no)**.
 
@@ -185,8 +185,9 @@ Check **Sub-components** to have a selection also highlight (in red) every child
 When a DISC profile is loaded, heat-traced elements are detected automatically from the `HeatTracingType` data property. The overlay only activates when `HeatTracingType` is `ElectricalHeatTracingSystem`, `HeatTracingSystem`, `SteamHeatTracingSystem`, or `TubularHeatTracingSystem`; the overlay draws coloured dashed highlights on top of the main drawing — no toggle needed:
 
 - **Piping segments** — dashed overlay on connector lines.
-- **Inline components** (valves, fittings, nozzles) — dashed bounding box around the symbol.
-- **Instruments** (`ProcessInstrumentationFunction`) — dashed rectangle around the symbol.
+- **Inline components** (valves, fittings, nozzles) — dashed line beside the symbol: below it on a horizontal pipe, to the right of it on a vertical pipe.
+- **Instruments** (`ProcessInstrumentationFunction`, e.g. ND0248A) — dashed ring 1 mm outside the symbol's own circle or ellipse.
+- **Tag bubbles** (ND0248B) — when the object the bubble tags is heat traced (e.g. a heat-traced valve), the bubble gets the same dashed ring 1 mm outside its circle as an ND0248A instrument. This applies whether the bubble is placed in a label group or a symbol group. Other label symbols get no overlay.
 
 ### 5.6 Line Boost
 
@@ -248,13 +249,26 @@ Selecting a decorated line, or highlighting it via Connectivity mode, recolours 
 
 ### 5.10 Profile Labels
 
-Once a DiscProfile.xml is loaded, a **Profile labels** checkbox appears in the centre toolbar. Whatever its state, a label never shows the literal text stored in the DEXPI file: the text shown is always built from the values of the attributes the label references on the component it belongs to, so the drawing reflects what an intelligent tool linked to an asset register would show. If the referenced attribute has no value, nothing is shown. Units are shown with their symbol (`barg`, `°C`, `m³/h`). Set point and alarm labels (`SP = `, `HH=`, `H=`, `L=`, `LL=`) always show the value with its unit, e.g. `SP = 6 barg`. A pressure at full vacuum (−1.01325 barg, or 0 in an absolute unit) is shown as `FV`.
+#### Linked text only
 
-**Checked** — labels are drawn from the loaded profile's own `Profile/LabelTemplate` definitions for the placed symbol, at the position the profile defines, resolved against the represented object (e.g. `<ObjectDisplayName>`, `<ReferencedDrawingNumber>`, `'HH=' & SignalConveyingFunction:<AlarmValue>`). Labels stored in the file for that symbol are hidden, so the drawing shows the profile's intended layout. A label is shown only for an element placed with a profile symbol that has label templates; the exception is a label linked to a Note, which is shown when it references a valid Note attribute and may carry literal text.
+Every text drawn on the P&ID must be linked, because the drawing is meant to be imported into an intelligent CAD tool that rebuilds each label from the attribute database. A text is drawn only from:
+
+- **attribute references** — the `Core/Diagram.AttributeRepresentation` fragments of the Text's own `TextTemplate`, resolved against the referenced object's current value, or
+- **literals that belong to the symbol** — text inside the symbol's own graphics, the literals of the profile's `Profile/LabelTemplate` (e.g. `SP = `, the `-` between plant and system code), and `Core/Diagram.LiteralText` fragments that match one of them (or any `LiteralText` fragment when no profile is loaded).
+
+The text stored in the file (`Core/Diagram.Text` → `Data property="Text"`) is **never shown**, whether or not a profile is loaded and whatever the state of **Profile labels**. It is a cached export result, not a link. A Text with no attribute reference therefore shows nothing. If a label looks wrong on the drawing, its links are wrong in the file: for example, when an export gives all three Texts of an instrument bubble the same template (`<ProcessPlantIdentificationCode><PlantSystemIdentificationCode>`), every Text shows `A20`.
+
+An attribute is read only from the object the fragment names, and only from the labelled component itself or what belongs to it (its plant structure, Chambers, connectors, related signal functions, Notes). If all the attributes of a label are blank, the whole label is blank, so a literal such as `SP = ` never stands on its own. Units are shown with their symbol (`barg`, `°C`, `m³/h`). Set point and alarm labels (`SP = `, `HH=`, `H=`, `L=`, `LL=`) always show the value with its unit, e.g. `SP = 6 barg`. A pressure at full vacuum (−1.01325 barg, or 0 in an absolute unit) is shown as `FV`.
+
+#### The Profile labels checkbox
+
+Once a DiscProfile.xml is loaded, a **Profile labels** checkbox appears in the centre toolbar.
+
+**Unchecked** — the labels stored in the file are drawn where the file puts them (position, rotation and alignment exactly as written), with the text built from each Text's own attribute references. With a profile loaded, a reference is shown only when the placed profile symbol's label templates use that attribute, and a literal fragment only when those templates define it. A label of a component placed without a profile symbol that has label templates shows nothing, except a label linked to a Note, which shows its literal fragments and the Note's attributes.
+
+**Checked** — labels are drawn from the loaded profile's own `Profile/LabelTemplate` definitions for the placed symbol, at the position the profile defines, resolved against the represented object (e.g. `<ObjectDisplayName>`, `<ReferencedDrawingNumber>`, `'HH=' & SignalConveyingFunction:<AlarmValue>`). The file's own label Texts for that symbol are hidden, so the drawing shows the profile's intended layout. The checked view is useful to see what the tag should read when the file's own label links are wrong.
 
 Only graphics that belong to a model object are drawn at all: a symbol, label, line or text is shown when it sits in a group that represents an existing object in the file. Bare graphics exported without a component behind them (frames, table lines, interface markers, free text that is not a Note) are not drawn. The `Convert-DexpiTextToNotes.ps1` script (section 10.7) turns a drawing's free text into Note components so that notes and title block text stay visible. With a profile loaded, a plain line is drawn only when it is a piping or signal line or a leader line belonging to a symbol; a shape exported as lines next to its own symbol (a duplicate slope triangle or flow arrow) is not drawn.
-
-**Unchecked** — labels stored in the file are drawn where the file puts them (position, rotation and alignment exactly as written), but still with the component's attribute values rather than the stored text. A label with no attribute reference shows nothing while a profile is loaded, and its stored text when no profile is loaded. A literal inside a label is shown only when the profile's label template for that symbol defines it.
 
 #### Rotation and mirroring
 

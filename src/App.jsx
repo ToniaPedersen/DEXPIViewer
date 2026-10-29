@@ -3,7 +3,7 @@ import { parseProfileConstraints, runFullValidation, downloadCSV, resolveSeverit
 import {
     parseDexpiPackage, boundsFromElements, clampViewBox,
     findAncestors, collectDescendantObjectIds, flattenTree,
-    parseColor, collectModelValidIds, isConnectivityRefProperty,
+    parseColor, collectModelValidIds, isConnectivityRefProperty, isHeatTraceRingLabel,
 } from "./dexpiParser.js";
 import { jsPDF } from "jspdf";
 import { version as APP_VERSION } from "../package.json";
@@ -467,13 +467,15 @@ function renderPrimitive(primitive, key, textColorOverride = null, strokeMult = 
         // DiscProfile symbol's label still defers to the symbol's own
         // LabelTemplate overlay instead. Labels that belong to no component
         // keep the behaviour below.
+        // NO Text.Text RULE: every drawn instance Text is marked
+        // isComponentLabel in dexpiParser.js and shows only its attribute-
+        // resolved componentText - never its stored <Data property="Text">.
+        // The only primitives that reach the literal `value` branch are
+        // symbol/shape catalogue primitives drawn by SymbolGraphic (text that
+        // is part of the symbol definition itself).
         const displayText = primitive.isComponentLabel
             ? ((showProfileLabels && primitive.isDiscProfileLabel) ? "" : (primitive.componentText ?? ""))
-            : showProfileLabels
-                ? ((primitive.isDiscProfileLabel || primitive.isProfileGoverned) ? "" : primitive.value)
-                : (primitive.isProfileGoverned
-                    ? (primitive.hasProfileAttributeBacking ? (primitive.validRawProfileText ?? primitive.value) : "")
-                    : primitive.value);
+            : (symbolScale ? primitive.value : "");
         // "LabelTemplates and TextTemplate should not scale": a Text
         // primitive driven by a Core/Diagram.TextTemplate (templateFragments)
         // that lives inside a symbol's own catalog primitives (SymbolGraphic
@@ -2653,7 +2655,7 @@ export default function App() {
                             Sub-components
                         </label>
                         {discXmlText && (
-                            <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "#57606a", cursor: "pointer" }} title="When checked, labels on symbols placed from the loaded DiscProfile.xml show only the value of their referenced Attribute - from the instance's own AttributeRepresentation Template if it has one, otherwise the DiscProfile symbol's own LabelTemplate - instead of the instance's literal Text string.">
+                            <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "#57606a", cursor: "pointer" }} title="When checked, labels on symbols placed from the loaded DiscProfile.xml are drawn from the DiscProfile symbol's own LabelTemplates. When unchecked, they are drawn from the instance's own AttributeRepresentation Templates. The stored Text string is never shown.">
                                 <input type="checkbox" checked={showProfileLabels} onChange={e => setShowProfileLabels(e.target.checked)} />
                                 Profile labels
                             </label>
@@ -2768,11 +2770,15 @@ export default function App() {
                             })}
                             {/* Heat-trace overlays – part of the DEXPI drawing layer (fades with it), only when a DISC profile is loaded */}
                             {parsed?.heatTraceSet?.size > 0 && parsed.graphics.elements.map(el => {
-                                // Never draw heat-trace overlays on label or annotation elements
-                                if (el.elementRole === "label") return null;
+                                // Tag-bubble labels (ND0248B) get the same dashed outer ring as an
+                                // ND0248A instrument bubble when the object they label is heat traced.
+                                const ringLabel = isHeatTraceRingLabel(el);
+                                // Never draw heat-trace overlays on other label or annotation elements
+                                if (el.elementRole === "label" && !ringLabel) return null;
                                 if (el.representedId && hiddenIssueIds.has(el.representedId)) return null;
                                 const htType = el.representedId ? parsed.heatTraceSet.get(el.representedId) : null;
                                 if (!htType) return null;
+                                if (ringLabel) return <HeatTracePIF key={`ht_${el.key}`} el={el} />;
                                 if (htType === "piping" && el.kind === "connectorLine")
                                     return <HeatTraceConnectorLine key={`ht_${el.key}`} el={el} nodePosMap={parsed.graphics.nodePosMap} />;
                                 if ((htType === "inline" || htType === "nozzle") && el.kind === "symbolUsage")
