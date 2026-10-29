@@ -2,7 +2,7 @@
 
 A browser-based viewer and validation engine for [DEXPI 2.0](https://dexpi.org) intelligent P&ID files, with full support for DISC profile validation.
 
-**Version 2.2.3** — see `ChangeLog_2.1_to_2.2.md` for the changes since 2.1.
+**Version 2.3.0** — see `ChangeLog_2.2_to_2.3.md` for the changes since 2.2.
 
 Developed by **Tonia Pedersen** at **[Draga AS](https://draga.no)**.
 

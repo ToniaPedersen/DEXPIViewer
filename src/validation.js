@@ -2796,16 +2796,19 @@ export function validateSymbolRules(mainXml, profileXml, profileName, severityCo
         if ((!profileNodeList || profileNodeList.length === 0) && profileAuxList.length === 0) return;
 
         // Transform both piping and auxiliary NodePositions from symbol-local to world
-        // coordinates (Y-down SVG convention):
-        //   world.x = posX + lx·cos − ly·sin  (unchanged)
-        //   world.y = posY − lx·sin − ly·cos  (Y-axis negated relative to symbol-local)
+        // coordinates. Symbol-local Y points down, as the diagram's does: the same transform
+        // the drawing uses (translate(position) rotate(rotation) scale(scaleX, scaleY), mirrored
+        // in X), and the one the reference exports follow (DISC ND0227's (0, 4) node written 4
+        // below its SymbolUsage). Version 2.3.0; before it the local Y was negated.
+        //   world.x = posX + lx·cos − ly·sin
+        //   world.y = posY + lx·sin + ly·cos
         const rad = (rotation * Math.PI) / 180;
         const cos = Math.cos(rad), sin = Math.sin(rad);
         const toWorld = np => {
             let lx = np.x * scaleX;
             let ly = np.y * scaleY;
             if (isMirrored) lx = -lx;
-            return { x: posX + lx * cos - ly * sin, y: posY - lx * sin - ly * cos };
+            return { x: posX + lx * cos - ly * sin, y: posY + lx * sin + ly * cos };
         };
         // Deduplicate world-coordinate lists (multiple identical variants in the profile
         // can produce repeated entries for the same physical connection point).
