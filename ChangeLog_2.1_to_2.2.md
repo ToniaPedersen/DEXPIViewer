@@ -1,5 +1,47 @@
 # Changelog
 
+## 2.2.3
+
+Changes from version 2.2.2 (commit `64dfb89`).
+
+### Version
+
+- The app is versioned as **2.2.3** (`package.json` / `package-lock.json` 2.2.3).
+- The version shows next to the title in the left panel and in the User Guide.
+
+### Labels for draga.no (xBRIDGE) profiles
+
+Profiles published from `draga.no` (the xBRIDGE / MIMS_Bridge export, e.g. `uri="https://draga.no/xbridge/profile/project-Project_TH"`) define no `Profile/LabelTemplate` on their symbols. Under the "Profile selected" rule almost every label was therefore blanked. The rule is now relaxed for these profiles only.
+
+| Case (draga.no profile loaded) | 2.2.2 | 2.2.3 |
+|---|---|---|
+| Label with attribute references, symbol without LabelTemplates (or no profile symbol) | blank | resolved references |
+| Segment line label referencing its PipingNetworkSystem (e.g. `8"-W47260-11200Y-NI`) | blank | resolved from the system |
+| Literal-only label or Note line, profile has no LabelTemplates at all | blank | stored text |
+| Same labels with **Profile labels** checked | blank | as unchecked |
+| Linked line graphics without a symbol in the group (e.g. Note "MIN." markers) | dropped | drawn |
+| Signal line type stored as `<prefix>/SignalConveyingFunctionTypeRepresentation` | not recognised | recognised |
+| DiscProfile and other profiles | | unchanged |
+
+On `0000-1-08-96706-rev4` with its `profile.xml`, 284 of 288 label texts are shown, up from 13.
+
+Implementation (`src/dexpiParser.js`):
+
+- new `isDragaProfile()`: the profile's `uri` host is `draga.no` or a subdomain;
+- `isLabelReferenceAllowed()`: for draga.no profiles, a `PipingNetworkSegment`'s label may read its owning `PipingNetworkSystem`;
+- "Profile selected" pass: labels of objects without a LabelTemplate-bearing symbol are resolved from their own fragments (or keep their stored text when the profile has no LabelTemplates and the label has no attribute reference), with `isDiscProfileLabel` cleared; literal Note lines keep their text under the same condition;
+- signal line type: falls back to any `*/SignalConveyingFunctionTypeRepresentation` property;
+- `isAllowedLine` filter skipped for draga.no profiles.
+
+### User Guide
+
+- `public/UserGuide.md`: version 2.2.3; section 5.10 *Profile Labels* gains *draga.no (xBRIDGE) profiles*.
+- `public/UserGuide.html`: version 2.2.3 in the title and heading.
+
+### Files changed
+
+`package.json`, `package-lock.json`, `ChangeLog_2.1_to_2.2.md` (this section), `public/UserGuide.md`, `public/UserGuide.html`, `src/dexpiParser.js`.
+
 ## 2.2.2
 
 Changes from version 2.2.1.

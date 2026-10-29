@@ -2,7 +2,7 @@
 
 A browser-based viewer and validation engine for [DEXPI 2.0](https://dexpi.org) intelligent P&ID files, with full support for DISC profile validation.
 
-**Version 2.2.2** — see `ChangeLog_2.1_to_2.2.md` for the changes since 2.1.
+**Version 2.2.3** — see `ChangeLog_2.1_to_2.2.md` for the changes since 2.1.
 
 Developed by **Tonia Pedersen** at **[Draga AS](https://draga.no)**.
 
@@ -259,6 +259,19 @@ Every text drawn on the P&ID must be linked, because the drawing is meant to be 
 The text stored in the file (`Core/Diagram.Text` → `Data property="Text"`) is **never shown**, whether or not a profile is loaded and whatever the state of **Profile labels**. It is a cached export result, not a link. A Text with no attribute reference therefore shows nothing. If a label looks wrong on the drawing, its links are wrong in the file: for example, when an export gives all three Texts of an instrument bubble the same template (`<ProcessPlantIdentificationCode><PlantSystemIdentificationCode>`), every Text shows `A20`.
 
 An attribute is read only from the object the fragment names, and only from the labelled component itself or what belongs to it (its plant structure, Chambers, connectors, related signal functions, Notes). If all the attributes of a label are blank, the whole label is blank, so a literal such as `SP = ` never stands on its own. Units are shown with their symbol (`barg`, `°C`, `m³/h`). Set point and alarm labels (`SP = `, `HH=`, `H=`, `L=`, `LL=`) always show the value with its unit, e.g. `SP = 6 barg`. A pressure at full vacuum (−1.01325 barg, or 0 in an absolute unit) is shown as `FV`.
+
+#### draga.no (xBRIDGE) profiles
+
+A profile whose `uri` is on `draga.no` (e.g. `https://draga.no/xbridge/profile/project-Project_TH`, written by the xBRIDGE / MIMS_Bridge export) usually defines no `Profile/LabelTemplate` on its symbols. For these profiles the label rules are relaxed:
+
+- a label with attribute references is shown even when its symbol has no LabelTemplates, or the object has no profile symbol at all. Each attribute is still checked against the object's class, including the profile's own ClassExtensions;
+- a segment's line label may read the attributes of the **PipingNetworkSystem** that owns the segment (line number, service, piping class, insulation);
+- when the profile defines no LabelTemplates anywhere, a purely literal label or Note line shows its stored text;
+- **Profile labels** checked does not blank these labels, because no LabelTemplate overlay exists to replace them;
+- every linked line graphic is kept, e.g. the dimension lines and arrowheads of a Note's "MIN." marker;
+- a signal line's type is read from `SignalConveyingFunctionTypeRepresentation` under any profile prefix (e.g. `XBridgeProfile_Project_TH/`).
+
+DiscProfile and all other profiles keep the rules above unchanged. Once a draga.no profile adds a LabelTemplate, its literal-only labels are hidden again, as for any other profile.
 
 #### The Profile labels checkbox
 

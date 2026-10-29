@@ -510,6 +510,22 @@ export function collectDescendantObjectIds(node, out = new Set()) {
 // below and App.jsx's SIGNAL_CONVEYING_MARKS for the sub-type glyphs.
 const SIGNAL_CONVEYING_DASH_ARRAY = "3 2";
 
+// Profiles published from https://draga.no (xBRIDGE exports, e.g. Model
+// uri="https://draga.no/xbridge/profile/project-...") usually define no
+// Profile/LabelTemplates on their symbols. For those profiles the "Profile
+// selected" label rule in collectGraphicalElements() is relaxed, and a
+// segment's label may read its PipingNetworkSystem's attributes (see
+// isLabelReferenceAllowed()).
+export function isDragaProfile(discDoc) {
+    const uri = discDoc?.documentElement?.getAttribute("uri") || "";
+    try {
+        const host = new URL(uri).hostname.toLowerCase();
+        return host === "draga.no" || host.endsWith(".draga.no");
+    } catch {
+        return false;
+    }
+}
+
 // Label group types: Core/Diagram.Label and all its subtypes in the class model
 // (e.g. Plant/Diagram.SafetyValveOrFittingLabel, PipingNetworkSegmentLabel).
 const LABEL_CLASS_SUFFIXES = (() => {
@@ -733,6 +749,7 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
     // even if the label's AttributeRepresentation points at another object
     // (such as the segment's PipingNetworkSystem). References to a Core/Note
     // are the only exception (note flags are not component attributes).
+    const dragaProfile = isDragaProfile(discDoc);
     function isLabelReferenceAllowed(representedId, objectId) {
         if (!representedId || !objectTypeMap.has(representedId)) return true; // label of no component
         if (objectId === representedId) return true;
@@ -741,6 +758,11 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         // the component's own Chambers (a heat exchanger label's hot/cold side values)
         if ((chambersById.get(representedId) || []).includes(objectId)) return true;
         if (isRoleChildOf(representedId, objectId)) return true;
+        // draga.no profiles: a PipingNetworkSegment's line label may read the
+        // PipingNetworkSystem that owns the segment (line number, service,
+        // piping class... live on the system)
+        if (dragaProfile && objectTypeMap.get(objectId) === "Plant/Piping.PipingNetworkSystem"
+            && parentIdById.get(representedId) === objectId) return true;
         return objectTypeMap.get(objectId) === "Core/Note";
     }
 
@@ -1186,6 +1208,8 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         const raw = props.get("SignalConveyingFunctionTypeRepresentation")
             ?? props.get("DiscProfile/SignalConveyingFunctionTypeRepresentation")
             ?? props.get("Plant/Instrumentation.SignalConveyingFunctionTypeRepresentation")
+            // any other profile prefix, e.g. "XBridgeProfile_Project_TH/" (draga.no xBRIDGE exports)
+            ?? [...props.entries()].find(([k]) => k.endsWith("/SignalConveyingFunctionTypeRepresentation"))?.[1]
             ?? null;
         return rawStringValue(raw);
     }
@@ -1716,9 +1740,19 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
     // The only labels allowed without a symbol are those linked to a Core/Note:
     // they must reference a valid attribute of the Note (e.g. NoteText,
     // LocalNoteIdentifier) and may carry literal text.
+    // Relaxed rule for draga.no profiles (isDragaProfile()):
+    //  - a label whose Template references attributes is kept (resolved from
+    //    those attributes, still checked against the object's class) even
+    //    when its symbol defines no LabelTemplates - or the object has no
+    //    profile symbol at all;
+    //  - when the loaded profile defines no LabelTemplates anywhere, a purely
+    //    literal label shows its stored text.
     if (discDoc) {
         const hasProfileSymbol = id => !!id && (discSymbolsByRepresentedId.get(id) || []).some(sym =>
             sym && (sym.variants || []).some(v => (v.labelTemplates || []).length));
+        const relaxedLabels = dragaProfile;
+        const profileHasLabelTemplates = relaxedLabels
+            && qsa(discDoc, 'Components[property="LabelTemplates"] > Object').length > 0;
         drawn.forEach(el => {
             if (el.kind !== "primitive" || el.primitive?.kind !== "text") return;
             const fragments = el.primitive.templateFragments || [];
@@ -1737,9 +1771,26 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
                             ? fragmentValueToText(lookupProperty(f.objectId, f.attributeName), f.repType)
                             : "").join("")
                     : "";
+                // draga.no profile without any LabelTemplates: a purely literal
+                // Note line (e.g. a NoteText continuation line) keeps its text
+                if (relaxedLabels && !profileHasLabelTemplates && !fragments.some(f => f.kind === "attr")) {
+                    el.primitive.componentText = el.primitive.value ?? "";
+                }
                 return;
             }
-            if (!hasProfileSymbol(el.representedId) || !fragments.some(f => f.kind === "attr")) {
+            const hasAttrFragment = fragments.some(f => f.kind === "attr");
+            if (relaxedLabels && !hasProfileSymbol(el.representedId)) {
+                // no LabelTemplate overlay will be drawn for this object, so
+                // don't let "Profile labels" checked defer to one
+                el.primitive.isDiscProfileLabel = false;
+                if (hasAttrFragment) {
+                    el.primitive.componentText = resolveFilteredTemplateFragments(fragments, el.representedId, labelDecimals(el)) ?? "";
+                } else {
+                    el.primitive.componentText = profileHasLabelTemplates ? "" : (el.primitive.value ?? "");
+                }
+                return;
+            }
+            if (!hasProfileSymbol(el.representedId) || !hasAttrFragment) {
                 el.primitive.componentText = "";
             }
         });
@@ -1915,7 +1966,11 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         const closed = (m.get(ptKey(pts[0])) || 0) >= 2 && (m.get(ptKey(pts[pts.length - 1])) || 0) >= 2;
         return !closed;
     };
-    const elements = discDoc ? linked.filter(isAllowedLine) : linked;
+    // draga.no (xBRIDGE) profiles: every linked line graphic is kept - their
+    // exports carry no loose SPPID frames/tables, and Note labels draw their
+    // own dimension lines and arrowheads (e.g. the "MIN." markers) with no
+    // symbol in the group. Unlinked graphics are still dropped above.
+    const elements = (discDoc && !dragaProfile) ? linked.filter(isAllowedLine) : linked;
 
     return { elements, nodePosMap, nodePositionsByNodeId, unlinkedCount: drawn.length - elements.length };
 }
