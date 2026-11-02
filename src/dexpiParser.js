@@ -920,9 +920,11 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         const fv = FULL_VACUUM_GAUGE[literal];
         return Math.abs(n - fv) <= Math.abs(fv) * 0.015;
     }
-    // Set point (SP = ) and alarm (H/HH/L/LL=) labels always show the value's
-    // unit of measure (e.g. "SP = 6 barg"), whatever the template or the
-    // instance AttributeRepresentation Type asks for.
+    // Set point (SP = ) and alarm (H/HH/L/LL=) PROFILE labels (LabelTemplate
+    // placeholders, which have no Type) always show the value's unit of
+    // measure (e.g. "SP = 6 barg"). A file label's AttributeRepresentation
+    // shows exactly what its Type asks for: Value -> the value only, Units ->
+    // the unit only, ValueAndUnits -> both (fragmentValueToText(raw, f.repType)).
     const UNIT_LABEL_ATTRIBUTES = new Set(["SetPoint", "AlarmValue"]);
     function labelRepType(attributeName, repType) {
         const bare = String(attributeName || "").split("/").pop().replace(/AssignmentClass$/, "");
@@ -955,7 +957,7 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
         if (!fragments || !fragments.length) return null;
         return fragments.map(f => {
             if (f.kind === "literal") return f.text || "";
-            if (f.kind === "attr") return fragmentValueToText(lookupProperty(f.objectId, f.attributeName), labelRepType(f.attributeName, f.repType));
+            if (f.kind === "attr") return fragmentValueToText(lookupProperty(f.objectId, f.attributeName), f.repType);
             return "";
         }).join("");
     }
@@ -1559,7 +1561,8 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
                 const raw = (allowed && allowed.size && f.objectId === representedId)
                     ? componentAttribute(f.objectId, f.attributeName)
                     : lookupProperty(f.objectId, f.attributeName);
-                const valueText = fragmentValueToText(raw, labelRepType(f.attributeName, f.repType), decimals);
+                // the file's own AttributeRepresentationType: Value shows the value only (see labelRepType())
+                const valueText = fragmentValueToText(raw, f.repType, decimals);
                 if (valueText || isRoleChildOf(representedId, f.objectId)) anyValue = true;
                 return valueText;
             }
@@ -1909,11 +1912,121 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
                 const n = textSeen.get(lt.text) || 0;
                 textSeen.set(lt.text, n + 1);
                 const chamberIndex = textCounts.get(lt.text) > 1 ? n : null;
-                return { text: resolveProfileLabelFallback(lt.text, el.representedId, roleCounters, chamberIndex, decimals), position: lt.position, rotation: lt.rotation, alignment: lt.alignment, font: lt.font, size: lt.size, color: lt.color };
+                // attrs: the LabelTemplate's own placeholder attributes - "Mixed labels" shows this overlay only when
+                // none of them is referenced by a label Text of the object (see mixedShow below).
+                const attrs = [...String(lt.text || "").matchAll(/(?:[A-Za-z][A-Za-z0-9_]*:)?<([^<>]+)>/g)].map(m => m[1]);
+                return { text: resolveProfileLabelFallback(lt.text, el.representedId, roleCounters, chamberIndex, decimals), position: lt.position, rotation: lt.rotation, alignment: lt.alignment, font: lt.font, size: lt.size, color: lt.color, attrs };
             })
             .filter(o => o.text);
         if (overlays.length) el.labelOverlays = overlays;
     });
+
+    // "Mixed labels" (App.jsx): a catalogued symbol's label Text
+    // (isDiscProfileLabel) shows primitive.mixedText -
+    //  - only the values of its AttributeRepresentation Fragments whose
+    //    AttributeName is a LabelTemplate attribute of the object's placed
+    //    DiscProfile symbols (labelTemplateAttrsForSymbol()) and that resolve;
+    //    the instance's LiteralText Fragments and stored Text are never shown;
+    //  - between two values, the literal that stands right before the second
+    //    value's placeholder in the profile LabelTemplate (" ", "x", "-");
+    //    literals before the first or after the last value ("EL: ", "HH=") are
+    //    not shown; values follow the template's order; values from different
+    //    templates, or found in none, are joined with a space.
+    // null when the Text references none of those attributes with a value.
+    // Each profile label (labelOverlays entry, one per LabelTemplate) gets
+    // mixedShow: true when none of its own placeholder attributes is used by a
+    // label Text of the object with a value - that profile label is then drawn
+    // as the default. E.g. an off-page connector whose file labels show
+    // ReferencedDrawingDescriptor but only a literal drawing number gets the
+    // profile's <ReferencedDrawingNumber> label. mixedUsesDefaultLabel: at
+    // least one of the placement's overlays is shown.
+    if (discDoc) {
+        const TOKEN_RE = /(?:([A-Za-z][A-Za-z0-9_]*):)?<([^<>]+)>/g;
+        const templateParts = templateText => {
+            const text = String(templateText || "").split(/\r?\n/).map(unwrapLabelFormula).join("\n");
+            const parts = [];
+            const re = new RegExp(TOKEN_RE.source, "g");
+            let last = 0, m;
+            while ((m = re.exec(text))) {
+                if (m.index > last) parts.push({ literal: text.slice(last, m.index) });
+                parts.push({ attribute: m[2] });
+                last = re.lastIndex;
+            }
+            if (last < text.length) parts.push({ literal: text.slice(last) });
+            return parts;
+        };
+        // LabelTemplate texts per represented object, from its placed DiscProfile symbol variants (drawing order)
+        const templatesById = new Map();
+        drawn.forEach(el => {
+            if (el.kind !== "symbolUsage" || !el.representedId || !el.symbol?.key?.startsWith("DiscProfile/")) return;
+            const lts = (el.variant?.labelTemplates || []).map(lt => lt.text).filter(Boolean);
+            if (!lts.length) return;
+            if (!templatesById.has(el.representedId)) templatesById.set(el.representedId, []);
+            templatesById.get(el.representedId).push(...lts);
+        });
+        const usedAttrsById = new Map();
+        drawn.forEach(el => {
+            if (el.kind !== "primitive" || el.primitive?.kind !== "text" || !el.primitive.isDiscProfileLabel) return;
+            const representedId = el.representedId;
+            const syms = ((representedId && discSymbolsByRepresentedId.get(representedId)) || [])
+                .filter(sym => (sym.variants || []).some(v => (v.labelTemplates || []).length));
+            const allowed = new Set(syms.flatMap(sym => [...(labelTemplateAttrsForSymbol(sym) || [])]));
+            const decimals = labelDecimals(el);
+            const remaining = [];
+            // One value per attribute of an object, shown as the file's AttributeRepresentationType asks (Value -> value
+            // only). A Units reference to an attribute already shown as Value is joined to it ("23" + "barg" ->
+            // "23 barg"); any other repeated reference to it adds nothing.
+            const seen = new Map();
+            (el.primitive.templateFragments || []).forEach(f => {
+                if (f.kind !== "attr" || !f.objectId) return;
+                const bare = (f.attributeName || "").split("/").pop();
+                if (!allowed.has(f.attributeName) && !allowed.has(bare)) return;
+                if (!isLabelReferenceAllowed(representedId, f.objectId)) return;
+                const raw = f.objectId === representedId
+                    ? componentAttribute(f.objectId, f.attributeName)
+                    : lookupProperty(f.objectId, f.attributeName);
+                const value = fragmentValueToText(raw, f.repType, decimals);
+                const key = `${f.objectId}|${bare}`;
+                const prev = seen.get(key);
+                if (prev) {
+                    if (f.repType === "Units" && prev.repType === "Value" && value && !prev.withUnits) { prev.entry.value += ` ${value}`; prev.withUnits = true; }
+                    return;
+                }
+                if (!value) return;
+                const entry = { attribute: bare, value };
+                seen.set(key, { entry, repType: f.repType, withUnits: f.repType !== "Value" });
+                remaining.push(entry);
+            });
+            if (!remaining.length) { el.primitive.mixedText = null; return; }
+            if (!usedAttrsById.has(representedId)) usedAttrsById.set(representedId, new Set());
+            remaining.forEach(v => usedAttrsById.get(representedId).add(v.attribute));
+            const segments = [];
+            const templates = templatesById.get(representedId)
+                || syms.flatMap(sym => ((sym.variants || []).find(v => (v.labelTemplates || []).length)?.labelTemplates || []).map(lt => lt.text));
+            for (const templateText of templates) {
+                if (!remaining.length) break;
+                let out = "", emitted = false, pendingLiteral = "";
+                for (const part of templateParts(templateText)) {
+                    if (part.literal !== undefined) { pendingLiteral += part.literal; continue; }
+                    const i = remaining.findIndex(v => v.attribute === part.attribute);
+                    if (i < 0) { pendingLiteral = ""; continue; }
+                    out += (emitted ? pendingLiteral : "") + remaining[i].value;
+                    emitted = true;
+                    pendingLiteral = "";
+                    remaining.splice(i, 1);
+                }
+                if (emitted) segments.push(out);
+            }
+            remaining.forEach(v => segments.push(v.value));
+            el.primitive.mixedText = segments.join(" ");
+        });
+        drawn.forEach(el => {
+            if (el.kind !== "symbolUsage" || !el.labelOverlays) return;
+            const used = usedAttrsById.get(el.representedId) || new Set();
+            el.labelOverlays.forEach(ov => { ov.mixedShow = !(ov.attrs || []).some(a => used.has(a) || used.has(a.split("/").pop())); });
+            el.mixedUsesDefaultLabel = el.labelOverlays.some(ov => ov.mixedShow);
+        });
+    }
 
     // Only graphics that belong to a model object are shown: every drawn
     // element must sit in a group that represents an existing object (symbol,

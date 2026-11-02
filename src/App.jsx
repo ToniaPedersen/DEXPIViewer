@@ -396,7 +396,7 @@ function renderMultilineText({ key, x, y, rotation, fontFamily, fontSize, fill, 
     );
 }
 
-function renderPrimitive(primitive, key, textColorOverride = null, strokeMult = 1, showProfileLabels = false, parentRotation = 0, symbolScale = null) {
+function renderPrimitive(primitive, key, textColorOverride = null, strokeMult = 1, showProfileLabels = false, parentRotation = 0, symbolScale = null, showMixedLabels = false) {
     const fill = v => v?.style === "Transparent" ? "none" : (v?.color || "none");
     const sw = v => v * strokeMult;
     if (primitive.kind === "polyline") return <polyline key={key} points={primitive.points.map(p => `${p.x},${p.y}`).join(" ")} fill="none" stroke={primitive.stroke.color} strokeWidth={sw(primitive.stroke.width)} strokeDasharray={primitive.stroke.dashArray || undefined} vectorEffect="non-scaling-stroke" />;
@@ -473,8 +473,12 @@ function renderPrimitive(primitive, key, textColorOverride = null, strokeMult = 
         // The only primitives that reach the literal `value` branch are
         // symbol/shape catalogue primitives drawn by SymbolGraphic (text that
         // is part of the symbol definition itself).
+        // "Mixed labels": a catalogued symbol's label shows primitive.mixedText (only its profile label attribute
+        // values, with the profile LabelTemplate's in-between literals - see dexpiParser.js), or nothing.
         const displayText = primitive.isComponentLabel
-            ? ((showProfileLabels && primitive.isDiscProfileLabel) ? "" : (primitive.componentText ?? ""))
+            ? ((showProfileLabels && primitive.isDiscProfileLabel) ? ""
+                : (showMixedLabels && primitive.isDiscProfileLabel) ? (primitive.mixedText ?? "")
+                : (primitive.componentText ?? ""))
             : (symbolScale ? primitive.value : "");
         // "LabelTemplates and TextTemplate should not scale": a Text
         // primitive driven by a Core/Diagram.TextTemplate (templateFragments)
@@ -969,7 +973,7 @@ function renderLabelOverlay(ov, key, el) {
     }, ov.text);
 }
 
-function SymbolGraphic({ el, selected, connHighlight, onSelect, boostPct, boostSymbolOutlines, showProfileLabels }) {
+function SymbolGraphic({ el, selected, connHighlight, onSelect, boostPct, boostSymbolOutlines, showProfileLabels, showMixedLabels }) {
     const symbolStrokeMult = boostSymbolOutlines ? boostPct / 100 : 1;
     const mirror = el.isMirrored ? -1 : 1;
     const transform = `translate(${el.position.x} ${el.position.y}) rotate(${el.rotation}) scale(${el.scaleX * mirror} ${el.scaleY})`;
@@ -996,14 +1000,14 @@ function SymbolGraphic({ el, selected, connHighlight, onSelect, boostPct, boostS
             {hlColor && <g transform={transform} pointerEvents="none">{el.variant.primitives.map((p, i) => highlightPrimitive(p, `hl_${el.key}_${i}`, hlColor))}</g>}
             <g transform={transform} pointerEvents="none">
                 {el.variant.primitives.map((p, i) => renderPrimitive(p, `${el.key}_${i}`, null, symbolStrokeMult, false, el.rotation, { sx: el.scaleX * mirror, sy: el.scaleY }))}
-                {showProfileLabels && el.labelOverlays && el.labelOverlays.map((ov, i) => renderLabelOverlay(ov, `ovl_${el.key}_${i}`, el))}
+                {(showProfileLabels || (showMixedLabels && el.mixedUsesDefaultLabel)) && el.labelOverlays && el.labelOverlays.map((ov, i) => (showProfileLabels || ov.mixedShow) ? renderLabelOverlay(ov, `ovl_${el.key}_${i}`, el) : null)}
                 {hlColor && <rect x={el.variant.minX - 0.8} y={el.variant.minY - 0.8} width={(el.variant.maxX - el.variant.minX) + 1.6} height={(el.variant.maxY - el.variant.minY) + 1.6} fill="none" stroke={hlColor} strokeWidth={0.6} vectorEffect="non-scaling-stroke" />}
             </g>
         </g>
     );
 }
 
-function PrimitiveGraphic({ el, selected, connHighlight, onSelect, nodePosMap, boostPct, boostSymbolOutlines, showProfileLabels }) {
+function PrimitiveGraphic({ el, selected, connHighlight, onSelect, nodePosMap, boostPct, boostSymbolOutlines, showProfileLabels, showMixedLabels }) {
     const hitPad = 2.0;
     const hlColor = selected ? (connHighlight || selectionColor(el.elementRole)) : connHighlight || null;
     const prim = el.primitive;
@@ -1023,7 +1027,7 @@ function PrimitiveGraphic({ el, selected, connHighlight, onSelect, nodePosMap, b
             {hlColor && el.kind !== "connectorLine" && prim?.kind !== "text" && highlightPrimitive(prim, `hl_${el.key}`, hlColor)}
             {el.kind === "connectorLine"
                 ? <ConnectorLineSvg el={el} nodePosMap={nodePosMap} selected={selected} connColor={connHighlight} boostPct={boostPct} />
-                : renderPrimitive(prim, el.key, prim?.kind === "text" ? hlColor : null, (boostSymbolOutlines && el.elementRole === "symbol") ? boostPct / 100 : 1, showProfileLabels)}
+                : renderPrimitive(prim, el.key, prim?.kind === "text" ? hlColor : null, (boostSymbolOutlines && el.elementRole === "symbol") ? boostPct / 100 : 1, showProfileLabels, 0, null, showMixedLabels)}
         </g>
     );
 }
@@ -1079,7 +1083,6 @@ export default function App() {
     const [viewBox, setViewBox] = useState({ x: 0, y: 0, w: 1000, h: 1000 });
     const [fullBounds, setFullBounds] = useState({ minX: 0, minY: 0, maxX: 1000, maxY: 1000 });
     const [isPanning, setIsPanning] = useState(false);
-    const [panStart, setPanStart] = useState(null);
     const [bgImage, setBgImage] = useState(null);
     const [showBgControls, setShowBgControls] = useState(false);
     // Folder tab (ported from AKSODEXPIViewer): validation results for every
@@ -1130,7 +1133,15 @@ export default function App() {
     // dexpiParser.js's collectGraphicalElements()) instead of the instance's
     // own literal Text string - see renderPrimitive()'s text branch.
     const [showProfileLabels, setShowProfileLabels] = useState(false);
-    const [spaceDown, setSpaceDown] = useState(false);
+    // "Mixed labels" (mutually exclusive with "Profile labels"): a catalogued symbol's label Text shows only the values of its
+    // profile label attributes, with the profile LabelTemplate's in-between literals (primitive.mixedText); a symbol placement
+    // whose object has no such label shows its profile default label (labelOverlays, el.mixedUsesDefaultLabel) instead.
+    // Note labels and labels of objects without a profile symbol are drawn as with both unchecked.
+    const [showMixedLabels, setShowMixedLabels] = useState(false);
+    // Drag-to-pan state, as in xBridge (MIMS_Bridge_DEXPI ModelCanvas.vue): a left- or middle-button press starts a drag;
+    // once it has moved more than 2 px it pans and the click that ends it does not select. A press without movement is a click.
+    const panDragRef = useRef(null);
+    const suppressClickRef = useRef(false);
     const [exporting, setExporting] = useState(false);
     // Draw-order overrides: representedIds whose graphic(s) the user has sent
     // to the back of the paint order. Elements paint in array order (later =
@@ -2042,21 +2053,24 @@ export default function App() {
             e.preventDefault();
             const rect = el.getBoundingClientRect();
             const factor = e.deltaY > 0 ? 1.12 : 0.88;
-            const mx = ((e.clientX - rect.left) / rect.width) * viewBox.w + viewBox.x;
-            const my = ((e.clientY - rect.top) / rect.height) * viewBox.h + viewBox.y;
-            setViewBox(v => clampViewBox({ x: mx - (mx - v.x) * factor, y: my - (my - v.y) * factor, w: v.w * factor, h: v.h * factor }, fullBounds));
+            // Cursor position from the current view (v), so zoom stays anchored under the cursor.
+            setViewBox(v => {
+                const mx = ((e.clientX - rect.left) / rect.width) * v.w + v.x;
+                const my = ((e.clientY - rect.top) / rect.height) * v.h + v.y;
+                return clampViewBox({ x: mx - (mx - v.x) * factor, y: my - (my - v.y) * factor, w: v.w * factor, h: v.h * factor }, fullBounds);
+            });
         };
         el.addEventListener("wheel", onWheel, { passive: false });
         return () => el.removeEventListener("wheel", onWheel);
     }, [fullBounds]);
 
-    useEffect(() => {
-        const onKeyDown = e => { if (e.code === "Space" && e.target === document.body) { e.preventDefault(); setSpaceDown(true); } };
-        const onKeyUp   = e => { if (e.code === "Space") { setSpaceDown(false); setIsPanning(false); setPanStart(null); } };
-        window.addEventListener("keydown", onKeyDown);
-        window.addEventListener("keyup", onKeyUp);
-        return () => { window.removeEventListener("keydown", onKeyDown); window.removeEventListener("keyup", onKeyUp); };
-    }, []);
+    // Fit button and double-click on the drawing (as in xBridge): shows the whole drawing.
+    const fitDrawingToWindow = useCallback(() => {
+        if (!parsed) return;
+        const b = boundsFromElements(parsed.graphics);
+        setFullBounds(b);
+        setViewBox({ x: b.minX, y: b.minY, w: b.maxX - b.minX, h: b.maxY - b.minY });
+    }, [parsed]);
 
     // Revokes the current BG image object URL (see handleBgFile) when the
     // component unmounts, so it isn't leaked for the life of the page. Each
@@ -2599,7 +2613,7 @@ export default function App() {
             <div style={{ position: "relative", overflow: "hidden", background: "#f8fafc", display: "flex", flexDirection: "column" }}>
                 <div style={{ ...S.toolbar, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
                     <div style={{ display: "flex", gap: 5, flexWrap: "wrap", alignItems: "center" }}>
-                        <button style={S.btn} onClick={() => { if (!parsed) return; const b = boundsFromElements(parsed.graphics); setFullBounds(b); setViewBox({ x: b.minX, y: b.minY, w: b.maxX - b.minX, h: b.maxY - b.minY }); }} title="Fit drawing to window">Fit</button>
+                        <button style={S.btn} onClick={fitDrawingToWindow} title="Fit drawing to window (or double-click the drawing)">Fit</button>
                         {sentToBackIds.size > 0 && (
                             <button style={{ ...S.btn, background: "#eaf2ff", borderColor: "#0969da", color: "#0969da" }} onClick={() => setSentToBackIds(new Set())} title={`Restore normal draw order for ${sentToBackIds.size} object(s) sent to back`}>
                                 Reset Z-Order ({sentToBackIds.size})
@@ -2656,14 +2670,19 @@ export default function App() {
                         </label>
                         {discXmlText && (
                             <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "#57606a", cursor: "pointer" }} title="When checked, labels on symbols placed from the loaded DiscProfile.xml are drawn from the DiscProfile symbol's own LabelTemplates. When unchecked, they are drawn from the instance's own AttributeRepresentation Templates. The stored Text string is never shown.">
-                                <input type="checkbox" checked={showProfileLabels} onChange={e => setShowProfileLabels(e.target.checked)} />
+                                <input type="checkbox" checked={showProfileLabels} onChange={e => { setShowProfileLabels(e.target.checked); if (e.target.checked) setShowMixedLabels(false); }} />
                                 Profile labels
+                            </label>
+                        )}
+                        {discXmlText && (
+                            <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "#57606a", cursor: "pointer" }} title="Show the file's labels that reference any of the symbol's profile label attributes: only those attribute values, with the profile label's literals between them (e.g. a space or 'x'). A symbol with no such label shows its profile default label instead. Notes are shown as usual.">
+                                <input type="checkbox" checked={showMixedLabels} onChange={e => { setShowMixedLabels(e.target.checked); if (e.target.checked) setShowProfileLabels(false); }} />
+                                Mixed labels
                             </label>
                         )}
                         <button style={S.btn} onClick={handleBgButton} title="Overlay an image behind the drawing. Pick a DEXPI XML together with its .png to load both.">BG Image</button>
                         {bgImage && <button style={{ ...S.btn, background: showBgControls ? "#eaf2ff" : "white" }} onClick={() => setShowBgControls(p => !p)}>BG Controls</button>}
                         <input ref={bgInputRef} type="file" accept="image/*,.xml" multiple style={{ display: "none" }} onChange={handleBgFile} />
-                        <span style={{ fontSize: 11, color: "#888", marginLeft: 4 }}>Scroll to zoom · Space+drag to pan</span>
                     </div>
                 </div>
 
@@ -2737,17 +2756,38 @@ export default function App() {
 
                 {parseError && <div style={{ color: "#cf222e", padding: "8px 12px", fontSize: 13 }}>{parseError}</div>}
 
-                <div ref={svgViewportRef} style={{ flex: 1, position: "relative", background: "white", cursor: isPanning ? "grabbing" : spaceDown ? "grab" : "default", overflow: "hidden" }}
-                    onMouseDown={e => { if (e.button !== 0 || !spaceDown) return; e.preventDefault(); setIsPanning(true); setPanStart({ x: e.clientX, y: e.clientY, view: viewBox }); }}
-                    onMouseMove={e => {
-                        if (!isPanning || !panStart || !svgViewportRef.current) return;
-                        const rect = svgViewportRef.current.getBoundingClientRect();
-                        const dx = ((e.clientX - panStart.x) / rect.width) * panStart.view.w;
-                        const dy = ((e.clientY - panStart.y) / rect.height) * panStart.view.h;
-                        setViewBox(clampViewBox({ ...panStart.view, x: panStart.view.x - dx, y: panStart.view.y - dy }, fullBounds));
+                <div ref={svgViewportRef} style={{ flex: 1, position: "relative", background: "white", cursor: isPanning ? "grabbing" : "default", overflow: "hidden", touchAction: "none" }}
+                    // Pan like xBridge: left- or middle-button drag. Pointer capture starts only once the drag has moved, so a plain
+                    // click still reaches the symbol/line under it and selects it; the click ending a pan is swallowed (onClickCapture).
+                    onMouseDown={e => { if (e.button === 0 || e.button === 1) e.preventDefault(); /* no text selection / middle-button autoscroll */ }}
+                    onPointerDown={e => {
+                        if (e.button !== 0 && e.button !== 1) return;
+                        suppressClickRef.current = false;
+                        panDragRef.current = { x: e.clientX, y: e.clientY, view: viewBox, moved: false, pointerId: e.pointerId };
                     }}
-                    onMouseUp={() => { setIsPanning(false); setPanStart(null); }}
-                    onMouseLeave={() => { setIsPanning(false); setPanStart(null); }}
+                    onPointerMove={e => {
+                        const d = panDragRef.current;
+                        if (!d || d.pointerId !== e.pointerId || !svgViewportRef.current) return;
+                        if (!d.moved) {
+                            if (Math.abs(e.clientX - d.x) + Math.abs(e.clientY - d.y) <= 2) return;
+                            d.moved = true;
+                            setIsPanning(true);
+                            try { svgViewportRef.current.setPointerCapture(e.pointerId); } catch { /* pointer already gone */ }
+                        }
+                        const rect = svgViewportRef.current.getBoundingClientRect();
+                        const dx = ((e.clientX - d.x) / rect.width) * d.view.w;
+                        const dy = ((e.clientY - d.y) / rect.height) * d.view.h;
+                        setViewBox(clampViewBox({ ...d.view, x: d.view.x - dx, y: d.view.y - dy }, fullBounds));
+                    }}
+                    onPointerUp={e => {
+                        const d = panDragRef.current;
+                        if (!d || d.pointerId !== e.pointerId) return;
+                        panDragRef.current = null;
+                        if (d.moved) { suppressClickRef.current = true; setIsPanning(false); }
+                    }}
+                    onPointerCancel={() => { panDragRef.current = null; setIsPanning(false); }}
+                    onClickCapture={e => { if (suppressClickRef.current) { suppressClickRef.current = false; e.stopPropagation(); } }}
+                    onDoubleClick={fitDrawingToWindow}
                 >
                     <svg ref={svgElRef} viewBox={`${viewBox.x} ${viewBox.y} ${viewBox.w} ${viewBox.h}`} width="100%" height="100%" style={{ display: "block" }} onAuxClick={e => e.preventDefault()}>
                         {bgImage && bgPlacement && !batchPng && !(cmp && cmpView === "diff") && (
@@ -2765,8 +2805,8 @@ export default function App() {
                                 const isSelected = !!el.representedId && selectedRepresentedIds.has(el.representedId);
                                 const ch = connectivityHighlight;
                                 const connColor = el.representedId ? (ch.upstream.has(el.representedId) ? "#0969da" : ch.downstream.has(el.representedId) ? "#1a7f37" : ch.group.has(el.representedId) ? "#8250df" : null) : null;
-                                if (el.kind === "symbolUsage") return <SymbolGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} boostPct={lineBoostPct} boostSymbolOutlines={boostSymbolOutlines} showProfileLabels={showProfileLabels} />;
-                                return <PrimitiveGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} nodePosMap={parsed.graphics.nodePosMap} boostPct={lineBoostPct} boostSymbolOutlines={boostSymbolOutlines} showProfileLabels={showProfileLabels} />;
+                                if (el.kind === "symbolUsage") return <SymbolGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} boostPct={lineBoostPct} boostSymbolOutlines={boostSymbolOutlines} showProfileLabels={showProfileLabels} showMixedLabels={showMixedLabels} />;
+                                return <PrimitiveGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} nodePosMap={parsed.graphics.nodePosMap} boostPct={lineBoostPct} boostSymbolOutlines={boostSymbolOutlines} showProfileLabels={showProfileLabels} showMixedLabels={showMixedLabels} />;
                             })}
                             {/* Heat-trace overlays – part of the DEXPI drawing layer (fades with it), only when a DISC profile is loaded */}
                             {parsed?.heatTraceSet?.size > 0 && parsed.graphics.elements.map(el => {

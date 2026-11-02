@@ -2,7 +2,7 @@
 
 A browser-based viewer and validation engine for [DEXPI 2.0](https://dexpi.org) intelligent P&ID files, with full support for DISC profile validation.
 
-**Version 2.3.0** — see `ChangeLog_2.2_to_2.3.md` for the changes since 2.2.
+**Version 2.4.0** — see `ChangeLog_2.3_to_2.4.md` for the changes since 2.3.
 
 Developed by **Tonia Pedersen** at **[Draga AS](https://draga.no)**.
 
@@ -155,8 +155,8 @@ The centre panel renders the DEXPI drawing graphically from the XML data. Symbol
 | Action | How |
 |--------|-----|
 | Zoom | Scroll the mouse wheel over the drawing (zooms toward the cursor) |
-| Pan | Hold **Space** and drag |
-| Fit to window | Click the **Fit** button in the centre toolbar |
+| Pan | Drag with the left or middle mouse button. A click without moving the mouse still selects |
+| Fit to window | Click the **Fit** button in the centre toolbar, or double-click the drawing |
 | Jump to a coordinate | **Go to** field in the left panel — enter `x, y` and click **Go** (see section 4, above) |
 | Export view | Click **Save PNG** / **Save PDF** in the centre toolbar (see 5.8, below) |
 
@@ -258,7 +258,7 @@ Every text drawn on the P&ID must be linked, because the drawing is meant to be 
 
 The text stored in the file (`Core/Diagram.Text` → `Data property="Text"`) is **never shown**, whether or not a profile is loaded and whatever the state of **Profile labels**. It is a cached export result, not a link. A Text with no attribute reference therefore shows nothing. If a label looks wrong on the drawing, its links are wrong in the file: for example, when an export gives all three Texts of an instrument bubble the same template (`<ProcessPlantIdentificationCode><PlantSystemIdentificationCode>`), every Text shows `A20`.
 
-An attribute is read only from the object the fragment names, and only from the labelled component itself or what belongs to it (its plant structure, Chambers, connectors, related signal functions, Notes). If all the attributes of a label are blank, the whole label is blank, so a literal such as `SP = ` never stands on its own. Units are shown with their symbol (`barg`, `°C`, `m³/h`). Set point and alarm labels (`SP = `, `HH=`, `H=`, `L=`, `LL=`) always show the value with its unit, e.g. `SP = 6 barg`. A pressure at full vacuum (−1.01325 barg, or 0 in an absolute unit) is shown as `FV`.
+An attribute is read only from the object the fragment names, and only from the labelled component itself or what belongs to it (its plant structure, Chambers, connectors, related signal functions, Notes). If all the attributes of a label are blank, the whole label is blank, so a literal such as `SP = ` never stands on its own. Units are shown with their symbol (`barg`, `°C`, `m³/h`). An attribute reference in the file shows what its `Type` asks for: `AttributeRepresentationType.Value` the value only (`23`), `Units` the unit only (`barg`), `ValueAndUnits` both (`23 barg`). The profile's own set point and alarm labels (`SP = `, `HH=`, `H=`, `L=`, `LL=`) always show the value with its unit, e.g. `SP = 6 barg`. With **Mixed labels**, a `Units` reference following a `Value` reference to the same attribute is joined to it with a space (`23 barg`). A pressure at full vacuum (−1.01325 barg, or 0 in an absolute unit) is shown as `FV`.
 
 #### draga.no (xBRIDGE) profiles
 
@@ -275,11 +275,19 @@ DiscProfile and all other profiles keep the rules above unchanged. Once a draga.
 
 #### The Profile labels checkbox
 
-Once a DiscProfile.xml is loaded, a **Profile labels** checkbox appears in the centre toolbar.
+Once a DiscProfile.xml is loaded, the **Profile labels** and **Mixed labels** checkboxes appear in the centre toolbar.
 
 **Unchecked** — the labels stored in the file are drawn where the file puts them (position, rotation and alignment exactly as written), with the text built from each Text's own attribute references. With a profile loaded, a reference is shown only when the placed profile symbol's label templates use that attribute, and a literal fragment only when those templates define it. A label of a component placed without a profile symbol that has label templates shows nothing, except a label linked to a Note, which shows its literal fragments and the Note's attributes.
 
 **Checked** — labels are drawn from the loaded profile's own `Profile/LabelTemplate` definitions for the placed symbol, at the position the profile defines, resolved against the represented object (e.g. `<ObjectDisplayName>`, `<ReferencedDrawingNumber>`, `'HH=' & SignalConveyingFunction:<AlarmValue>`). The file's own label Texts for that symbol are hidden, so the drawing shows the profile's intended layout. The checked view is useful to see what the tag should read when the file's own label links are wrong.
+
+**Mixed labels** — a second checkbox next to **Profile labels**; ticking one unticks the other. The labels stored in the file are drawn where the file puts them, but a label of a symbol placed from the profile shows:
+
+- only the values of its attribute references that are label attributes of the object's profile symbols (a reference to any other attribute is left out);
+- between two values, only the literal the profile label allows there: the one that stands between those attributes in the profile's `Profile/LabelTemplate` (a space, `x`, `-` …). The file's own literal text is never shown, and neither are literals before the first or after the last value (`EL: `, `HH=`);
+- the values in the order of the profile template; values from different template rows are separated by a space.
+
+Each of the symbol's profile labels (one per `Profile/LabelTemplate`) is drawn as the default, as with **Profile labels** checked, when none of its attributes is referenced by a file label of the object. For example, an off-page connector whose file labels reference `ReferencedDrawingDescriptor` but show the drawing number only as literal text gets the profile's `<ReferencedDrawingNumber>` label, and not its descriptor label. Note labels, leader lines and labels of objects without a profile symbol are drawn as with both checkboxes unticked.
 
 Only graphics that belong to a model object are drawn at all: a symbol, label, line or text is shown when it sits in a group that represents an existing object in the file. Bare graphics exported without a component behind them (frames, table lines, interface markers, free text that is not a Note) are not drawn. The `Convert-DexpiTextToNotes.ps1` script (section 10.7) turns a drawing's free text into Note components so that notes and title block text stay visible. With a profile loaded, a plain line is drawn only when it is a piping or signal line or a leader line belonging to a symbol; a shape exported as lines next to its own symbol (a duplicate slope triangle or flow arrow) is not drawn.
 
