@@ -1749,7 +1749,10 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
     //    when its symbol defines no LabelTemplates - or the object has no
     //    profile symbol at all;
     //  - when the loaded profile defines no LabelTemplates anywhere, a purely
-    //    literal label shows its stored text.
+    //    literal label shows its Template's LiteralText fragments - never the
+    //    stored <Data property="Text"> string (no Template -> nothing).
+    // Attribute values are shown as the file's AttributeRepresentation Type
+    // asks (Value / Units / ValueAndUnits, fragmentValueToText()).
     if (discDoc) {
         const hasProfileSymbol = id => !!id && (discSymbolsByRepresentedId.get(id) || []).some(sym =>
             sym && (sym.variants || []).some(v => (v.labelTemplates || []).length));
@@ -1761,6 +1764,8 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
             const fragments = el.primitive.templateFragments || [];
             const isLabel = el.elementRole === "label" || fragments.some(f => f.kind === "attr");
             if (!isLabel) return;
+            // a purely literal label's own LiteralText fragments (never Text.Text)
+            const literalFragmentsText = () => fragments.map(f => f.kind === "literal" ? (f.text || "") : "").join("");
             const noteFrags = fragments.filter(f => f.kind === "attr" && f.objectId && objectTypeMap.get(f.objectId) === "Core/Note");
             const representsNote = !!el.representedId && objectTypeMap.get(el.representedId) === "Core/Note";
             el.primitive.isComponentLabel = true;
@@ -1775,9 +1780,9 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
                             : "").join("")
                     : "";
                 // draga.no profile without any LabelTemplates: a purely literal
-                // Note line (e.g. a NoteText continuation line) keeps its text
+                // Note line (e.g. a NoteText continuation line) keeps its literal fragments
                 if (relaxedLabels && !profileHasLabelTemplates && !fragments.some(f => f.kind === "attr")) {
-                    el.primitive.componentText = el.primitive.value ?? "";
+                    el.primitive.componentText = literalFragmentsText();
                 }
                 return;
             }
@@ -1789,7 +1794,7 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
                 if (hasAttrFragment) {
                     el.primitive.componentText = resolveFilteredTemplateFragments(fragments, el.representedId, labelDecimals(el)) ?? "";
                 } else {
-                    el.primitive.componentText = profileHasLabelTemplates ? "" : (el.primitive.value ?? "");
+                    el.primitive.componentText = profileHasLabelTemplates ? "" : literalFragmentsText();
                 }
                 return;
             }
