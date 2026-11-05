@@ -1,11 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { parseProfileConstraints, runFullValidation, downloadCSV, resolveSeverity } from "./validation.js";
+import { parseProfileConstraints, runFullValidation, downloadCSV, resolveSeverity, describeCode } from "./validation.js";
 import {
     parseDexpiPackage, boundsFromElements, clampViewBox,
     findAncestors, collectDescendantObjectIds, flattenTree,
     parseColor, collectModelValidIds, isConnectivityRefProperty, isHeatTraceRingLabel,
 } from "./dexpiParser.js";
 import { jsPDF } from "jspdf";
+import { svgToDxf } from "./dxfExport.js";
 import { version as APP_VERSION } from "../package.json";
 import { buildXlsxBlob } from "./xlsxBlob.js";
 import { collectFolderElements } from "./elementUsage.js";
@@ -18,17 +19,16 @@ const DEFAULT_PROFILE_URL = "https://raw.githubusercontent.com/ToniaPedersen/DIS
 const DEFAULT_PROFILE_NAME = "DiscProfile.xml (DISCDEXPI_2026Pack)";
 
 // ---------- Hide elements with issues (persisted in localStorage) ----------
-// Mode: "All" | "AllErrors" | "None" | "Custom". The preset name is stored,
-// not the expanded code list, so All / All Errors pick up new codes
-// automatically. "codes" is only used by Custom.
+// "codes" is the list of verification codes (picked under Codes… in the
+// Validation tab) whose elements are hidden when "enabled" is on.
 const HIDE_ISSUES_KEY = "dexpiViewer.hideIssues";
 // Image compare (PNG vs DEXPI) UI: the Compare button / Compare layer
 // checkbox in BG Controls and the Compare tabs. Auto-fit and Save placement
 // stay available either way. Set to true to bring the compare back.
 const SHOW_IMAGE_COMPARE = true;
-// Default code set for the Custom mode (fill in, e.g. ["VAX-003", "ERR-E02"]).
+// Default code set (fill in, e.g. ["VAX-003", "ERR-E02"]).
 const DEFAULT_CUSTOM_HIDE_CODES = [];
-const HIDE_ISSUES_DEFAULT = { enabled: false, mode: "AllErrors", codes: DEFAULT_CUSTOM_HIDE_CODES };
+const HIDE_ISSUES_DEFAULT = { enabled: false, codes: DEFAULT_CUSTOM_HIDE_CODES };
 
 function loadHideIssues() {
     try {
@@ -36,7 +36,6 @@ function loadHideIssues() {
         if (v && typeof v === "object") {
             return {
                 enabled: !!v.enabled,
-                mode: ["All", "AllErrors", "None", "Custom"].includes(v.mode) ? v.mode : HIDE_ISSUES_DEFAULT.mode,
                 codes: Array.isArray(v.codes) ? v.codes.filter(c => typeof c === "string") : DEFAULT_CUSTOM_HIDE_CODES,
             };
         }
@@ -253,6 +252,8 @@ const S = {
     section: { padding: 12, borderBottom: "1px solid #eef2f6" },
     btn: { padding: "6px 10px", border: "1px solid #c7ced6", background: "white", borderRadius: 6, cursor: "pointer", fontSize: 13 },
     btnPrimary: { padding: "6px 10px", border: "1px solid #0969da", background: "#0969da", color: "white", borderRadius: 6, cursor: "pointer", fontSize: 13 },
+    exportGroup: { display: "flex", flexShrink: 0, marginLeft: 6 },
+    exportBtn: { display: "inline-flex", alignItems: "center", gap: 3, padding: "3px 7px", border: "1px solid #c7ced6", background: "white", cursor: "pointer", fontSize: 11, fontWeight: 600, color: "#57606a", lineHeight: "16px" },
     btnSmall: { padding: "3px 7px", border: "1px solid #c7ced6", background: "white", borderRadius: 4, cursor: "pointer", fontSize: 12 },
     btnDanger: { padding: "3px 7px", border: "1px solid #cf222e", background: "white", color: "#cf222e", borderRadius: 4, cursor: "pointer", fontSize: 12 },
     // Small green checkmark shown inline on a load button once its file has been loaded.
@@ -973,6 +974,52 @@ function renderLabelOverlay(ov, key, el) {
     }, ov.text);
 }
 
+// DXF layer for a drawn element (see dxfExport.js): pipes/signal lines, symbols and labels on separate layers.
+// Small "save to file" glyph used on the PNG / PDF / DXF buttons.
+function DownloadIcon() {
+    return (
+        <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true" style={{ flexShrink: 0 }}>
+            <path d="M8 1.5v8.5M4.5 6.8 8 10.3l3.5-3.5M2.5 11.5v2.5h11v-2.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+    );
+}
+
+// "Fit to window" glyph: four corner brackets.
+function FitIcon() {
+    return (
+        <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true" style={{ flexShrink: 0 }}>
+            <path d="M2 6V2h4M10 2h4v4M14 10v4h-4M6 14H2v-4" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+    );
+}
+
+// Picture glyph for the BG PNG button.
+function ImageIcon() {
+    return (
+        <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true" style={{ flexShrink: 0 }}>
+            <rect x="1.5" y="2.5" width="13" height="11" rx="1.5" fill="none" stroke="currentColor" strokeWidth="1.4" />
+            <circle cx="5.5" cy="6" r="1.3" fill="currentColor" />
+            <path d="M2.5 12.5 6.5 8.5l2.5 2.5 2-2 3 3" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinejoin="round" />
+        </svg>
+    );
+}
+
+// Sliders glyph for the BG controls toggle.
+function SlidersIcon() {
+    return (
+        <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true" style={{ flexShrink: 0 }}>
+            <path d="M2 4h12M2 8h12M2 12h12" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+            <circle cx="10" cy="4" r="1.7" fill="white" stroke="currentColor" strokeWidth="1.3" />
+            <circle cx="5" cy="8" r="1.7" fill="white" stroke="currentColor" strokeWidth="1.3" />
+            <circle cx="11" cy="12" r="1.7" fill="white" stroke="currentColor" strokeWidth="1.3" />
+        </svg>
+    );
+}
+
+function dxfLayerFor(el) {
+    return el.elementRole === "connector" ? "LINES" : el.elementRole === "label" ? "LABELS" : "SYMBOLS";
+}
+
 function SymbolGraphic({ el, selected, connHighlight, onSelect, boostPct, boostSymbolOutlines, showProfileLabels, showMixedLabels }) {
     const symbolStrokeMult = boostSymbolOutlines ? boostPct / 100 : 1;
     const mirror = el.isMirrored ? -1 : 1;
@@ -990,7 +1037,7 @@ function SymbolGraphic({ el, selected, connHighlight, onSelect, boostPct, boostS
                        : connHighlight === "#8250df" ? "#f3e8ff"
                        : null;
     return (
-        <g onClick={e => { e.stopPropagation(); if (el.representedId) onSelect(el.representedId); }} style={{ cursor: el.representedId ? "pointer" : "default" }}>
+        <g data-dxf-layer={dxfLayerFor(el)} onClick={e => { e.stopPropagation(); if (el.representedId) onSelect(el.representedId); }} style={{ cursor: el.representedId ? "pointer" : "default" }}>
             <g transform={transform}>
                 <rect x={hitX} y={hitY} width={hitW} height={hitH} fill="transparent" stroke="none" pointerEvents="all" />
             </g>
@@ -1012,7 +1059,7 @@ function PrimitiveGraphic({ el, selected, connHighlight, onSelect, nodePosMap, b
     const hlColor = selected ? (connHighlight || selectionColor(el.elementRole)) : connHighlight || null;
     const prim = el.primitive;
     return (
-        <g onClick={e => { e.stopPropagation(); if (el.representedId) onSelect(el.representedId); }} style={{ cursor: el.representedId ? "pointer" : "default" }}>
+        <g data-dxf-layer={dxfLayerFor(el)} onClick={e => { e.stopPropagation(); if (el.representedId) onSelect(el.representedId); }} style={{ cursor: el.representedId ? "pointer" : "default" }}>
             {prim?.kind === "circle" && <circle cx={prim.center.x} cy={prim.center.y} r={prim.radius + hitPad} fill="transparent" stroke="none" pointerEvents="all" />}
             {prim?.kind === "ellipse" && <ellipse cx={prim.center.x} cy={prim.center.y} rx={prim.rx + hitPad} ry={prim.ry + hitPad} fill="transparent" stroke="none" pointerEvents="all" />}
             {prim?.kind === "rect" && <rect x={prim.center.x - prim.width / 2 - hitPad} y={prim.center.y - prim.height / 2 - hitPad} width={prim.width + hitPad * 2} height={prim.height + hitPad * 2} fill="transparent" stroke="none" pointerEvents="all" />}
@@ -1120,7 +1167,7 @@ export default function App() {
     // 100 = unchanged (no-op), so nothing is boosted until the user raises it.
     const [lineBoostPct, setLineBoostPct] = useState(100);
     const [boostSymbolOutlines, setBoostSymbolOutlines] = useState(false);
-    // Hide elements with issues: checkbox + code-set mode, persisted per browser.
+    // Hide elements with issues: checkbox + picked code list, persisted per browser.
     const [hideIssues, setHideIssues] = useState(loadHideIssues);
     const [showHideCodes, setShowHideCodes] = useState(false);
     useEffect(() => {
@@ -1143,6 +1190,8 @@ export default function App() {
     const panDragRef = useRef(null);
     const suppressClickRef = useRef(false);
     const [exporting, setExporting] = useState(false);
+    // True for the moment Save DXF reads the drawing: selection and connectivity highlights are left out.
+    const [cleanExport, setCleanExport] = useState(false);
     // Draw-order overrides: representedIds whose graphic(s) the user has sent
     // to the back of the paint order. Elements paint in array order (later =
     // on top), so a symbol that visually/interactively covers overlapping or
@@ -1245,15 +1294,8 @@ export default function App() {
         return [...m.entries()].map(([code, severity]) => ({ code, severity })).sort((a, b) => a.code.localeCompare(b.code));
     }, [validationIssues]);
 
-    // Codes selected for hiding, resolved from the stored mode.
-    const hiddenIssueCodes = useMemo(() => {
-        switch (hideIssues.mode) {
-            case "All": return new Set(issueCodeList.map(c => c.code));
-            case "AllErrors": return new Set(issueCodeList.filter(c => c.severity === "Error").map(c => c.code));
-            case "None": return new Set();
-            default: return new Set(hideIssues.codes);
-        }
-    }, [hideIssues, issueCodeList]);
+    // Codes selected for hiding (always the picked list).
+    const hiddenIssueCodes = useMemo(() => new Set(hideIssues.codes), [hideIssues.codes]);
 
     // Object ids whose drawing elements are hidden. Issues on non-drawn
     // sub-objects hide their nearest drawn ancestor (visualContextId).
@@ -1272,10 +1314,12 @@ export default function App() {
     }, [hideIssues.enabled, hiddenIssueCodes, validationIssues]);
 
     const toggleHideCode = (code) => setHideIssues(h => {
-        const cur = new Set(h.mode === "Custom" ? h.codes : hiddenIssueCodes);
+        const cur = new Set(h.codes);
         if (cur.has(code)) cur.delete(code); else cur.add(code);
-        return { ...h, mode: "Custom", codes: [...cur].sort() };
+        return { ...h, codes: [...cur].sort() };
     });
+    // Codes… list: All selects every code found by the current verification; None clears the list.
+    const setAllHideCodes = (on) => setHideIssues(h => ({ ...h, codes: on ? [...new Set([...h.codes, ...issueCodeList.map(c => c.code)])].sort() : [] }));
 
     // Whether a DiscProfile.xml is loaded decides the parsing behavior -
     // there's no separate mode to pick: no profile loaded means "internal",
@@ -1955,6 +1999,28 @@ export default function App() {
         }
     }
 
+    // DXF: the whole DEXPI drawing as vector geometry (see dxfExport.js), not just the current view.
+    // The BG image, image-compare markers and selection/connectivity highlights are left out;
+    // elements hidden by "Hide elements with issues" stay hidden.
+    async function exportAsDxf() {
+        setExporting(true);
+        setCleanExport(true);
+        try {
+            // Let React re-render without highlights before reading the DOM.
+            await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+            const root = svgElRef.current?.querySelector("[data-dxf-root]");
+            if (!root) throw new Error("Drawing is not ready yet.");
+            const { dxf, count } = svgToDxf(root);
+            if (!count) throw new Error("Nothing to export - the drawing has no visible elements.");
+            downloadBlob(new Blob([dxf], { type: "application/dxf" }), `${exportFileBaseName()}.dxf`);
+        } catch (e) {
+            alert(e.message || String(e));
+        } finally {
+            setCleanExport(false);
+            setExporting(false);
+        }
+    }
+
     function runValidation() {
         if (!parsed) return;
         // Collect valid cross-file reference IDs from DiscProfile and any loaded profiles
@@ -2226,11 +2292,20 @@ export default function App() {
                         )}
                         {parsed && <button style={{ ...S.btnPrimary, marginTop: 8, width: "100%" }} onClick={runValidation}>Run Validation</button>}
                         {validationDone && (
-                            <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
-                                <span style={{ ...S.badge("#cf222e"), cursor: "pointer" }} onClick={() => { setValidationFilter("Error"); setLeftTab("validation"); }}>{issueCounts.Error} Errors</span>
-                                <span style={{ ...S.badge("#9a6700"), cursor: "pointer" }} onClick={() => { setValidationFilter("Warning"); setLeftTab("validation"); }}>{issueCounts.Warning} Warn</span>
-                                <span style={{ ...S.badge("#0969da"), cursor: "pointer" }} onClick={() => { setValidationFilter("Info"); setLeftTab("validation"); }}>{issueCounts.Info} Info</span>
-                                <button style={S.btnSmall} onClick={() => downloadCSV(validationIssues, `${mainFileName}.csv`)}>CSV</button>
+                            <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }} title="Filter the Validation tab">
+                                {[
+                                    { f: "All", label: `${validationIssues.length} All`, color: "#57606a" },
+                                    { f: "Error", label: `${issueCounts.Error} Errors`, color: "#cf222e" },
+                                    { f: "Warning", label: `${issueCounts.Warning} Warn`, color: "#9a6700" },
+                                    { f: "Info", label: `${issueCounts.Info} Info`, color: "#0969da" },
+                                ].map(({ f, label, color }) => {
+                                    const active = leftTab === "validation" && validationFilter === f;
+                                    return (
+                                        <span key={f} role="button" aria-pressed={active}
+                                            style={{ ...S.badge(color), cursor: "pointer", boxShadow: active ? `0 0 0 2px white, 0 0 0 3.5px ${color}` : "none" }}
+                                            onClick={() => { setValidationFilter(f); setLeftTab("validation"); }}>{label}</span>
+                                    );
+                                })}
                             </div>
                         )}
                     </div>
@@ -2274,14 +2349,34 @@ export default function App() {
                             ) : (
                                 <>
                                     <div style={{ padding: "6px 10px", borderBottom: "1px solid #eef2f6", display: "flex", gap: 5, flexWrap: "wrap", alignItems: "center" }}>
-                                        {["All", "Error", "Warning", "Info"].map(f => (
-                                            <button key={f} style={{ ...S.btnSmall, background: validationFilter === f ? "#0969da" : "white", color: validationFilter === f ? "white" : "#111", borderColor: validationFilter === f ? "#0969da" : "#c7ced6" }} onClick={() => setValidationFilter(f)}>
-                                                {f}{f !== "All" ? ` (${issueCounts[f]})` : ` (${validationIssues.length})`}
-                                            </button>
-                                        ))}
                                         <button style={S.btnSmall} onClick={expandAllCodeGroups}>Expand all</button>
                                         <button style={S.btnSmall} onClick={collapseAllCodeGroups}>Collapse all</button>
                                         <button style={{ ...S.btnSmall, marginLeft: "auto" }} onClick={() => downloadCSV(validationIssues, `${mainFileName}.csv`)}>CSV</button>
+                                    </div>
+                                    <div style={{ padding: "6px 10px", borderBottom: "1px solid #eef2f6", display: "flex", flexWrap: "wrap", alignItems: "center", gap: 5, fontSize: 12, color: "#57606a" }}>
+                                        <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }} title="Hide drawing elements that have validation issues with the selected codes. The issue list is not affected.">
+                                            <input type="checkbox" checked={hideIssues.enabled} onChange={e => setHideIssues(h => ({ ...h, enabled: e.target.checked }))} />
+                                            Hide elements with issues
+                                        </label>
+                                        <button style={{ ...S.btnSmall, background: showHideCodes ? "#eaf2ff" : "white" }} onClick={() => setShowHideCodes(v => !v)} title="Pick which verification codes hide their elements">Codes… ({issueCodeList.filter(c => hiddenIssueCodes.has(c.code)).length}/{issueCodeList.length})</button>
+                                        {hideIssues.enabled && hiddenIssueIds.size > 0 && <span title="Objects hidden from the drawing">({hiddenIssueIds.size} hidden)</span>}
+                                        {showHideCodes && (
+                                            <div style={{ flexBasis: "100%", marginTop: 4, background: "white", border: "1px solid #d0d7de", borderRadius: 6, padding: 8, maxHeight: 260, overflowY: "auto" }}>
+                                                <div style={{ display: "flex", gap: 6, marginBottom: 6, paddingBottom: 6, borderBottom: "1px solid #eef2f6" }}>
+                                                    <button style={S.btnSmall} disabled={!issueCodeList.length} onClick={() => setAllHideCodes(true)} title="Select every code">All</button>
+                                                    <button style={S.btnSmall} onClick={() => setAllHideCodes(false)} title="Clear the list">None</button>
+                                                    <button style={{ ...S.btnSmall, marginLeft: "auto" }} onClick={() => setShowHideCodes(false)}>Close</button>
+                                                </div>
+                                                {issueCodeList.length === 0 && <div style={{ color: "#8c959f" }}>No codes yet - run verification first.</div>}
+                                                {issueCodeList.map(({ code, severity }) => (
+                                                    <label key={code} title={`${code} (${severity}): ${describeCode(code)}`} style={{ display: "flex", alignItems: "center", gap: 6, padding: "2px 0", cursor: "pointer" }}>
+                                                        <input type="checkbox" checked={hiddenIssueCodes.has(code)} onChange={() => toggleHideCode(code)} />
+                                                        <span style={{ fontFamily: "monospace", flexShrink: 0, color: severity === "Error" ? "#cf222e" : severity === "Warning" ? "#9a6700" : "#57606a" }}>{code}</span>
+                                                        <span style={{ color: "#57606a", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{describeCode(code)}</span>
+                                                    </label>
+                                                ))}
+                                            </div>
+                                        )}
                                     </div>
                                     {(() => {
                                         const renderIssueCard = (issue, i) => {
@@ -2364,8 +2459,9 @@ export default function App() {
                                                     >
                                                         <span style={{ fontSize: 10, color: "#57606a", width: 10, display: "inline-block" }}>{isCollapsed ? "▶" : "▼"}</span>
                                                         <span style={{ ...S.badge(S.sevColor[group.severity]) }}>{group.severity}</span>
-                                                        <span style={{ fontSize: 11, fontFamily: "monospace", fontWeight: 600, color: "#333" }}>{group.code}</span>
-                                                        <span style={{ fontSize: 11, color: "#888", marginLeft: "auto" }}>{group.items.length}</span>
+                                                        <span style={{ fontSize: 11, fontFamily: "monospace", fontWeight: 600, color: "#333", flexShrink: 0 }}>{group.code}</span>
+                                                        <span title={describeCode(group.code)} style={{ fontSize: 11, color: "#57606a", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>{describeCode(group.code)}</span>
+                                                        <span style={{ fontSize: 11, color: "#888", marginLeft: "auto", flexShrink: 0 }}>{group.items.length}</span>
                                                     </div>
                                                     {!isCollapsed && group.items.map(({ issue, idx }) => renderIssueCard(issue, idx))}
                                                 </div>
@@ -2611,9 +2707,8 @@ export default function App() {
 
             {/* CENTER PANEL */}
             <div style={{ position: "relative", overflow: "hidden", background: "#f8fafc", display: "flex", flexDirection: "column" }}>
-                <div style={{ ...S.toolbar, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-                    <div style={{ display: "flex", gap: 5, flexWrap: "wrap", alignItems: "center" }}>
-                        <button style={S.btn} onClick={fitDrawingToWindow} title="Fit drawing to window (or double-click the drawing)">Fit</button>
+                <div style={{ ...S.toolbar, display: "flex", gap: 8, alignItems: "flex-start" }}>
+                    <div style={{ display: "flex", gap: 5, flexWrap: "wrap", alignItems: "center", flex: "1 1 auto", minWidth: 0 }}>
                         {sentToBackIds.size > 0 && (
                             <button style={{ ...S.btn, background: "#eaf2ff", borderColor: "#0969da", color: "#0969da" }} onClick={() => setSentToBackIds(new Set())} title={`Restore normal draw order for ${sentToBackIds.size} object(s) sent to back`}>
                                 Reset Z-Order ({sentToBackIds.size})
@@ -2628,38 +2723,6 @@ export default function App() {
                             <input type="checkbox" checked={boostSymbolOutlines} onChange={e => setBoostSymbolOutlines(e.target.checked)} />
                             Include outlines
                         </label>
-                        <div style={{ position: "relative", display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "#57606a" }}>
-                            <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }} title="Hide drawing elements that have validation issues with the selected codes. The issue list is not affected.">
-                                <input type="checkbox" checked={hideIssues.enabled} onChange={e => setHideIssues(h => ({ ...h, enabled: e.target.checked }))} />
-                                Hide elements with issues
-                            </label>
-                            <select value={hideIssues.mode} onChange={e => setHideIssues(h => ({ ...h, mode: e.target.value }))} style={{ fontSize: 12 }} title="Which verification codes hide elements">
-                                <option value="All">All</option>
-                                <option value="AllErrors">All Errors</option>
-                                <option value="None">None</option>
-                                <option value="Custom">Custom</option>
-                            </select>
-                            <button style={S.btn} onClick={() => setShowHideCodes(v => !v)} title="Pick individual codes (switches to Custom)">Codes…</button>
-                            {hideIssues.enabled && hiddenIssueIds.size > 0 && <span title="Objects hidden from the drawing">({hiddenIssueIds.size} hidden)</span>}
-                            {showHideCodes && (
-                                <div style={{ position: "absolute", top: "100%", left: 0, zIndex: 20, marginTop: 4, background: "white", border: "1px solid #d0d7de", borderRadius: 6, boxShadow: "0 4px 12px rgba(0,0,0,0.12)", padding: 8, maxHeight: 320, overflowY: "auto", minWidth: 200 }}>
-                                    {issueCodeList.length === 0 && <div style={{ color: "#8c959f" }}>No codes yet - run verification first.</div>}
-                                    {issueCodeList.map(({ code, severity }) => (
-                                        <label key={code} style={{ display: "flex", alignItems: "center", gap: 6, padding: "2px 0", cursor: "pointer" }}>
-                                            <input type="checkbox" checked={hiddenIssueCodes.has(code)} onChange={() => toggleHideCode(code)} />
-                                            <span style={{ fontFamily: "monospace" }}>{code}</span>
-                                            <span style={{ color: severity === "Error" ? "#cf222e" : severity === "Warning" ? "#9a6700" : "#57606a" }}>{severity}</span>
-                                        </label>
-                                    ))}
-                                    <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
-                                        <button style={S.btn} onClick={() => setHideIssues(h => ({ ...h, mode: "Custom", codes: DEFAULT_CUSTOM_HIDE_CODES }))} title="Reset Custom to the default code set">Default</button>
-                                        <button style={S.btn} onClick={() => setShowHideCodes(false)}>Close</button>
-                                    </div>
-                                </div>
-                            )}
-                        </div>
-                        <button style={S.btn} disabled={!parsed || exporting} onClick={exportAsPng} title="Save the current view (drawing + BG image, if any) as a PNG">{exporting ? "..." : "Save PNG"}</button>
-                        <button style={S.btn} disabled={!parsed || exporting} onClick={exportAsPdf} title="Save the current view (drawing + BG image, if any) as a PDF">{exporting ? "..." : "Save PDF"}</button>
                         <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "#57606a", cursor: "pointer" }} title="Connectivity mode: highlights the upstream (blue), downstream (green), and group (purple) connections of the selected object. Hidden by default - check this box to show the highlight.">
                             <input type="checkbox" checked={showConnectivity} onChange={e => setShowConnectivity(e.target.checked)} />
                             Connectivity
@@ -2680,9 +2743,30 @@ export default function App() {
                                 Mixed labels
                             </label>
                         )}
-                        <button style={S.btn} onClick={handleBgButton} title="Overlay an image behind the drawing. Pick a DEXPI XML together with its .png to load both.">BG Image</button>
-                        {bgImage && <button style={{ ...S.btn, background: showBgControls ? "#eaf2ff" : "white" }} onClick={() => setShowBgControls(p => !p)}>BG Controls</button>}
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 4, flexShrink: 0 }}>
+                        <button style={{ ...S.exportBtn, borderRadius: 5 }} onClick={fitDrawingToWindow} title="Fit drawing to window (or double-click the drawing)"><FitIcon />Fit</button>
+                        <button style={{ ...S.exportBtn, borderRadius: 5, color: bgImage ? "#0969da" : "#57606a", borderColor: bgImage ? "#0969da" : "#c7ced6" }} onClick={handleBgButton} title="Overlay a background image (e.g. the original P&ID as PNG) behind the drawing. Pick a DEXPI XML together with its .png to load both.">
+                            <ImageIcon />BG PNG
+                        </button>
+                        {bgImage && (
+                            <button style={{ ...S.exportBtn, borderRadius: 5, padding: "3px 5px", background: showBgControls ? "#eaf2ff" : "white" }} onClick={() => setShowBgControls(p => !p)} title="Show / hide the BG image controls (blend, scale, position)" aria-label="BG controls">
+                                <SlidersIcon />
+                            </button>
+                        )}
                         <input ref={bgInputRef} type="file" accept="image/*,.xml" multiple style={{ display: "none" }} onChange={handleBgFile} />
+                    </div>
+                    <div style={S.exportGroup} role="group" aria-label="Save drawing">
+                        {[
+                            { fmt: "PNG", onClick: exportAsPng, title: "Save the current view (drawing + BG image, if any) as a PNG image" },
+                            { fmt: "PDF", onClick: exportAsPdf, title: "Save the current view (drawing + BG image, if any) as a PDF" },
+                            { fmt: "DXF", onClick: exportAsDxf, title: "Save the whole drawing as a DXF (vector lines, arcs and text on SYMBOLS / LINES / LABELS / HEAT_TRACE layers) for CAD" },
+                        ].map((b, i) => (
+                            <button key={b.fmt} style={{ ...S.exportBtn, borderLeftWidth: i ? 0 : 1, borderRadius: i === 0 ? "5px 0 0 5px" : i === 2 ? "0 5px 5px 0" : 0, opacity: !parsed || exporting ? 0.5 : 1 }}
+                                disabled={!parsed || exporting} onClick={b.onClick} title={b.title}>
+                                <DownloadIcon />{b.fmt}
+                            </button>
+                        ))}
                     </div>
                 </div>
 
@@ -2799,17 +2883,17 @@ export default function App() {
                         {cmp && cmpView === "diff" && !batchPng && (
                             <image href={cmp.diffUrl} x={cmp.diffPlacement.x} y={cmp.diffPlacement.y} width={cmp.diffPlacement.width} height={cmp.diffPlacement.height} preserveAspectRatio="none" style={{ pointerEvents: "none" }} />
                         )}
-                        <g style={{ opacity: cmp && cmpView === "diff" && !batchPng ? 0.12 : bgImage && bgImage.opacity < 0 ? Math.max(0, 1 + bgImage.opacity) : 1 }}>
+                        <g data-dxf-root="" style={{ opacity: cmp && cmpView === "diff" && !batchPng ? 0.12 : bgImage && bgImage.opacity < 0 ? Math.max(0, 1 + bgImage.opacity) : 1 }}>
                             {orderedGraphicsElements.map(el => {
                                 if (el.representedId && hiddenIssueIds.has(el.representedId)) return null;
-                                const isSelected = !!el.representedId && selectedRepresentedIds.has(el.representedId);
+                                const isSelected = !cleanExport && !!el.representedId && selectedRepresentedIds.has(el.representedId);
                                 const ch = connectivityHighlight;
-                                const connColor = el.representedId ? (ch.upstream.has(el.representedId) ? "#0969da" : ch.downstream.has(el.representedId) ? "#1a7f37" : ch.group.has(el.representedId) ? "#8250df" : null) : null;
+                                const connColor = !cleanExport && el.representedId ? (ch.upstream.has(el.representedId) ? "#0969da" : ch.downstream.has(el.representedId) ? "#1a7f37" : ch.group.has(el.representedId) ? "#8250df" : null) : null;
                                 if (el.kind === "symbolUsage") return <SymbolGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} boostPct={lineBoostPct} boostSymbolOutlines={boostSymbolOutlines} showProfileLabels={showProfileLabels} showMixedLabels={showMixedLabels} />;
                                 return <PrimitiveGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} nodePosMap={parsed.graphics.nodePosMap} boostPct={lineBoostPct} boostSymbolOutlines={boostSymbolOutlines} showProfileLabels={showProfileLabels} showMixedLabels={showMixedLabels} />;
                             })}
                             {/* Heat-trace overlays – part of the DEXPI drawing layer (fades with it), only when a DISC profile is loaded */}
-                            {parsed?.heatTraceSet?.size > 0 && parsed.graphics.elements.map(el => {
+                            {parsed?.heatTraceSet?.size > 0 && <g data-dxf-layer="HEAT_TRACE">{parsed.graphics.elements.map(el => {
                                 // Tag-bubble labels (ND0248B) get the same dashed outer ring as an
                                 // ND0248A instrument bubble when the object they label is heat traced.
                                 const ringLabel = isHeatTraceRingLabel(el);
@@ -2826,7 +2910,7 @@ export default function App() {
                                 if (htType === "pif" && el.kind === "symbolUsage")
                                     return <HeatTracePIF key={`ht_${el.key}`} el={el} />;
                                 return null;
-                            })}
+                            })}</g>}
                         </g>
                         {/* Image compare markers - one box per open issue, arrow to where a misplaced object matches */}
                         {cmp && cmpView !== "off" && !batchPng && (

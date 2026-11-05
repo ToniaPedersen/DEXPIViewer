@@ -65,6 +65,59 @@ export const DEFAULT_SEVERITIES = {
     "PRF-E07": { level: "Warning", score: 2 },
 };
 
+// Very short description of each verification code, shown next to the code in
+// the Validation tab group headers and the Codes… list. Full wording is in
+// public/UserGuide.md.
+export const CODE_DESCRIPTIONS = {
+    "VAL-001": "XML not well-formed",
+    "VAL-004": "Required object has no id or no graphics",
+    "VAL-005": "Broken reference to a missing ID",
+    "VAX-001": "ActuatingSystem has no ControlledActuator",
+    "VAX-003": "System has no segments / loop has no functions",
+    "VAX-004": "Piping node not connected",
+    "VAX-005": "Segment has no connections",
+    "VAX-006": "Component has unconnected ports",
+    "VAE-001": "Valve reference missing / equipment has no nozzles",
+    "VAE-002": "Segment has no piping components",
+    "VAE-003": "Instrument function has no tag or loop",
+    "VAE-004": "Nozzle not under process equipment",
+    "VAE-005": "Zero-length connector line",
+    "VAE-006": "Instrument function has no signal lines",
+    "ERR-E01": "XML cannot be parsed",
+    "ERR-E02": "Unknown DEXPI namespace in Import",
+    "ERR-E03": "Unknown XML element",
+    "ERR-E04": "Unknown attribute on Object",
+    "ERR-E05": "Object has no type",
+    "ERR-E06": "Value fails its type check",
+    "ERR-E07": "Unknown type, property or multiplicity",
+    "ERR-E08": "Object under the wrong or an undefined Components property",
+    "ERR-E10": "Duplicate id",
+    "ERR-E11": "Duplicate PersistentIdentifier",
+    "ERR-E12": "Valve reference points to a non-valve",
+    "ERR-E15": "PlantMetaData missing",
+    "ERR-E16": "Graphics represent a missing object",
+    "ERR-E17": "Important object has no graphics",
+    "ERR-E18": "Attribute not allowed on this class (profile)",
+    "ERR-E19": "Attribute used too many times (profile)",
+    "ERR-E20": "Label attribute has no value",
+    "ERR-E21": "Target referenced more than once",
+    "PRF-E01": "Profile XML or constraint invalid",
+    "PRF-E02": "Profile constraint type unknown",
+    "PRF-E04": "Symbol not in profile or wrong class",
+    "PRF-E05": "Pipe end not on a symbol connection point",
+    "PRF-E06": "Label attribute not defined by the symbol",
+    "PRF-E07": "Object drawn without a symbol",
+    "PRF-007": "Profile constraint overridden",
+};
+
+// Description for a code; profile-required-property codes (PRF-{profile}-{property}) are generated per property.
+export function describeCode(code) {
+    if (!code) return "";
+    if (CODE_DESCRIPTIONS[code]) return CODE_DESCRIPTIONS[code];
+    if (code.startsWith("PRF-")) return `Required property missing (${code.split("-").slice(2).join("-") || "profile"})`;
+    return "";
+}
+
 export function resolveSeverity(ruleId, severityConfig) {
     if (severityConfig && severityConfig[ruleId]) return severityConfig[ruleId];
     // Check specific rule first, then prefix fallback
@@ -729,10 +782,49 @@ export function runXmlSchemaValidation(mainXml, flatTree, severityConfig, extern
 
             const clsEntry = compositionMap.classComposition.get(parentSuffix);
             const propEntry = clsEntry ? clsEntry.get(propLocal) : null;
-            // No known declaration for this (class, property) combination — either
-            // it's genuinely invalid (already reported by ERR-E07's property-name
-            // check) or it's a profile extension property with no target on record.
-            // Nothing further to check here without a target type.
+
+            // The parent class is known to the meta model (or a loaded profile) but
+            // declares no Components property of this name, directly or by
+            // inheritance — e.g. a Plant/Piping.Sensorwell placed under
+            // MeasuringLineFunction/Components[@property='Items']. ERR-E07 reports
+            // the undefined property on the parent; here every child object in that
+            // slot is reported too, because none of them can legally be a child of
+            // this parent, with a hint on where its type does belong.
+            if (!propEntry && clsEntry && compositionMap.closure.has(parentSuffix)) {
+                for (const child of comp.children) {
+                    if (child.tagName !== "Object") continue;
+                    const childType = child.getAttribute("type") || "";
+                    if (!childType) continue;
+                    const childSuffix = childType.split(/[.\/]/).pop();
+                    const hosts = allowedCompositionHosts(childSuffix, compositionMap);
+                    const childId = child.getAttribute("id") || "(no id)";
+                    const directRep = childId !== "(no id)" && representedIds.has(childId);
+                    const visualContextId = directRep ? null : findNearestRepAncestor(child);
+                    const parentId = parentObj.getAttribute("id") || "(no id)";
+                    const sev = resolveSeverity("ERR-E08", severityConfig);
+                    const hostText = hosts.length
+                        ? ` In the DEXPI 2.0 model '${childSuffix}' can be a child of: ${hosts.slice(0, 5).join(", ")}${hosts.length > 5 ? ", …" : ""}.`
+                        : "";
+                    issues.push({
+                        objectId: childId, objectType: childType, ruleId: "ERR-E08",
+                        severity: sev.level, score: sev.score,
+                        description: `Object of type '${childType}' is not allowed as a child of '${parentType}' (id '${parentId}'): '${parentSuffix}' has no Components property '${comp.getAttribute("property")}' in the DEXPI 2.0 meta model or any loaded profile.${hostText}`,
+                        location: childId !== "(no id)" ? `//*[@id='${childId}']` : `//*[@id='${parentId}']/Components[@property='${comp.getAttribute("property")}']`,
+                        profileSource: "Base",
+                        suggestedCorrection: (hosts.length
+                            ? `Move this object under ${hosts[0]}`
+                            : `Move this object to a parent class that can contain '${childSuffix}'`) +
+                            (compositionMap.closure.get(childSuffix)?.has("SensingLocation")
+                                ? ` and point to it from the ProcessSignalGeneratingFunction's SensingLocation reference instead of nesting it in the signal line.`
+                                : `, or reference it from '${parentSuffix}' instead of nesting it.`),
+                        ...(visualContextId ? { visualContextId } : {}),
+                    });
+                }
+                return;
+            }
+
+            // No declaration and parent class unknown, or a profile extension
+            // property with no target on record — nothing further to check here.
             if (!propEntry || !propEntry.target) return;
 
             for (const child of comp.children) {
@@ -1957,6 +2049,27 @@ function buildProfileCompositionMap(hierarchyPairs, propRows, profileXmlList) {
     }
 
     return { hierarchy, closure, classComposition };
+}
+
+// List "Class.Property" composition slots (declared, not merely inherited) that
+// accept an object of type `childSuffix`, for ERR-E08 correction hints.
+function allowedCompositionHosts(childSuffix, compositionMap) {
+    const anc = compositionMap.closure.get(childSuffix);
+    if (!anc) return [];
+    const out = [];
+    for (const [cls, props] of compositionMap.classComposition) {
+        for (const [name, info] of props) {
+            if (!info.target || !anc.has(info.target)) continue;
+            // Skip entries inherited unchanged from a supertype that is itself listed.
+            const supers = compositionMap.hierarchy.get(cls) || new Set();
+            let inherited = false;
+            for (const sup of supers) {
+                if (compositionMap.classComposition.get(sup)?.get(name) === info) { inherited = true; break; }
+            }
+            if (!inherited) out.push(`${cls}.${name}`);
+        }
+    }
+    return out.sort();
 }
 
 // Is `childSuffix` the same type as, or a (transitive) subtype of, `targetSuffix`?

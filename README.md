@@ -4,7 +4,7 @@ A browser-based viewer and validation engine for [DEXPI 2.0](https://dexpi.org) 
 
 **Live demo:** [toniapedersen.github.io/DEXPIViewer](https://toniapedersen.github.io/DEXPIViewer/)
 
-Version 2.4.0 - see [ChangeLog_2.3_to_2.4.md](ChangeLog_2.3_to_2.4.md) for the changes since 2.3.
+Version 2.5.0 - see [ChangeLog_2.4_to_2.5.md](ChangeLog_2.4_to_2.5.md) for the changes since 2.4.
 
 ---
 

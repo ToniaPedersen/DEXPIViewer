@@ -2,7 +2,7 @@
 
 A browser-based viewer and validation engine for [DEXPI 2.0](https://dexpi.org) intelligent P&ID files, with full support for DISC profile validation.
 
-**Version 2.4.0** — see `ChangeLog_2.3_to_2.4.md` for the changes since 2.3.
+**Version 2.5.0** — see `ChangeLog_2.4_to_2.5.md` for the changes since 2.4.
 
 Developed by **Tonia Pedersen** at **[Draga AS](https://draga.no)**.
 
@@ -77,11 +77,12 @@ Profiles stack in load order — later profiles override constraints from earlie
 
 After loading a file, click the **Run Validation** button (blue, full-width, in the left panel). The engine runs all applicable rules and displays a summary badge row:
 
+- ⚪ **Grey badge** — total number of issues (**All**)
 - 🔴 **Red badge** — number of Errors
 - 🟡 **Amber badge** — number of Warnings
 - 🔵 **Blue badge** — number of Info items
 
-Clicking any badge filters the Validation tab to that severity level. The Validation tab label updates to show the total issue count.
+Clicking a badge opens the Validation tab filtered to that severity (**All** shows every issue). The badge of the active filter is outlined. The Validation tab label updates to show the total issue count.
 
 ---
 
@@ -106,7 +107,7 @@ Below the file-loading buttons and the loaded Profile filename, a **Go to** fiel
 1. Paste or type a coordinate pair as `x, y` (e.g. `281.402440417167, 454.852545971671`) — a space or `;` between the numbers also works.
 2. Click **Go**, or press **Enter** in the field.
 
-The centre panel pans and zooms to center that point in the view (at the current zoom level) and drops an orange crosshair marker on it. Click **Clear** to remove the marker. Coordinates are in the drawing's own native units — the same coordinate space used throughout the app (e.g. the BG Image X/Y offsets in 5.7) — not screen pixels. The **Go** button is disabled until a DEXPI XML file is loaded.
+The centre panel pans and zooms to center that point in the view (at the current zoom level) and drops an orange crosshair marker on it. Click **Clear** to remove the marker. Coordinates are in the drawing's own native units — the same coordinate space used throughout the app (e.g. the BG image X/Y offsets in 5.7) — not screen pixels. The **Go** button is disabled until a DEXPI XML file is loaded.
 
 ### 4.1 Topology Tab
 
@@ -132,9 +133,11 @@ Lists all validation issues from the last run. Each row shows:
 - Object ID and type
 - Issue description and suggested correction
 
-Filter buttons at the top let you show **All** issues or filter to a single severity level. Clicking an issue row selects the associated object and navigates to it in the topology tree.
+Issues are grouped by verification code. Each group header shows the code, its short description (e.g. `ERR-E08 Object under the wrong or an undefined Components property`) and the number of issues. **Expand all** / **Collapse all** open or close every group. The severity filter is set with the badges in the left panel (2.4). Clicking an issue row selects the associated object and navigates to it in the topology tree.
 
 The **CSV** button exports the full issue list as a spreadsheet-compatible file.
+
+**Hide elements with issues** — tick to hide, in the drawing, every element that has an issue with one of the picked codes. The issue list itself is not affected. **Codes… (n/m)** opens the code list (n of the m codes found by the last verification are picked): tick codes one by one, or use **All** (every code found) or **None** (clear the list). Each code is shown with its severity colour and short description. While hiding is on, the number of hidden objects is shown. The picked codes are kept in the browser.
 
 ### 4.3 Config Tab
 
@@ -158,7 +161,7 @@ The centre panel renders the DEXPI drawing graphically from the XML data. Symbol
 | Pan | Drag with the left or middle mouse button. A click without moving the mouse still selects |
 | Fit to window | Click the **Fit** button in the centre toolbar, or double-click the drawing |
 | Jump to a coordinate | **Go to** field in the left panel — enter `x, y` and click **Go** (see section 4, above) |
-| Export view | Click **Save PNG** / **Save PDF** in the centre toolbar (see 5.8, below) |
+| Export view | Click **PNG** / **PDF** / **DXF** in the centre toolbar (see 5.8, below) |
 
 ### 5.2 Selecting Objects
 
@@ -197,7 +200,7 @@ Check **Include symbol outlines** to also apply the same percentage to symbol ou
 
 ### 5.7 Background Image
 
-Click **BG Image** to overlay a reference image behind the P&ID drawing. Once one is loaded, **BG Controls** appears with:
+Click **BG PNG** (right-hand end of the centre toolbar) to overlay a reference image behind the P&ID drawing; the button turns blue while an image is loaded. Once one is loaded, the sliders button next to it shows or hides the BG controls:
 
 | Control | Description |
 |---------|-------------|
@@ -213,7 +216,7 @@ The image is placed inside the same coordinate space as the drawing, so it pans 
 
 #### Saving and reloading a placement
 
-Unlike the other BG Controls, the placement isn't kept in the browser — it travels with the image file itself. Once you've dialed in the Scale/X/Y for a PNG, click **⬇ Download PNG with placement** to save it: the values are written into a small text chunk embedded in the PNG's own bytes, alongside the pixel data.
+Unlike the other BG controls, the placement isn't kept in the browser — it travels with the image file itself. Once you've dialed in the Scale/X/Y for a PNG, click **⬇ Download PNG with placement** to save it: the values are written into a small text chunk embedded in the PNG's own bytes, alongside the pixel data.
 
 The next time that downloaded PNG is loaded as a BG image — in this app, on another machine, or in a different browser — the embedded Scale/X/Y is read automatically and applied immediately, instead of falling back to the auto-fit placement. No extra step is needed; it just works the way opening any other file with saved settings would.
 
@@ -221,10 +224,11 @@ Only PNG files support an embedded placement (the file format used for the under
 
 ### 5.8 Exporting the Drawing
 
-Use **Save PNG** or **Save PDF** in the centre toolbar to save exactly what's currently in the drawing viewport — the DEXPI drawing plus the BG image overlay, if one is loaded and visible — as a file. Both buttons are disabled until a drawing is loaded, and while an export is in progress.
+The **PNG**, **PDF** and **DXF** buttons at the right-hand end of the centre toolbar save the drawing as a file. They are disabled until a drawing is loaded, and while an export is in progress.
 
-- **Save PNG** — rasterizes the current view to a PNG at a fixed long-edge resolution, aspect ratio matching the current view.
-- **Save PDF** — the same rendering, embedded as a single full-page image in a PDF (long edge ~420mm, A3-ish). DEXPI drawing coordinates aren't reliably tied to real-world units, so this is a print-friendly fit rather than a to-scale export.
+- **PNG** — rasterizes the current view (the DEXPI drawing plus the BG image overlay, if one is loaded and visible) to a PNG at a fixed long-edge resolution, aspect ratio matching the current view.
+- **PDF** — the same rendering, embedded as a single full-page image in a PDF (long edge ~420mm, A3-ish). DEXPI drawing coordinates aren't reliably tied to real-world units, so this is a print-friendly fit rather than a to-scale export.
+- **DXF** — the whole drawing (not just the current view) as an AutoCAD R12 ASCII DXF with real vector geometry: lines and polylines, circles and arcs, and text with its height, rotation and alignment. Elements are placed on the layers **SYMBOLS**, **LINES** (piping and signal lines), **LABELS** and **HEAT_TRACE**; colours map to the nearest AutoCAD colour and dash patterns get their own line types. Units are the drawing's own (millimetres). The BG image, image-compare markers and selection/connectivity highlights are left out; elements hidden by **Hide elements with issues** stay hidden. R12 opens in AutoCAD, BricsCAD, LibreCAD, DraftSight, QCAD and ODA viewers.
 
 The downloaded file name is derived from the drawing number where available.
 
@@ -258,7 +262,7 @@ Every text drawn on the P&ID must be linked, because the drawing is meant to be 
 
 The text stored in the file (`Core/Diagram.Text` → `Data property="Text"`) is **never shown**, whether or not a profile is loaded and whatever the state of **Profile labels**. It is a cached export result, not a link. A Text with no attribute reference therefore shows nothing. If a label looks wrong on the drawing, its links are wrong in the file: for example, when an export gives all three Texts of an instrument bubble the same template (`<ProcessPlantIdentificationCode><PlantSystemIdentificationCode>`), every Text shows `A20`.
 
-An attribute is read only from the object the fragment names, and only from the labelled component itself or what belongs to it (its plant structure, Chambers, connectors, related signal functions, Notes). If all the attributes of a label are blank, the whole label is blank, so a literal such as `SP = ` never stands on its own. Units are shown with their symbol (`barg`, `°C`, `m³/h`). An attribute reference in the file shows what its `Type` asks for: `AttributeRepresentationType.Value` the value only (`23`), `Units` the unit only (`barg`), `ValueAndUnits` both (`23 barg`). The profile's own set point and alarm labels (`SP = `, `HH=`, `H=`, `L=`, `LL=`) always show the value with its unit, e.g. `SP = 6 barg`. With **Mixed labels**, a `Units` reference following a `Value` reference to the same attribute is joined to it with a space (`23 barg`). A pressure at full vacuum (−1.01325 barg, or 0 in an absolute unit) is shown as `FV`.
+An attribute is read only from the object the fragment names, and only from the labelled component itself or what belongs to it (its plant structure, Chambers, connectors, related signal functions, Notes). If all the attributes of a label are blank, the whole label is blank, so a literal such as `SP = ` never stands on its own. Units are shown with their symbol (`barg`, `°C`, `m³/h`). An attribute reference in the file shows what its `Type` asks for: `AttributeRepresentationType.Value` the value only (`23`), `Units` the unit only (`barg`), `ValueAndUnits` both (`23 barg`). The profile's own set point and alarm labels (`SP = `, `HH=`, `H=`, `L=`, `LL=`) always show the value with its unit, e.g. `SP = 6 barg`. A pressure at full vacuum (−1.01325 barg, or 0 in an absolute unit) is shown as `FV`.
 
 #### draga.no (xBRIDGE) profiles
 
@@ -281,11 +285,7 @@ Once a DiscProfile.xml is loaded, the **Profile labels** and **Mixed labels** ch
 
 **Checked** — labels are drawn from the loaded profile's own `Profile/LabelTemplate` definitions for the placed symbol, at the position the profile defines, resolved against the represented object (e.g. `<ObjectDisplayName>`, `<ReferencedDrawingNumber>`, `'HH=' & SignalConveyingFunction:<AlarmValue>`). The file's own label Texts for that symbol are hidden, so the drawing shows the profile's intended layout. The checked view is useful to see what the tag should read when the file's own label links are wrong.
 
-**Mixed labels** — a second checkbox next to **Profile labels**; ticking one unticks the other. The labels stored in the file are drawn where the file puts them, but a label of a symbol placed from the profile shows:
-
-- only the values of its attribute references that are label attributes of the object's profile symbols (a reference to any other attribute is left out);
-- between two values, only the literal the profile label allows there: the one that stands between those attributes in the profile's `Profile/LabelTemplate` (a space, `x`, `-` …). The file's own literal text is never shown, and neither are literals before the first or after the last value (`EL: `, `HH=`);
-- the values in the order of the profile template; values from different template rows are separated by a space.
+**Mixed labels** — a second checkbox next to **Profile labels**; ticking one unticks the other. The labels stored in the file are drawn where the file puts them. A label of a symbol placed from the profile that is a valid representation — it references, with a value, at least one label attribute of the object's profile symbols — is shown exactly as with both checkboxes unticked: its text is never rebuilt from the profile `Profile/LabelTemplate`. A file label built as `NominalDiameterRepresentationIn` + `NominalDiameterRepresentationOut` with no literal between them stays `12001000` and does not get the profile's `x` (`1200x1000`); an instrument's label A built as `ProcessPlantIdentificationCode` + `PlantSystemIdentificationCode` stays `A20` and does not get the profile's `-` (`A-20`). Such a difference from the profile label is left visible; tick **Profile labels** to see what the profile defines. A label of a profile symbol that references none of the symbol's label attributes with a value is not drawn.
 
 Each of the symbol's profile labels (one per `Profile/LabelTemplate`) is drawn as the default, as with **Profile labels** checked, when none of its attributes is referenced by a file label of the object. For example, an off-page connector whose file labels reference `ReferencedDrawingDescriptor` but show the drawing number only as literal text gets the profile's `<ReferencedDrawingNumber>` label, and not its descriptor label. Note labels, leader lines and labels of objects without a profile symbol are drawn as with both checkboxes unticked.
 
@@ -390,7 +390,7 @@ Rules marked **Profile required** only fire when at least one profile XML has be
 | ERR-E05 | Error | Object missing mandatory `type` attribute. | |
 | ERR-E06 | Error | Value in a typed element (`Double`, `Integer`, `Boolean`, etc.) fails type check. | |
 | ERR-E07 | Error | Object type not in the DEXPI 2.0 Plant Meta Model registry; or property name / multiplicity violated. | |
-| ERR-E08 | Error | Object placed under an incompatible `Components` property for its type. | |
+| ERR-E08 | Error | Object placed under an incompatible `Components` property for its type, or under a `Components` property its parent class does not define at all (e.g. a `Piping.Sensorwell` nested in `MeasuringLineFunction/Components[@property='Items']`). The message lists where the type is allowed. | |
 | ERR-E10 | Error | Duplicate `id` attribute — two or more objects share the same ID. | |
 | ERR-E11 | Error | Duplicate `PersistentIdentifier` value across objects. | |
 | ERR-E12 | Error | `OperatedValveReference.Valve` references a non-valve type. | |
@@ -603,7 +603,7 @@ Use **Data → From Text/CSV** in Excel and select UTF-8 encoding.
 The file may reference profile symbols that are not loaded. Load the appropriate `DiscProfile.xml` (and FL0 profile if needed) — the parser re-runs automatically when a new profile is added.
 
 **Background image does not align with the drawing**
-The image is auto-fit (centered, aspect-correct) into the drawing extents on load and rendered inside the same coordinate space as the drawing, so it stays aligned at any pan/zoom level. Use the Scale and X/Y controls in BG Controls, or click **Reset fit** to snap back to the auto-fit placement — offsets are in drawing units, not screen pixels. If you're reloading a PNG you've previously aligned, make sure you're loading the copy downloaded via **⬇ Download PNG with placement** (see 5.7) — the original file you first selected was never modified and has no embedded placement.
+The image is auto-fit (centered, aspect-correct) into the drawing extents on load and rendered inside the same coordinate space as the drawing, so it stays aligned at any pan/zoom level. Use the Scale and X/Y controls in the BG controls, or click **Reset fit** to snap back to the auto-fit placement — offsets are in drawing units, not screen pixels. If you're reloading a PNG you've previously aligned, make sure you're loading the copy downloaded via **⬇ Download PNG with placement** (see 5.7) — the original file you first selected was never modified and has no embedded placement.
 
 **Background image placement resets every time I reopen the file**
 Only PNG images can carry a saved placement, and only once you've explicitly downloaded a copy with it embedded (5.7). Reopening the original, unmodified file — or a non-PNG image — always starts at the auto-fit placement, by design.

@@ -1927,17 +1927,15 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
     });
 
     // "Mixed labels" (App.jsx): a catalogued symbol's label Text
-    // (isDiscProfileLabel) shows primitive.mixedText -
-    //  - only the values of its AttributeRepresentation Fragments whose
-    //    AttributeName is a LabelTemplate attribute of the object's placed
-    //    DiscProfile symbols (labelTemplateAttrsForSymbol()) and that resolve;
-    //    the instance's LiteralText Fragments and stored Text are never shown;
-    //  - between two values, the literal that stands right before the second
-    //    value's placeholder in the profile LabelTemplate (" ", "x", "-");
-    //    literals before the first or after the last value ("EL: ", "HH=") are
-    //    not shown; values follow the template's order; values from different
-    //    templates, or found in none, are joined with a space.
-    // null when the Text references none of those attributes with a value.
+    // (isDiscProfileLabel) that is a valid representation - it references, with
+    // a value, at least one LabelTemplate attribute of the object's placed
+    // DiscProfile symbols (labelTemplateAttrsForSymbol()) - is shown exactly as
+    // the file represents it (primitive.mixedText = componentText, the same
+    // text as with both checkboxes unchecked). It is never rebuilt from the
+    // profile LabelTemplate: a file label of In + Out with no 'x' literal
+    // stays "12001000" and is not turned into the profile's "1200x1000".
+    // mixedText is null when the Text references none of those attributes
+    // with a value (the label is not drawn).
     // Each profile label (labelOverlays entry, one per LabelTemplate) gets
     // mixedShow: true when none of its own placeholder attributes is used by a
     // label Text of the object with a value - that profile label is then drawn
@@ -1946,29 +1944,6 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
     // profile's <ReferencedDrawingNumber> label. mixedUsesDefaultLabel: at
     // least one of the placement's overlays is shown.
     if (discDoc) {
-        const TOKEN_RE = /(?:([A-Za-z][A-Za-z0-9_]*):)?<([^<>]+)>/g;
-        const templateParts = templateText => {
-            const text = String(templateText || "").split(/\r?\n/).map(unwrapLabelFormula).join("\n");
-            const parts = [];
-            const re = new RegExp(TOKEN_RE.source, "g");
-            let last = 0, m;
-            while ((m = re.exec(text))) {
-                if (m.index > last) parts.push({ literal: text.slice(last, m.index) });
-                parts.push({ attribute: m[2] });
-                last = re.lastIndex;
-            }
-            if (last < text.length) parts.push({ literal: text.slice(last) });
-            return parts;
-        };
-        // LabelTemplate texts per represented object, from its placed DiscProfile symbol variants (drawing order)
-        const templatesById = new Map();
-        drawn.forEach(el => {
-            if (el.kind !== "symbolUsage" || !el.representedId || !el.symbol?.key?.startsWith("DiscProfile/")) return;
-            const lts = (el.variant?.labelTemplates || []).map(lt => lt.text).filter(Boolean);
-            if (!lts.length) return;
-            if (!templatesById.has(el.representedId)) templatesById.set(el.representedId, []);
-            templatesById.get(el.representedId).push(...lts);
-        });
         const usedAttrsById = new Map();
         drawn.forEach(el => {
             if (el.kind !== "primitive" || el.primitive?.kind !== "text" || !el.primitive.isDiscProfileLabel) return;
@@ -2005,25 +1980,7 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
             if (!remaining.length) { el.primitive.mixedText = null; return; }
             if (!usedAttrsById.has(representedId)) usedAttrsById.set(representedId, new Set());
             remaining.forEach(v => usedAttrsById.get(representedId).add(v.attribute));
-            const segments = [];
-            const templates = templatesById.get(representedId)
-                || syms.flatMap(sym => ((sym.variants || []).find(v => (v.labelTemplates || []).length)?.labelTemplates || []).map(lt => lt.text));
-            for (const templateText of templates) {
-                if (!remaining.length) break;
-                let out = "", emitted = false, pendingLiteral = "";
-                for (const part of templateParts(templateText)) {
-                    if (part.literal !== undefined) { pendingLiteral += part.literal; continue; }
-                    const i = remaining.findIndex(v => v.attribute === part.attribute);
-                    if (i < 0) { pendingLiteral = ""; continue; }
-                    out += (emitted ? pendingLiteral : "") + remaining[i].value;
-                    emitted = true;
-                    pendingLiteral = "";
-                    remaining.splice(i, 1);
-                }
-                if (emitted) segments.push(out);
-            }
-            remaining.forEach(v => segments.push(v.value));
-            el.primitive.mixedText = segments.join(" ");
+            el.primitive.mixedText = el.primitive.componentText ?? "";
         });
         drawn.forEach(el => {
             if (el.kind !== "symbolUsage" || !el.labelOverlays) return;
