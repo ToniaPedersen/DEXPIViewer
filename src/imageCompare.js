@@ -26,8 +26,9 @@ const SIGNAL_MARK_TYPES = new Set([
     "ElectromagneticGuidedSignalConveying", "ElectromagneticUnguidedSignalConveying",
 ]);
 const SIGNAL_MARK_HIDE_LINE_TYPES = new Set(["ElectromagneticUnguidedSignalConveying"]);
-const SIGNAL_MARK_SPACING = 14;
-const SIGNAL_MARK_HALF_H = 1.2;
+const SIGNAL_MARK_SPACING = 6.5; // mm - same cadence as App.jsx (first mark 2.5 mm in)
+const SIGNAL_MARK_OFFSET = 2.5;
+const SIGNAL_MARK_HALF_H = 1.25;
 const SIGNAL_MARK_W = 1.6;
 
 const STEP = 0.25;      // stroke sampling step, world units
@@ -222,31 +223,44 @@ function textBox(x, y, value, size, rotDeg, style) {
     return box;
 }
 
+// Mark centres along a line - same rule as App.jsx signalMarkStops(): first
+// mark startOffset in, then every `spacing`, last one >= SIGNAL_MARK_HALF_H
+// short of the end; a line too short for that gets one mark at its midpoint.
 function markPositions(pts, spacing, startOffset) {
+    let total = 0;
+    for (let i = 0; i < pts.length - 1; i++) total += Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y);
+    const stops = [];
+    if (total > startOffset + SIGNAL_MARK_HALF_H) {
+        for (let s = startOffset; s <= total - SIGNAL_MARK_HALF_H; s += spacing) stops.push(s);
+    } else if (total > 0) stops.push(total / 2);
     const marks = [];
-    let next = startOffset, acc = 0;
-    for (let i = 0; i < pts.length - 1; i++) {
-        const p1 = pts[i], p2 = pts[i + 1];
-        const dx = p2.x - p1.x, dy = p2.y - p1.y, len = Math.hypot(dx, dy);
-        if (len < 0.001) continue;
-        let a = Math.atan2(dy, dx) * 180 / Math.PI;
-        if (a > 90) a -= 180; else if (a <= -90) a += 180;
-        while (next <= acc + len) {
-            const t = (next - acc) / len;
-            marks.push({ x: p1.x + dx * t, y: p1.y + dy * t, angleDeg: a });
-            next += spacing;
+    for (const target of stops) {
+        let remaining = target;
+        for (let i = 0; i < pts.length - 1; i++) {
+            const p1 = pts[i], p2 = pts[i + 1];
+            const dx = p2.x - p1.x, dy = p2.y - p1.y, len = Math.hypot(dx, dy);
+            if (len <= 0) continue;
+            if (remaining <= len) {
+                let a = Math.atan2(dy, dx) * 180 / Math.PI;
+                if (a > 90) a -= 180; else if (a <= -90) a += 180;
+                const t = remaining / len;
+                marks.push({ x: p1.x + dx * t, y: p1.y + dy * t, angleDeg: a });
+                break;
+            }
+            remaining -= len;
         }
-        acc += len;
     }
     return marks;
 }
 
 // Rough stroke samples for one signal mark glyph (for the DEXPI ink mask only).
+// Glyphs are centred on the mark point (see App.jsx SIGNAL_MARK_GLYPHS).
 function markGlyphSamples(out, m) {
     const r = m.angleDeg * Math.PI / 180, c = Math.cos(r), s = Math.sin(r);
     const put = (u, v) => out.push(m.x + u * c - v * s, m.y + u * s + v * c);
-    for (let v = -SIGNAL_MARK_HALF_H; v <= SIGNAL_MARK_HALF_H; v += STEP) { put(0, v); put(SIGNAL_MARK_W, v); }
-    for (let u = 0; u <= SIGNAL_MARK_W; u += STEP) { put(u, -SIGNAL_MARK_HALF_H); put(u, SIGNAL_MARK_HALF_H); }
+    const hw = SIGNAL_MARK_W / 2;
+    for (let v = -SIGNAL_MARK_HALF_H; v <= SIGNAL_MARK_HALF_H; v += STEP) { put(-hw, v); put(hw, v); }
+    for (let u = -hw; u <= hw; u += STEP) { put(u, -SIGNAL_MARK_HALF_H); put(u, SIGNAL_MARK_HALF_H); }
 }
 
 // Returns samples of the viewer's pipe heat-trace line plus, per sample, the
@@ -408,7 +422,7 @@ export function buildCompareGeometry(parsed) {
             for (let i = 0; i < linePts.length - 1; i++) lengthMm += Math.hypot(linePts[i + 1].x - linePts[i].x, linePts[i + 1].y - linePts[i].y);
             const signalType = el.signalConveyingType || null;
             const hideLine = SIGNAL_MARK_HIDE_LINE_TYPES.has(signalType);
-            const marks = SIGNAL_MARK_TYPES.has(signalType) ? markPositions(linePts, SIGNAL_MARK_SPACING, SIGNAL_MARK_SPACING / 2) : [];
+            const marks = SIGNAL_MARK_TYPES.has(signalType) ? (signalType === "BusSignalConveying" ? markPositions(linePts, 10, 5) : markPositions(linePts, SIGNAL_MARK_SPACING, SIGNAL_MARK_OFFSET)) : [];
             const markInk = [];
             marks.forEach(m => markGlyphSamples(markInk, m));
             const rawStyle = prim.stroke?.dashStyle || "Solid";

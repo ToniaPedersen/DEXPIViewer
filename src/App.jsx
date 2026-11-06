@@ -397,9 +397,17 @@ function renderMultilineText({ key, x, y, rotation, fontFamily, fontSize, fill, 
     );
 }
 
+// Minimum on-screen stroke width (device px), as in vegarringdal/dexpi-viewer
+// (rendering.minStrokePx = 1): authored DEXPI widths (0.09-0.25 mm) otherwise
+// render as sub-pixel hairlines that look washed out. Lines never draw thinner
+// than this at any zoom; thicker authored/boosted widths are kept.
+const MIN_STROKE_PX = 1;
+
 function renderPrimitive(primitive, key, textColorOverride = null, strokeMult = 1, showProfileLabels = false, parentRotation = 0, symbolScale = null, showMixedLabels = false) {
     const fill = v => v?.style === "Transparent" ? "none" : (v?.color || "none");
-    const sw = v => v * strokeMult;
+    // These primitives use vectorEffect="non-scaling-stroke", so the width is in
+    // screen px - clamp up to MIN_STROKE_PX (a 0 width stays 0 = no stroke).
+    const sw = v => (v > 0 ? Math.max(v * strokeMult, MIN_STROKE_PX) : 0);
     if (primitive.kind === "polyline") return <polyline key={key} points={primitive.points.map(p => `${p.x},${p.y}`).join(" ")} fill="none" stroke={primitive.stroke.color} strokeWidth={sw(primitive.stroke.width)} strokeDasharray={primitive.stroke.dashArray || undefined} vectorEffect="non-scaling-stroke" />;
     if (primitive.kind === "polygon") return <polygon key={key} points={primitive.points.map(p => `${p.x},${p.y}`).join(" ")} fill={fill(primitive.fill)} stroke={primitive.stroke.color} strokeWidth={sw(primitive.stroke.width)} vectorEffect="non-scaling-stroke" />;
     if (primitive.kind === "circle") return <circle key={key} cx={primitive.center.x} cy={primitive.center.y} r={primitive.radius} fill={fill(primitive.fill)} stroke={primitive.stroke.color} strokeWidth={sw(primitive.stroke.width)} vectorEffect="non-scaling-stroke" />;
@@ -549,136 +557,105 @@ const SIGNAL_CONVEYING_MARKS = {
 // ElectromagneticUnguidedSignalConveying, which (unlike a guided wire) has
 // no physical conductor to draw a continuous line for.
 const SIGNAL_MARK_HIDE_LINE_TYPES = new Set(["ElectromagneticUnguidedSignalConveying"]);
-const SIGNAL_MARK_SPACING = 14;  // world units between repeated glyphs
-const SIGNAL_MARK_HEIGHT = 2.4;  // glyph cap-height, world units
-const SIGNAL_MARK_WIDTH = 1.6;   // glyph width, world units (E only - L's arms are square, see below)
-const SIGNAL_MARK_STROKE = 0.16; // glyph stroke width, world units - thin, close to the line's own weight
-const SIGNAL_MARK_LEAN = 0.55;   // horizontal shear per unit of y (~29 deg) - a pronounced italic slant, E only
-const SIGNAL_MARK_CIRCLE_RADIUS = 0.9; // "O" (Bus) circle radius, world units
-const SIGNAL_MARK_CARET_WIDTH = 1.8;   // "^" (Pneumatic) chevron width, world units
-const SIGNAL_MARK_X_WIDTH = 1.6;       // "x" (Capillary) cross width, world units
-const SIGNAL_MARK_SLASH_WIDTH = 1.6;   // "/" (Undefined) stroke width, world units
-const SIGNAL_MARK_WAVE_WIDTH = 2.4;    // "∿" (Electromagnetic Guided) one full wave cycle's width, world units
+// Mark geometry follows the DISC decoration convention as rendered by
+// vegarringdal/dexpi-viewer (re-implemented here, not copied - that project is
+// AGPL-3.0): every glyph is ~2.5 mm tall and CENTERED on the line point, letter
+// glyphs repeat every 6.5 mm starting 2.5 mm in, Bus circles (r 1.25 mm) every
+// 10 mm starting 5 mm in, the last mark stays 1.25 mm short of the line end,
+// and a line too short for that gets one mark at its midpoint. Marks use the
+// line's own colour and stroke width, always solid.
+const SIGNAL_MARK_SPACING = 6.5;
+const SIGNAL_MARK_OFFSET = 2.5;
+const SIGNAL_MARK_CIRCLE_SPACING = 10;
+const SIGNAL_MARK_CIRCLE_OFFSET = 5;
+const SIGNAL_MARK_HALF = 1.25;   // half glyph size / circle radius (mm)
+const SIGNAL_MARK_STROKE = 0.16; // fallback stroke width when none is passed
 
-// Vector glyph paths for the marks above, drawn as monoline strokes rather
-// than system-font text: font-based dominant-baseline centering doesn't
-// reliably land on a letter's own visual middle (varies by browser/font),
-// and font glyphs don't give exact control over stroke weight or slant
-// angle. Each path is built in a local frame where y=0 is the line the
-// glyph sits on - so placing a mark at (x, y) on the polyline with y=0 in
-// this local frame puts the glyph precisely on the line (not just its
-// bounding box), and x=0 is the glyph's leading edge along the line's own
-// direction.
-function buildSignalMarkPaths() {
-    const h2 = SIGNAL_MARK_HEIGHT / 2;
-    const w = SIGNAL_MARK_WIDTH;
-    const lean = SIGNAL_MARK_LEAN;
-    // Italic "E": lean is baked directly into each stroke's endpoints
-    // (rather than an SVG skewX transform) so it reads correctly regardless
-    // of the per-mark rotation applied afterwards. y=0 (the line) passes
-    // through the glyph's middle bar.
-    const lx = (x, y) => x - lean * y; // shifts top-of-glyph right, bottom left (standard italic lean)
-    const tl = { x: lx(0, -h2), y: -h2 }, tr = { x: lx(w, -h2), y: -h2 };
-    const bl = { x: lx(0, h2), y: h2 }, br = { x: lx(w, h2), y: h2 };
-    const ml = { x: lx(0, 0), y: 0 }, mr = { x: lx(w * 0.75, 0), y: 0 };
-    const ePath = `M${tl.x},${tl.y} L${tr.x},${tr.y} M${tl.x},${tl.y} L${bl.x},${bl.y} M${bl.x},${bl.y} L${br.x},${br.y} M${ml.x},${ml.y} L${mr.x},${mr.y}`;
+// Glyph strokes in a local frame centred on the mark point: +x along the line,
+// +y to the line's right (SVG y-down). Each entry is one polyline.
+const SIGNAL_MARK_GLYPHS = {
+    // italic E: slanted spine plus three bars
+    E: [[[-0.15, -1.25], [-0.75, 1.25]], [[-0.15, -1.25], [1.05, -1.25]], [[-0.45, 0], [0.6, 0]], [[-0.75, 1.25], [0.45, 1.25]]],
+    // upright L
+    L: [[[-0.5, -1.25], [-0.5, 1.25], [0.8, 1.25]]],
+    // ^ chevron (Pneumatic)
+    "^": [[[-1, 1], [0, -1], [1, 1]]],
+    // x (Capillary)
+    x: [[[-0.9, -0.9], [0.9, 0.9]], [[-0.9, 0.9], [0.9, -0.9]]],
+    // / (Undefined)
+    "/": [[[-0.6, 1.1], [0.6, -1.1]]],
+    // ~ squiggle (Electromagnetic guided/unguided)
+    "∿": [[[-1.4, 0.3], [-0.9, -0.4], [-0.35, -0.4], [0.35, 0.4], [0.9, 0.4], [1.4, -0.3]]],
+};
+const SIGNAL_MARK_PATHS = Object.fromEntries(Object.entries(SIGNAL_MARK_GLYPHS).map(([k, strokes]) =>
+    [k, strokes.map(pl => pl.map(([x, y], i) => `${i ? "L" : "M"}${x},${y}`).join(" ")).join(" ")]));
 
-    // Upright "L": vertical and horizontal arms are the same length
-    // (SIGNAL_MARK_HEIGHT), and the line (y=0) passes through the middle of
-    // the vertical arm, which runs from -h2 to +h2 with the horizontal arm
-    // extending right from its foot.
-    const lTop = { x: 0, y: -h2 }, lBottom = { x: 0, y: h2 }, lFoot = { x: SIGNAL_MARK_HEIGHT, y: h2 };
-    const lPath = `M${lTop.x},${lTop.y} L${lBottom.x},${lBottom.y} L${lFoot.x},${lFoot.y}`;
-
-    // "O" (Bus): a small circle whose center sits at y=0, so the line
-    // passes straight through its middle. Drawn as two half-circle arcs
-    // (the usual SVG trick for a full circle in one path, since a single
-    // arc command can't span 360deg), positioned so it starts at its own
-    // leading edge (x=0) the same way the other glyphs do.
-    const r = SIGNAL_MARK_CIRCLE_RADIUS;
-    const oPath = `M${r * 2},0 A${r},${r} 0 1 0 0,0 A${r},${r} 0 1 0 ${r * 2},0`;
-
-    // "^" (Pneumatic): a chevron whose apex sits above the line and whose
-    // two feet sit below it, symmetric about y=0 so the line runs through
-    // the vertical middle of the shape (same convention as the "L" arm and
-    // "O" circle above).
-    const cw = SIGNAL_MARK_CARET_WIDTH;
-    const caretLeft = { x: 0, y: h2 }, caretApex = { x: cw / 2, y: -h2 }, caretRight = { x: cw, y: h2 };
-    const caretPath = `M${caretLeft.x},${caretLeft.y} L${caretApex.x},${caretApex.y} L${caretRight.x},${caretRight.y}`;
-
-    // "x" (Capillary): two diagonal strokes corner-to-corner of a bounding
-    // box centered on y=0. Diagonals of a rectangle always cross at its
-    // center, so the line automatically runs straight through the cross
-    // point without any extra alignment math.
-    const xw = SIGNAL_MARK_X_WIDTH;
-    const xPath = `M0,${-h2} L${xw},${h2} M0,${h2} L${xw},${-h2}`;
-
-    // "/" (Undefined): a single diagonal stroke, bottom-left to top-right,
-    // within a bounding box centered on y=0 - its midpoint therefore falls
-    // exactly on the line, same "diagonal of a centered box" trick as "x".
-    const sw_ = SIGNAL_MARK_SLASH_WIDTH;
-    const slashPath = `M0,${h2} L${sw_},${-h2}`;
-
-    // "∿" (Electromagnetic Guided): one full sine-like wave cycle, built
-    // from two symmetric cubic-bezier humps. It starts and ends on y=0 and
-    // also crosses y=0 at its midpoint, so - like the other marks - the
-    // line runs straight through its vertical center throughout.
-    const ww = SIGNAL_MARK_WAVE_WIDTH;
-    const waveQ = ww / 4;
-    const wavePath = `M0,0 C${waveQ},${-h2} ${waveQ},${-h2} ${waveQ * 2},0 `
-        + `C${waveQ * 3},${h2} ${waveQ * 3},${h2} ${ww},0`;
-
-    return { E: ePath, L: lPath, O: oPath, "^": caretPath, x: xPath, "/": slashPath, "∿": wavePath };
+function polylineLengthOf(points) {
+    let total = 0;
+    for (let i = 0; i < points.length - 1; i++) total += Math.hypot(points[i + 1].x - points[i].x, points[i + 1].y - points[i].y);
+    return total;
 }
-const SIGNAL_MARK_PATHS = buildSignalMarkPaths();
 
-// Marches at a fixed spacing along a polyline's arc length and returns a
-// {x, y, angleDeg} sample at each step. angleDeg follows the local segment's
-// direction but is normalized to stay within (-90, 90] so the glyph is
-// always drawn upright/readable regardless of which way the line's points
-// happen to be ordered.
-function markPointsAlongPolyline(points, spacing, startOffset = spacing / 2) {
-    const marks = [];
-    if (!points || points.length < 2) return marks;
-    let nextMark = startOffset;
-    let accum = 0;
+// Point and readable direction at arc length s along the polyline. The angle is
+// normalized into (-90, 90] so letters never draw upside-down.
+function pointAtArcLength(points, s) {
+    let remaining = s;
     for (let i = 0; i < points.length - 1; i++) {
-        const p1 = points[i], p2 = points[i + 1];
-        const dx = p2.x - p1.x, dy = p2.y - p1.y;
-        const len = Math.sqrt(dx * dx + dy * dy);
-        if (len < 0.001) continue;
-        let angleDeg = Math.atan2(dy, dx) * 180 / Math.PI;
-        if (angleDeg > 90) angleDeg -= 180;
-        else if (angleDeg <= -90) angleDeg += 180;
-        while (nextMark <= accum + len) {
-            const t = (nextMark - accum) / len;
-            marks.push({ x: p1.x + dx * t, y: p1.y + dy * t, angleDeg });
-            nextMark += spacing;
+        const a = points[i], b = points[i + 1];
+        const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy);
+        if (len <= 0) continue;
+        if (remaining <= len) {
+            const t = remaining / len;
+            let angleDeg = Math.atan2(dy, dx) * 180 / Math.PI;
+            if (angleDeg > 90) angleDeg -= 180; else if (angleDeg <= -90) angleDeg += 180;
+            return { x: a.x + dx * t, y: a.y + dy * t, angleDeg };
         }
-        accum += len;
+        remaining -= len;
     }
-    return marks;
+    return null;
 }
 
-// Renders a small italic vector glyph (e.g. "E" for ElectricalSignalConveying)
-// repeated along a SignalConveyingFunction connector line's drawn length -
-// see SIGNAL_CONVEYING_MARKS/SIGNAL_MARK_PATHS above.
-function SignalConveyingMarks({ points, markKey, color }) {
+// Mark centres along a polyline for a given mark key (see cadence notes above).
+function signalMarkStops(points, markKey) {
+    if (!points || points.length < 2) return [];
+    const circle = markKey === "O";
+    const offset = circle ? SIGNAL_MARK_CIRCLE_OFFSET : SIGNAL_MARK_OFFSET;
+    const spacing = circle ? SIGNAL_MARK_CIRCLE_SPACING : SIGNAL_MARK_SPACING;
+    const total = polylineLengthOf(points);
+    const stops = [];
+    if (total > offset + SIGNAL_MARK_HALF) {
+        for (let s = offset; s <= total - SIGNAL_MARK_HALF; s += spacing) stops.push(s);
+    } else if (total > 0) {
+        stops.push(total / 2);
+    }
+    return stops.map(s => pointAtArcLength(points, s)).filter(Boolean);
+}
+
+// Repeated signal-conveying marks along a SignalConveyingFunction connector
+// line - see SIGNAL_CONVEYING_MARKS / SIGNAL_MARK_GLYPHS above.
+function SignalConveyingMarks({ points, markKey, color, strokeWidth = SIGNAL_MARK_STROKE }) {
+    const marks = signalMarkStops(points, markKey);
+    if (marks.length === 0) return null;
+    if (markKey === "O") {
+        return (
+            <g pointerEvents="none">
+                {marks.map((m, i) => <circle key={i} cx={m.x} cy={m.y} r={SIGNAL_MARK_HALF} fill="none" stroke={color} strokeWidth={strokeWidth} />)}
+            </g>
+        );
+    }
     const d = SIGNAL_MARK_PATHS[markKey];
     if (!d) return null;
-    const marks = markPointsAlongPolyline(points, SIGNAL_MARK_SPACING);
-    if (marks.length === 0) return null;
     return (
         <g pointerEvents="none">
             {marks.map((m, i) => (
-                <path key={i} d={d} fill="none" stroke={color} strokeWidth={SIGNAL_MARK_STROKE} strokeLinecap="round"
-                    vectorEffect="non-scaling-stroke" transform={`translate(${m.x} ${m.y}) rotate(${m.angleDeg})`} />
+                <path key={i} d={d} fill="none" stroke={color} strokeWidth={strokeWidth} strokeLinecap="round"
+                    strokeLinejoin="round" transform={`translate(${m.x} ${m.y}) rotate(${m.angleDeg})`} />
             ))}
         </g>
     );
 }
 
-function ConnectorLineSvg({ el, nodePosMap, selected, connColor, boostPct }) {
+function ConnectorLineSvg({ el, nodePosMap, selected, connColor, boostPct, worldPerPx = 0 }) {
     const { primitive: prim } = el;
     const src = prim.sourceRef ? nodePosMap.get(prim.sourceRef) : null;
     const tgt = prim.targetRef ? nodePosMap.get(prim.targetRef) : null;
@@ -689,12 +666,20 @@ function ConnectorLineSvg({ el, nodePosMap, selected, connColor, boostPct }) {
     // (100 = unchanged/no-op). The dash pattern is scaled proportionally so
     // dashes stay readable when the width is boosted.
     const baseWidth = prim.stroke.width;
+    // Unselected lines scale with the viewBox (world units); clamp to at least
+    // MIN_STROKE_PX on screen so thin signal/process lines never wash out.
+    const minWorld = MIN_STROKE_PX * worldPerPx;
     const sw = selected
         ? Math.max(baseWidth * 2, baseWidth + 0.4)
-        : baseWidth * (boostPct / 100);
+        : Math.max(baseWidth * (boostPct / 100), minWorld);
     const rawDash = prim.stroke.dashArray || "";
-    const scaledDash = (!selected && rawDash && baseWidth > 0 && sw !== baseWidth)
-        ? rawDash.split(/\s+/).map(v => (parseFloat(v) * (sw / baseWidth)).toFixed(3)).join(" ")
+    // Dash lengths stay in drawing mm from the AUTHORED width (as in
+    // vegarringdal/dexpi-viewer): only the user's Line Boost stretches them,
+    // never the MIN_STROKE_PX display clamp - stretching by sw/baseWidth made
+    // thin (0.09 mm) dashed lines show very long dashes once clamped.
+    const dashMult = selected ? 1 : boostPct / 100;
+    const scaledDash = (rawDash && dashMult !== 1)
+        ? rawDash.split(/\s+/).map(v => (parseFloat(v) * dashMult).toFixed(3)).join(" ")
         : rawDash;
     const mid = Math.floor(pts.length / 2);
     const p1 = pts[mid - 1] || pts[0]; const p2 = pts[mid];
@@ -722,7 +707,7 @@ function ConnectorLineSvg({ el, nodePosMap, selected, connColor, boostPct }) {
                     fill={color} stroke="none" vectorEffect="non-scaling-stroke"
                 />
             )}
-            {markKey && <SignalConveyingMarks points={pts} markKey={markKey} color={color} />}
+            {markKey && <SignalConveyingMarks points={pts} markKey={markKey} color={color} strokeWidth={selected ? Math.max(SIGNAL_MARK_STROKE, minWorld) : sw} />}
         </g>
     );
 }
@@ -812,14 +797,41 @@ function symbolDiagramBBox(el) {
 
 /**
  * Heat trace dashed line for an inline symbol (valve, fitting, nozzle).
- * Orientation is determined from el.rotation:
- *   ~0 / ~180 deg  (horizontal pipe) -> line 1 pt below  the symbol in diagram space
- *   ~90 / ~270 deg (vertical pipe)   -> line 1 pt right of the symbol in diagram space
+ *
+ * Symmetric symbols (geometry balanced about the local run axis y = 0, e.g. a
+ * plain gate valve) keep the world-space rule:
+ *   ~0 / ~180 deg  (horizontal pipe) -> line 1 pt below  the symbol
+ *   ~90 / ~270 deg (vertical pipe)   -> line 1 pt right of the symbol
  *   other (corner / diagonal)        -> line 1 pt below  (default)
- * The bounding box is computed in diagram space so the result is correct for all
- * rotations without relying on local-coordinate tricks.
+ *
+ * One-sided symbols (geometry extends mostly to one side of the run axis, e.g.
+ * ND0004 double block & bleed with its bleed branch, or an actuated valve)
+ * get the line under the symbol's BASE in local symbol coordinates
+ * (local y = MaxY + offset, spanning MinX..MaxX). It is drawn inside the
+ * symbol's own placement transform, so it rotates/mirrors with the symbol
+ * and always stays on the base side, away from the branch/actuator - instead
+ * of being pushed outside a world bounding box that includes the branch.
  */
+const HT_ASYM_TOL = 1.0; // |MaxY + MinY| above this (symbol units) = one-sided symbol
+
 function HeatTraceSymbol({ el }) {
+    const { minX, maxX, minY, maxY } = el.variant;
+    const oneSided = Math.abs(maxY + minY) > HT_ASYM_TOL;
+    if (oneSided) {
+        const mirror = el.isMirrored ? -1 : 1;
+        const transform = `translate(${el.position.x} ${el.position.y}) rotate(${el.rotation || 0}) scale(${el.scaleX * mirror} ${el.scaleY})`;
+        // Base = side of the run axis with the smaller extent.
+        const baseDown = Math.abs(maxY) <= Math.abs(minY);
+        const off = HT_OFF / (Math.abs(el.scaleY) || 1);
+        const y = baseDown ? maxY + off : minY - off;
+        return (
+            <g transform={transform} pointerEvents="none">
+                <line x1={minX} y1={y} x2={maxX} y2={y}
+                    stroke={HT_COLOR} strokeWidth={HT_SW} strokeDasharray={HT_DASH}
+                    vectorEffect="non-scaling-stroke" />
+            </g>
+        );
+    }
     const normRot = ((el.rotation || 0) % 360 + 360) % 360;
     const isVertical = (normRot > 75 && normRot < 105) || (normRot > 255 && normRot < 285);
     const bb = symbolDiagramBBox(el);
@@ -1054,7 +1066,7 @@ function SymbolGraphic({ el, selected, connHighlight, onSelect, boostPct, boostS
     );
 }
 
-function PrimitiveGraphic({ el, selected, connHighlight, onSelect, nodePosMap, boostPct, boostSymbolOutlines, showProfileLabels, showMixedLabels }) {
+function PrimitiveGraphic({ el, selected, connHighlight, onSelect, nodePosMap, boostPct, boostSymbolOutlines, showProfileLabels, showMixedLabels, worldPerPx }) {
     const hitPad = 2.0;
     const hlColor = selected ? (connHighlight || selectionColor(el.elementRole)) : connHighlight || null;
     const prim = el.primitive;
@@ -1073,7 +1085,7 @@ function PrimitiveGraphic({ el, selected, connHighlight, onSelect, nodePosMap, b
             })()}
             {hlColor && el.kind !== "connectorLine" && prim?.kind !== "text" && highlightPrimitive(prim, `hl_${el.key}`, hlColor)}
             {el.kind === "connectorLine"
-                ? <ConnectorLineSvg el={el} nodePosMap={nodePosMap} selected={selected} connColor={connHighlight} boostPct={boostPct} />
+                ? <ConnectorLineSvg el={el} nodePosMap={nodePosMap} selected={selected} connColor={connHighlight} boostPct={boostPct} worldPerPx={worldPerPx} />
                 : renderPrimitive(prim, el.key, prim?.kind === "text" ? hlColor : null, (boostSymbolOutlines && el.elementRole === "symbol") ? boostPct / 100 : 1, showProfileLabels, 0, null, showMixedLabels)}
         </g>
     );
@@ -1234,6 +1246,20 @@ export default function App() {
     const bgObjectUrlRef = useRef(null);
     const issueCardRefs = useRef(new Map()); // index → DOM element for validation list scroll
     const svgViewportRef = useRef(null);
+    // Drawing units per screen px for the current viewBox (preserveAspectRatio
+    // "meet" uses the larger ratio). Drives the MIN_STROKE_PX clamp on connector
+    // lines; 0 before the viewport has been measured (no clamp on that frame).
+    const [vpSize, setVpSize] = useState({ w: 0, h: 0 });
+    useEffect(() => {
+        const node = svgViewportRef.current;
+        if (!node || typeof ResizeObserver === "undefined") return undefined;
+        const update = () => setVpSize(prev => (prev.w === node.clientWidth && prev.h === node.clientHeight) ? prev : { w: node.clientWidth, h: node.clientHeight });
+        update();
+        const ro = new ResizeObserver(update);
+        ro.observe(node);
+        return () => ro.disconnect();
+    }, [parsed]); // re-attach if the viewport div was (re)mounted with a new drawing
+    const worldPerPx = (vpSize.w > 0 && vpSize.h > 0) ? Math.max(viewBox.w / vpSize.w, viewBox.h / vpSize.h) : 0;
     const svgElRef = useRef(null);
 
     const issueMap = useMemo(() => {
@@ -2890,7 +2916,7 @@ export default function App() {
                                 const ch = connectivityHighlight;
                                 const connColor = !cleanExport && el.representedId ? (ch.upstream.has(el.representedId) ? "#0969da" : ch.downstream.has(el.representedId) ? "#1a7f37" : ch.group.has(el.representedId) ? "#8250df" : null) : null;
                                 if (el.kind === "symbolUsage") return <SymbolGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} boostPct={lineBoostPct} boostSymbolOutlines={boostSymbolOutlines} showProfileLabels={showProfileLabels} showMixedLabels={showMixedLabels} />;
-                                return <PrimitiveGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} nodePosMap={parsed.graphics.nodePosMap} boostPct={lineBoostPct} boostSymbolOutlines={boostSymbolOutlines} showProfileLabels={showProfileLabels} showMixedLabels={showMixedLabels} />;
+                                return <PrimitiveGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} nodePosMap={parsed.graphics.nodePosMap} boostPct={lineBoostPct} boostSymbolOutlines={boostSymbolOutlines} showProfileLabels={showProfileLabels} showMixedLabels={showMixedLabels} worldPerPx={worldPerPx} />;
                             })}
                             {/* Heat-trace overlays – part of the DEXPI drawing layer (fades with it), only when a DISC profile is loaded */}
                             {parsed?.heatTraceSet?.size > 0 && <g data-dxf-layer="HEAT_TRACE">{parsed.graphics.elements.map(el => {

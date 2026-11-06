@@ -152,16 +152,18 @@ export function parseStroke(node) {
     const color = aggregatedValue(getData(node, "Color")?.firstElementChild);
     const width = numberFromData(node, "Width", 0.25);
     const dashStyle = refName(valueFromData(node, "DashStyle")) || "Solid";
-    // Covers every Core/Diagram.DashStyle literal (ShortDash, LongDash and the
-    // combined styles used to fall through to "" and render as solid).
+    // DEXPI 2.0 DashStyle patterns: dimensionless values x stroke width (mm),
+    // width floored at 0.1 mm so hairlines still get readable dashes - same
+    // table as vegarringdal/dexpi-viewer (primitives.ts dashPattern).
+    const w = Math.max(width, 0.1);
     const dashMap = {
-        Solid: "", Dash: `${4 * width} ${2 * width}`, Dot: `${width} ${2 * width}`,
-        ShortDash: `${2 * width} ${2 * width}`, LongDash: `${8 * width} ${2 * width}`,
-        DashDot: `${4 * width} ${2 * width} ${width} ${2 * width}`,
-        DashDotDot: `${4 * width} ${2 * width} ${width} ${2 * width} ${width} ${2 * width}`,
-        DashShortDash: `${4 * width} ${2 * width} ${2 * width} ${2 * width}`,
-        LongDashShortDash: `${8 * width} ${2 * width} ${2 * width} ${2 * width}`,
-        LongDashShortDashShortDash: `${8 * width} ${2 * width} ${2 * width} ${2 * width} ${2 * width} ${2 * width}`,
+        Solid: "", Dot: `${w} ${2 * w}`, ShortDash: `${2 * w} ${2 * w}`,
+        Dash: `${4 * w} ${2 * w}`, LongDash: `${8 * w} ${3 * w}`,
+        DashShortDash: `${4 * w} ${2 * w} ${2 * w} ${2 * w}`,
+        LongDashShortDash: `${8 * w} ${3 * w} ${2 * w} ${3 * w}`,
+        LongDashShortDashShortDash: `${8 * w} ${3 * w} ${2 * w} ${3 * w} ${2 * w} ${3 * w}`,
+        DashDot: `${4 * w} ${2 * w} ${w} ${2 * w}`,
+        DashDotDot: `${4 * w} ${2 * w} ${w} ${2 * w} ${w} ${2 * w}`,
     };
     return { color: parseColor(color), width, dashStyle, dashArray: dashMap[dashStyle] || "", dashOffset: numberFromData(node, "Offset", 0) };
 }
@@ -508,7 +510,27 @@ export function collectDescendantObjectIds(node, out = new Set()) {
 // AKSODEXPIViewer's SIGNAL_CONVEYING_DASH_ARRAY convention for the
 // equivalent Proteus InformationFlow attribute - see collectGraphicalElements()
 // below and App.jsx's SIGNAL_CONVEYING_MARKS for the sub-type glyphs.
-const SIGNAL_CONVEYING_DASH_ARRAY = "3 2";
+const SIGNAL_CONVEYING_DASH_ARRAY = "3 3"; // 3 mm dash / 3 mm gap, as vegarringdal/dexpi-viewer
+
+// When SignalConveyingFunctionTypeRepresentation is given, its representation
+// style wins over the DashStyle written on the drawn Core/Diagram.ConnectorLine:
+//   "SignalConveying"            -> dashed line (SIGNAL_CONVEYING_DASH_ARRAY)
+//   any sub-type listed below    -> SOLID line + the sub-type glyph from
+//                                   App.jsx's SIGNAL_CONVEYING_MARKS repeated
+//                                   along it (e.g. Electrical = italic "E";
+//                                   ElectromagneticUnguided hides the line and
+//                                   keeps only the glyph, see App.jsx)
+// Keep in step with App.jsx SIGNAL_CONVEYING_MARKS / imageCompare.js.
+const SIGNAL_CONVEYING_SOLID_TYPES = new Set([
+    "ElectricalSignalConveying",
+    "HydraulicSignalConveying",
+    "BusSignalConveying",
+    "PneumaticSignalConveying",
+    "CapillarySignalConveying",
+    "UndefinedSignalConveying",
+    "ElectromagneticGuidedSignalConveying",
+    "ElectromagneticUnguidedSignalConveying",
+]);
 
 // Profiles published from https://draga.no (xBRIDGE exports, e.g. Model
 // uri="https://draga.no/xbridge/profile/project-...") usually define no
@@ -1348,6 +1370,13 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
                     const signalConveyingType = signalConveyingTypeFor(localRepresents);
                     if (signalConveyingType === "SignalConveying") {
                         prim.stroke = { ...prim.stroke, dashArray: SIGNAL_CONVEYING_DASH_ARRAY };
+                    } else if (SIGNAL_CONVEYING_SOLID_TYPES.has(signalConveyingType)
+                        || objectTypeMap.get(localRepresents) === "Plant/Instrumentation.MeasuringLineFunction") {
+                        // MeasuringLineFunction: always solid, no marks (DISC decoration
+                        // table, as in vegarringdal/dexpi-viewer signalLines.ts).
+                        // Solid line + repeated glyph (e.g. italic "E"), regardless of
+                        // the DashStyle written on the drawn ConnectorLine.
+                        prim.stroke = { ...prim.stroke, dashStyle: "Solid", dashArray: "" };
                     }
                     drawn.push({ kind: "connectorLine", primitive: prim, representedId: localRepresents, elementRole: "connector", key: `${keyPrefix}_cl_${i}`, signalConveyingType: signalConveyingType || undefined });
                 } else {
