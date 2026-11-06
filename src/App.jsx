@@ -496,12 +496,37 @@ function renderPrimitive(primitive, key, textColorOverride = null, strokeMult = 
         // regardless of that symbol instance's own placement scale - see
         // renderMultilineText's counterScale. Plain (non-templated) text
         // baked into a symbol keeps scaling with it as before.
-        const useCounterScale = (symbolScale && primitive.templateFragments) ? symbolScale : null;
+        if (symbolScale) {
+            // Text that is part of a placed symbol's own catalog definition
+            // (e.g. ND0227's literal "TS"): same DISC DEXPI rule 'B' as the
+            // profile LabelTemplate overlays (labelOverlayPlacement) - always
+            // readable left-to-right / bottom-to-top under the placement's
+            // rotation AND mirroring, never drawn with mirrored glyphs.
+            // Templated text keeps its absolute Size (full counter-scale);
+            // plain literal text still scales with the symbol, only the
+            // mirror sign is cancelled.
+            const sx = symbolScale.sx || 1, sy = symbolScale.sy || 1;
+            // style.horizontal/vertical usually both carry the combined TextAlignment
+            // literal (e.g. "CenterBottom"); fall back to joining the two halves.
+            const h = primitive.style.horizontal || "Center", v = primitive.style.vertical || "Center";
+            const alignment = /^(Left|Center|Right)(Top|Center|Bottom)$/.test(h) ? h : `${h}${v}`;
+            const placement = labelOverlayPlacement(
+                { position: primitive.position, rotation: primitive.rotation, alignment },
+                { rotation: parentRotation, scaleX: sx, scaleY: sy, isMirrored: false },
+            );
+            const counterScale = primitive.templateFragments ? { sx, sy } : { sx: Math.sign(sx) || 1, sy: Math.sign(sy) || 1 };
+            return renderMultilineText({
+                key, x: placement.x, y: placement.y, rotation: placement.rotation,
+                fontFamily: primitive.style.font, fontSize: primitive.style.size, fill: textFill,
+                anchor: placement.anchor, baseline: placement.baseline,
+                counterScale,
+            }, displayText);
+        }
         const { rotation, anchor, baseline } = readableTextOrientation(parentRotation, primitive.rotation, rawAnchor, rawBaseline);
         return renderMultilineText({
             key, x: primitive.position.x, y: primitive.position.y, rotation,
             fontFamily: primitive.style.font, fontSize: primitive.style.size, fill: textFill, anchor, baseline,
-            counterScale: useCounterScale,
+            counterScale: null,
         }, displayText);
     }
     if (primitive.kind === "ellipseArc") {
