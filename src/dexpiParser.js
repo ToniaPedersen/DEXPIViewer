@@ -480,6 +480,78 @@ export function parseTreeFromConceptual(rootObject) {
     return walk(rootObject);
 }
 
+// Graphical model topology: walks the Diagram part of the file
+// (Core/EngineeringModel > Components[Diagram] > Core/Diagram.Diagram) and
+// returns a tree with the same node shape as parseTreeFromConceptual(), so
+// the Topology tab's TreeNode/search can render either. Graphical objects
+// rarely carry their own id, so each node gets a synthetic path id ("g:..."),
+// keeps its own Represents target in `representsId`, and inherits the nearest
+// ancestor's target in `selectId` - clicking any graphical node selects the
+// conceptual object it draws. `treeMap` (conceptual id -> node) is used to
+// label RepresentationGroups/Labels with the represented object's tag.
+export function parseTreeFromDiagram(mainDoc, treeMap = new Map(), domToNodeId = null) {
+    let diagrams = qsa(mainDoc, 'Object[type="Core/EngineeringModel"] > Components[property="Diagram"] > Object');
+    if (!diagrams.length) diagrams = qsa(mainDoc, 'Object[type="Core/Diagram.Diagram"]');
+    if (!diagrams.length) return null;
+    const short = t => (t || "").split("/").pop().replace(/^Diagram\./, "");
+    const refLabel = v => (v || "").split("/").pop();
+    function describe(obj, type, representsId) {
+        const id = obj.getAttribute("id") || "";
+        const target = representsId ? treeMap.get(representsId) : null;
+        const targetLabel = target ? target.label : representsId;
+        if (type === "Profile/SymbolUsage") return refLabel(referenceTargets(obj, "Symbol")[0]) || "SymbolUsage";
+        if (type === "Core/Diagram.ShapeUsage") return refLabel(referenceTargets(obj, "Shape")[0]) || "ShapeUsage";
+        if (type === "Core/Diagram.Text" || type === "Core/Diagram.LiteralText") {
+            const txt = valueFromData(obj, "Value") ?? valueFromData(obj, "Text");
+            return txt != null && txt !== "" ? `"${txt}"` : "(text)";
+        }
+        if (type === "Core/Diagram.AttributeRepresentation") return refLabel(valueFromData(obj, "Attribute") || valueFromData(obj, "AttributeName") || "") || "Attribute";
+        if (/NodePosition$/.test(type)) {
+            const node = referenceTargets(obj, "Node")[0];
+            return node ? (treeMap.get(node)?.label || node) : (id || short(type));
+        }
+        if (targetLabel) return id ? `${targetLabel} (${id})` : targetLabel;
+        return id || short(type);
+    }
+    function walk(obj, inheritedSelect, path) {
+        if (!obj || typeof obj.getAttribute !== "function") return null;
+        const type = obj.getAttribute("type") || "";
+        const ownId = obj.getAttribute("id") || null;
+        const representsId = referenceTargets(obj, "Represents")[0] || null;
+        const selectId = representsId || inheritedSelect || null;
+        const data = directChildrenByTag(obj, "Data").map(d => ({ property: d.getAttribute("property") || "", value: dataValue(d) }));
+        const refs = directChildrenByTag(obj, "References").map(r => ({
+            property: r.getAttribute("property") || "",
+            objects: (r.getAttribute("objects") || "").split(/\s+/).filter(Boolean).map(v => v.startsWith("#") ? v.slice(1) : v)
+        }));
+        const children = directChildrenByTag(obj, "Components").flatMap((comp, ci) => {
+            const prop = comp.getAttribute("property") || `comp_${ci}`;
+            return directChildrenByTag(comp, "Object").map((child, i) => {
+                const c = walk(child, selectId, `${path}/${prop}:${i}`);
+                return c ? { ...c, edgeLabel: prop } : null;
+            }).filter(Boolean);
+        });
+        if (domToNodeId) domToNodeId.set(obj, `g:${path}`);
+        return {
+            id: `g:${path}`, objectId: null, graphicalId: ownId, type, label: describe(obj, type, representsId),
+            representsId, selectId, tagName: "", subTagName: "", loopNum: "",
+            data, persistentIdentifiers: [], refs, children
+        };
+    }
+    const roots = diagrams.map((d, i) => walk(d, null, `d${i}`)).filter(Boolean);
+    if (roots.length === 1) { roots[0].label = "Diagram"; return roots[0]; }
+    return { id: "g:root", objectId: null, graphicalId: null, type: "Core/Diagram.Diagram", label: `Diagrams (${roots.length})`, representsId: null, selectId: null, tagName: "", subTagName: "", loopNum: "", data: [], persistentIdentifiers: [], refs: [], children: roots };
+}
+
+// Ids of the graphical-tree nodes that must be expanded to reveal every
+// node drawing (directly Representing) `targetId`.
+export function findDiagramAncestors(node, targetId, trail = [], out = []) {
+    if (!node) return out;
+    if (node.representsId === targetId) out.push(...trail.map(t => t.id));
+    node.children.forEach(child => findDiagramAncestors(child, targetId, [...trail, node], out));
+    return out;
+}
+
 export function flattenTree(node, arr = []) {
     if (!node) return arr;
     arr.push(node);
@@ -1305,7 +1377,8 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
             rotation: numberFromData(el, "Rotation", 0),
             scaleX: numberFromData(el, "ScaleX", 1),
             scaleY: numberFromData(el, "ScaleY", 1),
-            isMirrored: !!valueFromData(el, "IsMirrored")
+            isMirrored: !!valueFromData(el, "IsMirrored"),
+            srcNode: el
         });
     }
 
@@ -1348,7 +1421,7 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
                     const lt = lel.getAttribute("type") || "";
                     if (lt === "Core/Diagram.Text" || lt === "Core/Diagram.LiteralText" || lt === "Core/Diagram.AttributeRepresentation") {
                         const prim = attachProfileText(parsePrimitive(lel, li));
-                        if (prim) drawn.push({ kind: "primitive", primitive: prim, representedId: labelRepresents, elementRole: "label", key: `${keyPrefix}_lbltxt_${i}_${li}` });
+                        if (prim) drawn.push({ kind: "primitive", primitive: prim, representedId: labelRepresents, elementRole: "label", key: `${keyPrefix}_lbltxt_${i}_${li}`, srcNode: lel });
                     } else if (lt === "Core/Diagram.ShapeUsage") {
                         pushSymbolUsage(referenceTargets(lel, "Shape")[0] || null, lel, labelRepresents, `${keyPrefix}_lblshape_${i}_${li}`, "label");
                     } else if (lt === "Profile/SymbolUsage") {
@@ -1378,9 +1451,9 @@ export function collectGraphicalElements(mainDoc, symbolMap, discDoc = null) {
                         // the DashStyle written on the drawn ConnectorLine.
                         prim.stroke = { ...prim.stroke, dashStyle: "Solid", dashArray: "" };
                     }
-                    drawn.push({ kind: "connectorLine", primitive: prim, representedId: localRepresents, elementRole: "connector", key: `${keyPrefix}_cl_${i}`, signalConveyingType: signalConveyingType || undefined });
+                    drawn.push({ kind: "connectorLine", primitive: prim, representedId: localRepresents, elementRole: "connector", key: `${keyPrefix}_cl_${i}`, signalConveyingType: signalConveyingType || undefined, srcNode: el });
                 } else {
-                    drawn.push({ kind: "primitive", primitive: prim, representedId: localRepresents, elementRole: isLabelGroup ? "label" : "symbol", key: `${keyPrefix}_p_${i}` });
+                    drawn.push({ kind: "primitive", primitive: prim, representedId: localRepresents, elementRole: isLabelGroup ? "label" : "symbol", key: `${keyPrefix}_p_${i}`, srcNode: el });
                 }
             }
         });
@@ -2421,7 +2494,23 @@ export function parseDexpiPackage(mainXml, discProfileXml) {
         return raw;
     })();
     const enumAbbreviations = buildEnumAbbreviationMap(discDoc);
-    return { mainDoc, discDoc, tree, flatTree, treeMap, symbolMap, graphics, meta, connectivityMap, heatTraceSet, enumAbbreviations };
+    // Graphical model topology + the link between its nodes and the drawn
+    // elements: each drawn element remembers the Diagram DOM object it was
+    // built from (srcNode, set in collectGraphicalElements), which maps to
+    // the graphical tree node id. srcNode is dropped afterwards so element
+    // objects stay plain data (they are also posted to the compare worker).
+    const domToNodeId = new Map();
+    const diagramTree = parseTreeFromDiagram(mainDoc, treeMap, domToNodeId);
+    const diagramFlat = diagramTree ? flattenTree(diagramTree) : [];
+    const diagramFlatCount = diagramFlat.length;
+    const diagramNodeMap = new Map(diagramFlat.map(n => [n.id, n]));
+    const diagramParent = new Map();
+    diagramFlat.forEach(n => n.children.forEach(c => diagramParent.set(c.id, n.id)));
+    graphics.elements.forEach(el => {
+        el.diagramNodeId = (el.srcNode && domToNodeId.get(el.srcNode)) || null;
+        delete el.srcNode;
+    });
+    return { mainDoc, discDoc, tree, flatTree, treeMap, symbolMap, graphics, meta, connectivityMap, heatTraceSet, enumAbbreviations, diagramTree, diagramFlatCount, diagramNodeMap, diagramParent };
 }
 
 export function boundsFromElements(graphics) {

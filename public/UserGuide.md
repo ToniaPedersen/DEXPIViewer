@@ -2,7 +2,7 @@
 
 A browser-based viewer and validation engine for [DEXPI 2.0](https://dexpi.org) intelligent P&ID files, with full support for DISC profile validation.
 
-**Version 2.5.0** — see `ChangeLog_2.4_to_2.5.md` for the changes since 2.4.
+**Version 2.6.0** — see `ChangeLog_2.5_to_2.6.md` for the changes since 2.5.
 
 Developed by **Tonia Pedersen** at **[Draga AS](https://draga.no)**.
 
@@ -31,7 +31,7 @@ Developed by **Tonia Pedersen** at **[Draga AS](https://draga.no)**.
 DEXPI Viewer & Verificator reads DEXPI 2.0 XML files and provides three integrated capabilities:
 
 - **Graphical rendering** — renders the P&ID drawing directly from the XML, including symbols, piping lines, signal connectors, heat trace overlays, and labels.
-- **Object model exploration** — structured topology tree with full property, reference, and connectivity details for every object.
+- **Object model exploration** — structured topology tree of the conceptual model (engineering objects) or the graphical model (the Diagram part), with full property, reference, and connectivity details for every object.
 - **Validation** — 38+ named rules covering XML well-formedness, DEXPI schema conformance, engineering semantics, and DISC profile compliance.
 
 The application runs entirely in the browser with no server component. A companion command-line tool (`validate-cli.js`) provides the same validation engine for CI/CD pipelines and batch processing.
@@ -111,18 +111,46 @@ The centre panel pans and zooms to center that point in the view (at the current
 
 ### 4.1 Topology Tab
 
-The Topology tab shows the full DEXPI object model as an expandable tree, organised by containment (e.g. `PlantModel` → `PipingNetworkSystem` → `PipingNetworkSegment`).
+The Topology tab shows the loaded file as an expandable tree. Two buttons at the top of the tab choose which part of the file the tree shows:
+
+| Button | Tree | Built from |
+|---|---|---|
+| **Conceptual model** (default) | The engineering objects, organised by containment (e.g. `PlantModel` → `PipingNetworkSystem` → `PipingNetworkSegment`). | `ConceptualModel` |
+| **Graphical model** | The drawing structure: representation groups, Static and Label groups, symbol and shape usages, texts, connector lines and node positions, organised as they are nested in the file. | `Diagram` (`Core/Diagram.Diagram`) |
 
 Each node displays:
 - The object label or tag name (e.g. pump tag `P-101`).
-- A coloured dot if validation issues exist: 🔴 red for errors, 🟡 amber for warnings.
+- Its type on the right (e.g. `CentrifugalPump`, or `RepresentationGroup` / `SymbolUsage` in the graphical model).
+- A coloured dot if validation issues exist: 🔴 red for errors, 🟡 amber for warnings. In the graphical model the dot is shown on the nodes that directly represent the object with issues.
 
 Controls above the tree:
 
-- **Search** — type any part of a tag name, object ID, type name, or persistent identifier to filter the tree in real time.
-- **Expand all / Collapse all** — expand or collapse the entire tree in one click.
+- **Conceptual model / Graphical model** — switch the tree. Each tree keeps its own expanded nodes.
+- **Search** — type any part of a tag name, object ID, type name, or persistent identifier to filter the tree in real time. In the graphical model the search also matches a graphical object's own id and the id of the object it represents.
+- **Expand all / Collapse all** — expand or collapse the shown tree in one click.
+- The object count on the right is for the shown tree (`… objects` or `… graphical objects`).
 
-Clicking any node selects it, highlights its graphical counterpart in the drawing, and populates the right panel with its details.
+**Conceptual model:** clicking any node selects it, highlights its graphical counterpart in the drawing, and populates the right panel with its details.
+
+#### Graphical model
+
+Graphical objects rarely have an id of their own, so the tree names them from what they draw:
+
+| Node | Shown as |
+|---|---|
+| Representation group or Label | The label/tag of the object it represents (its `Represents` reference), e.g. `D-20PA001`. |
+| Profile/SymbolUsage, ShapeUsage | The symbol or shape reference, e.g. `PP003A`, `ND0002`. |
+| Text | The text string in quotes. |
+| Piping / Instrumentation node position | The node it positions. |
+| Anything else | Its id, or its type (e.g. `Static`, `Border`). |
+
+Hover a node to see its type, its own id and what it represents.
+
+The graphical tree and the drawing are linked both ways:
+
+- **Tree → drawing:** clicking a node highlights exactly the drawing elements built from that node and the nodes under it. A single SymbolUsage highlights only that symbol; a representation group highlights everything in it (symbol, labels, connector lines, nested groups). The right panel shows the object the node represents, or that its nearest enclosing group represents. Nodes that represent no object (e.g. the drawing Border, loose Static groups) are shown in grey and still highlight their graphics.
+- **Drawing → tree:** clicking an element in the drawing selects its object and the graphical node it was built from; the tree expands down to that node and scrolls it into view. In this view, elements that represent no object (border, drawing labels) can be clicked too.
+- Selecting an object any other way (validation list, right panel links, the conceptual tree) clears the graphical node selection, and the drawing goes back to highlighting the selected object.
 
 ### 4.2 Validation Tab
 
@@ -165,7 +193,7 @@ The centre panel renders the DEXPI drawing graphically from the XML data. Symbol
 
 ### 5.2 Selecting Objects
 
-Click any symbol or piping line in the drawing to select it. The selected object is highlighted with a red outline (orange for label elements) and its details appear in the right panel. The corresponding node in the topology tree is also highlighted.
+Click any symbol or piping line in the drawing to select it. The selected object is highlighted with a red outline (orange for label elements) and its details appear in the right panel. The corresponding node in the topology tree is also highlighted. With **Graphical model** chosen in the Topology tab, the click also selects the graphical node the element was built from, and only that node's elements are highlighted (see 4.1).
 
 ### 5.3 Connectivity Mode
 

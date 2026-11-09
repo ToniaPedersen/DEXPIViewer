@@ -4,6 +4,7 @@ import {
     parseDexpiPackage, boundsFromElements, clampViewBox,
     findAncestors, collectDescendantObjectIds, flattenTree,
     parseColor, collectModelValidIds, isConnectivityRefProperty, isHeatTraceRingLabel,
+    findDiagramAncestors,
 } from "./dexpiParser.js";
 import { jsPDF } from "jspdf";
 import { svgToDxf } from "./dxfExport.js";
@@ -1074,7 +1075,7 @@ function SymbolGraphic({ el, selected, connHighlight, onSelect, boostPct, boostS
                        : connHighlight === "#8250df" ? "#f3e8ff"
                        : null;
     return (
-        <g data-dxf-layer={dxfLayerFor(el)} onClick={e => { e.stopPropagation(); if (el.representedId) onSelect(el.representedId); }} style={{ cursor: el.representedId ? "pointer" : "default" }}>
+        <g data-dxf-layer={dxfLayerFor(el)} onClick={e => { e.stopPropagation(); if (el.representedId || el.diagramNodeId) onSelect(el.representedId, el); }} style={{ cursor: el.representedId || el.diagramNodeId ? "pointer" : "default" }}>
             <g transform={transform}>
                 <rect x={hitX} y={hitY} width={hitW} height={hitH} fill="transparent" stroke="none" pointerEvents="all" />
             </g>
@@ -1096,7 +1097,7 @@ function PrimitiveGraphic({ el, selected, connHighlight, onSelect, nodePosMap, b
     const hlColor = selected ? (connHighlight || selectionColor(el.elementRole)) : connHighlight || null;
     const prim = el.primitive;
     return (
-        <g data-dxf-layer={dxfLayerFor(el)} onClick={e => { e.stopPropagation(); if (el.representedId) onSelect(el.representedId); }} style={{ cursor: el.representedId ? "pointer" : "default" }}>
+        <g data-dxf-layer={dxfLayerFor(el)} onClick={e => { e.stopPropagation(); if (el.representedId || el.diagramNodeId) onSelect(el.representedId, el); }} style={{ cursor: el.representedId || el.diagramNodeId ? "pointer" : "default" }}>
             {prim?.kind === "circle" && <circle cx={prim.center.x} cy={prim.center.y} r={prim.radius + hitPad} fill="transparent" stroke="none" pointerEvents="all" />}
             {prim?.kind === "ellipse" && <ellipse cx={prim.center.x} cy={prim.center.y} rx={prim.rx + hitPad} ry={prim.ry + hitPad} fill="transparent" stroke="none" pointerEvents="all" />}
             {prim?.kind === "rect" && <rect x={prim.center.x - prim.width / 2 - hitPad} y={prim.center.y - prim.height / 2 - hitPad} width={prim.width + hitPad * 2} height={prim.height + hitPad * 2} fill="transparent" stroke="none" pointerEvents="all" />}
@@ -1118,19 +1119,34 @@ function PrimitiveGraphic({ el, selected, connHighlight, onSelect, nodePosMap, b
 
 // ---------- Tree Node --------------------------------------------------------
 
-function TreeNode({ node, selectedId, onSelect, expanded, setExpanded, level, issueMap }) {
+function TreeNode({ node, selectedId, onSelect, expanded, setExpanded, level, issueMap, selectedGraphNodeId = null, onGraphSelect = null }) {
     const isOpen = expanded.has(node.id);
     const hasChildren = node.children.length > 0;
-    const isSelected = selectedId === node.objectId;
-    const nodeIssues = node.objectId ? (issueMap.get(node.objectId) || []) : [];
+    // Graphical-model nodes (see parseTreeFromDiagram) have no objectId of
+    // their own: they select the conceptual object they (or an ancestor)
+    // Represent, and only count as "selected"/carry issue dots when they
+    // Represent it directly.
+    const isGraphical = node.id.startsWith("g:");
+    const selectTarget = isGraphical ? node.selectId : node.objectId;
+    const ownTarget = isGraphical ? node.representsId : node.objectId;
+    // In the graphical view a specific graphical node (picked in the tree or
+    // by clicking its element in the drawing) wins over "every node that
+    // Represents the selected object".
+    const isSelected = isGraphical && selectedGraphNodeId
+        ? selectedGraphNodeId === node.id
+        : !!ownTarget && selectedId === ownTarget;
+    const nodeIssues = ownTarget ? (issueMap.get(ownTarget) || []) : [];
     const hasError = nodeIssues.some(i => i.severity === "Error");
     const hasWarn = !hasError && nodeIssues.some(i => i.severity === "Warning");
     return (
         <div>
             <div
-                id={node.objectId ? `tree-node-${node.objectId}` : undefined}
-                onClick={() => { if (!node.objectId) return; onSelect(node.objectId); }}
-                style={{ padding: "3px 8px", paddingLeft: 8 + level * 14, background: isSelected ? "#dbeafe" : "transparent", cursor: "pointer", borderRadius: 4, marginBottom: 1, display: "flex", alignItems: "center", gap: 5 }}
+                id={!isGraphical && node.objectId ? `tree-node-${node.objectId}` : undefined}
+                data-sel-id={ownTarget || undefined}
+                data-gnode-id={isGraphical ? node.id : undefined}
+                title={isGraphical ? [node.type, node.graphicalId && `id: ${node.graphicalId}`, node.representsId && `Represents: ${node.representsId}`, !node.representsId && node.selectId && `(within ${node.selectId})`].filter(Boolean).join("\n") : undefined}
+                onClick={() => { if (isGraphical && onGraphSelect) { onGraphSelect(node); return; } if (!selectTarget) return; onSelect(selectTarget); }}
+                style={{ padding: "3px 8px", paddingLeft: 8 + level * 14, background: isSelected ? "#dbeafe" : "transparent", cursor: "pointer", color: isGraphical && !selectTarget ? "#57606a" : undefined, borderRadius: 4, marginBottom: 1, display: "flex", alignItems: "center", gap: 5 }}
             >
                 <span onClick={e => { e.stopPropagation(); if (!hasChildren) return; setExpanded(prev => { const n = new Set(prev); n.has(node.id) ? n.delete(node.id) : n.add(node.id); return n; }); }} style={{ width: 14, display: "inline-block", textAlign: "center", flexShrink: 0, color: "#888" }}>
                     {hasChildren ? (isOpen ? "▾" : "▸") : "·"}
@@ -1138,10 +1154,10 @@ function TreeNode({ node, selectedId, onSelect, expanded, setExpanded, level, is
                 {hasError && <span title="Has validation errors" style={{ color: "#cf222e", fontSize: 10, flexShrink: 0 }}>{"●"}</span>}
                 {hasWarn && <span title="Has validation warnings" style={{ color: "#9a6700", fontSize: 10, flexShrink: 0 }}>{"●"}</span>}
                 <span style={{ fontWeight: isSelected ? 700 : 400, fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{node.label}</span>
-                {(() => { const s = node.type.split(".").pop(); const tc = node.type.includes("FlowIn") ? "#0969da" : node.type.includes("FlowOut") ? "#1a7f37" : null; return <span style={{ fontSize: 10, color: tc || "#aaa", fontWeight: tc ? 600 : 400, flexShrink: 0, marginLeft: "auto" }}>{s}</span>; })()}
+                {(() => { const s = isGraphical ? node.type.split("/").pop().replace(/^Diagram\./, "") : node.type.split(".").pop(); const tc = node.type.includes("FlowIn") ? "#0969da" : node.type.includes("FlowOut") ? "#1a7f37" : null; return <span style={{ fontSize: 10, color: tc || "#aaa", fontWeight: tc ? 600 : 400, flexShrink: 0, marginLeft: "auto" }}>{s}</span>; })()}
             </div>
             {isOpen && node.children.map(child => (
-                <TreeNode key={child.id} node={child} selectedId={selectedId} onSelect={onSelect} expanded={expanded} setExpanded={setExpanded} level={level + 1} issueMap={issueMap} />
+                <TreeNode key={child.id} node={child} selectedId={selectedId} onSelect={onSelect} expanded={expanded} setExpanded={setExpanded} level={level + 1} issueMap={issueMap} selectedGraphNodeId={selectedGraphNodeId} onGraphSelect={onGraphSelect} />
             ))}
         </div>
     );
@@ -1153,6 +1169,12 @@ export default function App() {
     const [leftCollapsed, setLeftCollapsed] = useState(false);
     const [rightCollapsed, setRightCollapsed] = useState(false);
     const [leftTab, setLeftTab] = useState("topology");
+    // Topology tab view: "conceptual" (ConceptualModel object tree) or
+    // "graphical" (the Diagram part: groups, symbol usages, texts, node positions).
+    const [topologyView, setTopologyView] = useState("conceptual");
+    // Graphical tree node currently selected (tree click or drawing click);
+    // cleared by any other kind of selection (handleSelect).
+    const [selectedGraphNodeId, setSelectedGraphNodeId] = useState(null);
     const [rightTab, setRightTab] = useState("details");
     const [mainXmlText, setMainXmlText] = useState("");
     const [mainFileName, setMainFileName] = useState("validation-report");
@@ -1383,7 +1405,9 @@ export default function App() {
             setFullBounds(b);
             setParsed(p);
             setSelectedId(p.tree.objectId);
-            setExpanded(new Set([p.tree.id, ...p.tree.children.slice(0, 5).map(c => c.id)]));
+            setSelectedGraphNodeId(null);
+            setExpanded(new Set([p.tree.id, ...p.tree.children.slice(0, 5).map(c => c.id),
+                ...(p.diagramTree ? [p.diagramTree.id] : [])]));
             setViewBox({ x: b.minX, y: b.minY, w: Math.max(100, b.maxX - b.minX), h: Math.max(100, b.maxY - b.minY) });
             setParseError("");
             setValidationIssues([]); setValidationDone(false);
@@ -2090,18 +2114,19 @@ export default function App() {
         setLeftTab("validation");
     }
 
+    const activeTree = parsed ? (topologyView === "graphical" ? parsed.diagramTree : parsed.tree) : null;
     const filteredTree = useMemo(() => {
-        if (!parsed) return null;
+        if (!activeTree) return null;
         const q = search.trim().toLowerCase();
-        if (!q) return parsed.tree;
+        if (!q) return activeTree;
         const filter = node => {
-            const terms = [node.label, node.objectId, node.type, node.tagName, node.subTagName, node.loopNum, ...node.persistentIdentifiers.map(p => p.value)].filter(Boolean);
+            const terms = [node.label, node.objectId, node.graphicalId, node.representsId, node.type, node.tagName, node.subTagName, node.loopNum, ...node.persistentIdentifiers.map(p => p.value)].filter(Boolean);
             const match = terms.some(v => String(v).toLowerCase().includes(q));
             const children = node.children.map(filter).filter(Boolean);
             return match || children.length ? { ...node, children } : null;
         };
-        return filter(parsed.tree);
-    }, [parsed, search]);
+        return filter(activeTree);
+    }, [activeTree, search]);
 
     const selectedNode = useMemo(() => parsed?.treeMap?.get(selectedId) || null, [parsed, selectedId]);
     const selectedRepresentedIds = useMemo(() => {
@@ -2146,19 +2171,58 @@ export default function App() {
 
     const handleSelect = useCallback((id) => {
         if (!id) return;
+        setSelectedGraphNodeId(null);
         setSelectedId(id);
         setSearch("");
         if (parsed) {
             const ancestors = findAncestors(parsed.tree, id);
-            setExpanded(prev => new Set([...prev, ...ancestors]));
+            const diagramAncestors = parsed.diagramTree ? findDiagramAncestors(parsed.diagramTree, id) : [];
+            setExpanded(prev => new Set([...prev, ...ancestors, ...diagramAncestors]));
         }
     }, [parsed]);
 
+    // Graphical tree <-> drawing link. Selecting a graphical node selects the
+    // conceptual object it (or its nearest ancestor) Represents, and marks the
+    // node itself so the drawing highlights exactly the elements built from it
+    // and its sub-nodes. Clicking an element in the drawing does the reverse:
+    // selects its object and the graphical node it came from, expanding the
+    // graphical tree down to it.
+    const selectGraphNode = useCallback((nodeId) => {
+        if (!parsed?.diagramNodeMap || !nodeId) return;
+        const node = parsed.diagramNodeMap.get(nodeId);
+        if (!node) return;
+        if (node.selectId) handleSelect(node.selectId);
+        setSelectedGraphNodeId(nodeId);
+        const chain = [];
+        for (let p = parsed.diagramParent.get(nodeId); p; p = parsed.diagramParent.get(p)) chain.push(p);
+        if (chain.length) setExpanded(prev => new Set([...prev, ...chain]));
+    }, [parsed, handleSelect]);
+    const handleGraphTreeSelect = useCallback(node => selectGraphNode(node.id), [selectGraphNode]);
+    const handleDrawingSelect = useCallback((id, el) => {
+        if (id) handleSelect(id);
+        if (el?.diagramNodeId) selectGraphNode(el.diagramNodeId);
+    }, [handleSelect, selectGraphNode]);
+
+    // Every drawn-element source node under the selected graphical node.
+    const graphHighlightNodeIds = useMemo(() => {
+        if (topologyView !== "graphical" || !selectedGraphNodeId || !parsed?.diagramNodeMap) return null;
+        const root = parsed.diagramNodeMap.get(selectedGraphNodeId);
+        if (!root) return null;
+        const ids = new Set();
+        const walk = n => { ids.add(n.id); n.children.forEach(walk); };
+        walk(root);
+        return ids;
+    }, [topologyView, selectedGraphNodeId, parsed]);
+
     useEffect(() => {
-        if (!selectedId) return;
-        const h = requestAnimationFrame(() => { document.getElementById(`tree-node-${selectedId}`)?.scrollIntoView({ block: "nearest", behavior: "smooth" }); });
+        if (!selectedId && !selectedGraphNodeId) return;
+        const h = requestAnimationFrame(() => {
+            const el = (topologyView === "graphical" && selectedGraphNodeId && document.querySelector(`[data-gnode-id="${CSS.escape(selectedGraphNodeId)}"]`))
+                || (selectedId && document.querySelector(`[data-sel-id="${CSS.escape(selectedId)}"]`));
+            el?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+        });
         return () => cancelAnimationFrame(h);
-    }, [selectedId]);
+    }, [selectedId, selectedGraphNodeId, topologyView]);
 
     // Attach wheel listener directly with passive:false so preventDefault() works.
     // Plain scroll over the drawing zooms; the listener is scoped to the SVG container
@@ -2197,8 +2261,15 @@ export default function App() {
         return () => { if (bgObjectUrlRef.current) URL.revokeObjectURL(bgObjectUrlRef.current); };
     }, []);
 
-    function expandAll() { if (!parsed) return; const ids = new Set(); flattenTree(parsed.tree).forEach(n => ids.add(n.id)); setExpanded(ids); }
-    function collapseAll() { if (!parsed) return; setExpanded(new Set([parsed.tree.id])); }
+    // Expand/collapse act on the tree currently shown, keeping the other
+    // view's expansion state untouched (their node ids never collide - all
+    // graphical ids start with "g:").
+    function expandAll() { if (!activeTree) return; setExpanded(prev => { const ids = new Set(prev); flattenTree(activeTree).forEach(n => ids.add(n.id)); return ids; }); }
+    function collapseAll() {
+        if (!activeTree) return;
+        const ids = new Set(); flattenTree(activeTree).forEach(n => ids.add(n.id));
+        setExpanded(prev => new Set([...[...prev].filter(id => !ids.has(id)), activeTree.id]));
+    }
 
     const issueCounts = useMemo(() => { const c = { Error: 0, Warning: 0, Info: 0 }; validationIssues.forEach(i => { c[i.severity] = (c[i.severity] || 0) + 1; }); return c; }, [validationIssues]);
     const filteredIssues = useMemo(() => validationFilter === "All" ? validationIssues : validationIssues.filter(i => i.severity === validationFilter), [validationIssues, validationFilter]);
@@ -2374,17 +2445,27 @@ export default function App() {
                             <div style={{ padding: "6px 10px", borderBottom: "1px solid #eef2f6" }}>
                                 <input style={S.input} placeholder="Search tag, type, ID, persistent ID..." value={search} onChange={e => setSearch(e.target.value)} />
                             </div>
+                            <div style={{ padding: "4px 8px", borderBottom: "1px solid #eef2f6", display: "flex", gap: 0 }} role="group" aria-label="Topology view">
+                                {[["conceptual", "Conceptual model", "Engineering objects from the ConceptualModel part of the file"],
+                                    ["graphical", "Graphical model", "Drawing structure from the Diagram part of the file (groups, symbol usages, texts, node positions)"]].map(([v, label, tip], i) => (
+                                    <button key={v} title={tip} aria-pressed={topologyView === v} onClick={() => setTopologyView(v)}
+                                        style={{ ...S.btnSmall, flex: 1, borderRadius: i === 0 ? "4px 0 0 4px" : "0 4px 4px 0", marginLeft: i ? -1 : 0,
+                                            background: topologyView === v ? "#0969da" : "white", color: topologyView === v ? "white" : "#24292f",
+                                            borderColor: topologyView === v ? "#0969da" : undefined, fontWeight: topologyView === v ? 600 : 400 }}>{label}</button>
+                                ))}
+                            </div>
                             <div style={{ padding: "4px 8px", borderBottom: "1px solid #eef2f6", display: "flex", gap: 6 }}>
                                 <button style={S.btnSmall} onClick={expandAll}>Expand all</button>
                                 <button style={S.btnSmall} onClick={collapseAll}>Collapse all</button>
-                                {parsed && <span style={{ fontSize: 12, color: "#888", marginLeft: "auto" }}>{parsed.flatTree.length} objects</span>}
+                                {parsed && <span style={{ fontSize: 12, color: "#888", marginLeft: "auto" }}>{topologyView === "graphical" ? `${parsed.diagramFlatCount} graphical objects` : `${parsed.flatTree.length} objects`}</span>}
                             </div>
                             <div style={{ padding: 6 }}>
                                 {parseError && <div style={{ color: "#cf222e", padding: 8, fontSize: 13 }}>{parseError}</div>}
                                 {filteredTree ? (
-                                    <TreeNode node={filteredTree} selectedId={selectedId} onSelect={handleSelect} expanded={expanded} setExpanded={setExpanded} level={0} issueMap={issueMap} />
+                                    <TreeNode node={filteredTree} selectedId={selectedId} onSelect={handleSelect} expanded={expanded} setExpanded={setExpanded} level={0} issueMap={issueMap}
+                                        selectedGraphNodeId={topologyView === "graphical" ? selectedGraphNodeId : null} onGraphSelect={handleGraphTreeSelect} />
                                 ) : (
-                                    <div style={{ color: "#888", fontSize: 13, padding: 8 }}>Load a DEXPI XML file to view the topology.</div>
+                                    <div style={{ color: "#888", fontSize: 13, padding: 8 }}>{parsed && topologyView === "graphical" && !parsed.diagramTree ? "This file has no Diagram part." : parsed && search.trim() ? "No matches." : "Load a DEXPI XML file to view the topology."}</div>
                                 )}
                             </div>
                         </div>
@@ -2937,11 +3018,13 @@ export default function App() {
                         <g data-dxf-root="" style={{ opacity: cmp && cmpView === "diff" && !batchPng ? 0.12 : bgImage && bgImage.opacity < 0 ? Math.max(0, 1 + bgImage.opacity) : 1 }}>
                             {orderedGraphicsElements.map(el => {
                                 if (el.representedId && hiddenIssueIds.has(el.representedId)) return null;
-                                const isSelected = !cleanExport && !!el.representedId && selectedRepresentedIds.has(el.representedId);
+                                const isSelected = !cleanExport && (graphHighlightNodeIds
+                                    ? !!el.diagramNodeId && graphHighlightNodeIds.has(el.diagramNodeId)
+                                    : !!el.representedId && selectedRepresentedIds.has(el.representedId));
                                 const ch = connectivityHighlight;
                                 const connColor = !cleanExport && el.representedId ? (ch.upstream.has(el.representedId) ? "#0969da" : ch.downstream.has(el.representedId) ? "#1a7f37" : ch.group.has(el.representedId) ? "#8250df" : null) : null;
-                                if (el.kind === "symbolUsage") return <SymbolGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} boostPct={lineBoostPct} boostSymbolOutlines={boostSymbolOutlines} showProfileLabels={showProfileLabels} showMixedLabels={showMixedLabels} />;
-                                return <PrimitiveGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleSelect} nodePosMap={parsed.graphics.nodePosMap} boostPct={lineBoostPct} boostSymbolOutlines={boostSymbolOutlines} showProfileLabels={showProfileLabels} showMixedLabels={showMixedLabels} worldPerPx={worldPerPx} />;
+                                if (el.kind === "symbolUsage") return <SymbolGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleDrawingSelect} boostPct={lineBoostPct} boostSymbolOutlines={boostSymbolOutlines} showProfileLabels={showProfileLabels} showMixedLabels={showMixedLabels} />;
+                                return <PrimitiveGraphic key={el.key} el={el} selected={isSelected} connHighlight={connColor} onSelect={handleDrawingSelect} nodePosMap={parsed.graphics.nodePosMap} boostPct={lineBoostPct} boostSymbolOutlines={boostSymbolOutlines} showProfileLabels={showProfileLabels} showMixedLabels={showMixedLabels} worldPerPx={worldPerPx} />;
                             })}
                             {/* Heat-trace overlays – part of the DEXPI drawing layer (fades with it), only when a DISC profile is loaded */}
                             {parsed?.heatTraceSet?.size > 0 && <g data-dxf-layer="HEAT_TRACE">{parsed.graphics.elements.map(el => {
