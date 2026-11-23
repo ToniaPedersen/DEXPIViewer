@@ -2,7 +2,7 @@
 
 A browser-based viewer and validation engine for [DEXPI 2.0](https://dexpi.org) intelligent P&ID files, with full support for DISC profile validation.
 
-**Version 2.6.0** — see `ChangeLog_2.5_to_2.6.md` for the changes since 2.5.
+**Version 2.7.0** — see `ChangeLog_2.6_to_2.7.md` for the changes since 2.6.
 
 Developed by **Tonia Pedersen** at **[Draga AS](https://draga.no)**.
 
@@ -61,7 +61,7 @@ Two load modes are available at the top of the left panel:
 
 | Mode | Description |
 |------|-------------|
-| **With profile** | Enables the **DiscProfile.xml** button and profile-specific rules (PRF-E01–E07, VAL-004, ERR-E18, ERR-E19). Use when validating against DISC profile requirements. |
+| **With profile** | Enables the **DiscProfile.xml** button and profile-specific rules (PRF-E01–E08, VAL-004, ERR-E18, ERR-E19). Use when validating against DISC profile requirements. |
 | **Internal** | Profile loading is disabled. Only DEXPI base rules fire. Use for quick structural checks without profile constraints. |
 
 To load profiles:
@@ -125,9 +125,11 @@ Each node displays:
 
 Controls above the tree:
 
-- **Conceptual model / Graphical model** — switch the tree. Each tree keeps its own expanded nodes.
+- **Conceptual model / Graphical model** (the two icon buttons on the left; hover for the name) — switch the tree. Each tree keeps its own expanded nodes.
 - **Search** — type any part of a tag name, object ID, type name, or persistent identifier to filter the tree in real time. In the graphical model the search also matches a graphical object's own id and the id of the object it represents.
-- **Expand all / Collapse all** — expand or collapse the shown tree in one click.
+- **Expand all / Collapse all** (the two arrow icon buttons) — expand or collapse the shown tree in one click.
+
+The search box and these buttons stay in place while the tree scrolls. The same applies to the header rows of the Validation and Folder tabs.
 - The object count on the right is for the shown tree (`… objects` or `… graphical objects`).
 
 **Conceptual model:** clicking any node selects it, highlights its graphical counterpart in the drawing, and populates the right panel with its details.
@@ -405,7 +407,7 @@ Rules marked **Profile required** only fire when at least one profile XML has be
 |------|---------|-------------|:---:|
 | VAL-001 | Error | XML is not well-formed (parse error). | |
 | VAL-004 | Info | Model object of a DISC-required type has no `id` attribute, or has no graphical `RepresentationGroup` in the drawing. | ✓ |
-| VAL-005 | Error | Broken reference — `objects="…"` points to an ID not present in the file. | |
+| VAL-005 | Error | Broken reference — `objects="#…"` points to an ID not present in the file. Every `<References>` element is checked, including graphics without an id (`ConnectorLine` `Source`/`Target`, `RepresentationGroup.Represents`, `AttributeRepresentation.Object`). | |
 
 ### ERR — XML Schema & Structural Correctness
 
@@ -421,11 +423,11 @@ Rules marked **Profile required** only fire when at least one profile XML has be
 | ERR-E08 | Error | Object placed under an incompatible `Components` property for its type, or under a `Components` property its parent class does not define at all (e.g. a `Piping.Sensorwell` nested in `MeasuringLineFunction/Components[@property='Items']`). The message lists where the type is allowed. | |
 | ERR-E10 | Error | Duplicate `id` attribute — two or more objects share the same ID. | |
 | ERR-E11 | Error | Duplicate `PersistentIdentifier` value across objects. | |
-| ERR-E12 | Error | `OperatedValveReference.Valve` references a non-valve type. | |
+| ERR-E12 | Error | A `References` target is not of the class the reference property requires (its `ClassReference` in the DEXPI 2.0 meta model, subclasses and profile subclasses allowed), e.g. `SensingLocation` → a `ProcessInstrumentationFunction`, `SignalConveyingFunction.Target` → a meter, `SourceItem` → a FlowOut off-page connector. | |
 | ERR-E15 | Error | `PlantMetaData` element is absent from the file. | |
 | ERR-E16 | Error | Graphical `Represents` reference points to a non-existent model object. | |
 | ERR-E17 | Error | Important equipment, valve, or connector has no `RepresentationGroup` (orphaned model object). | |
-| ERR-E18 | Error | Attribute used on a class that does not allow it per the loaded profile's `PropertyConstraint` definitions. | ✓ |
+| ERR-E18 | Error | Property used on a class that does not allow it per the loaded profile: either its `PropertyConstraint` definitions, or its class model (a `Prefix/Name` Data, Components or References property that the profile does not declare on the object's class or any supertype, e.g. `DiscProfile/Sequence` on a ProcessInstrumentationFunction, or a profile class name such as `DiscProfile/AreaBreak` used as a property). | ✓ |
 | ERR-E19 | Error | Attribute appears more times than the upper cardinality allows per the loaded profile. | ✓ |
 | ERR-E20 | Error | A `Core/Diagram.TextTemplate`'s `AttributeName` doesn't resolve to a value anywhere reachable from the owning object (direct property, or a nested/related object up to two hops out). Skipped when the loaded profile itself recognises the attribute name somewhere in its own LabelTemplate catalogue, since such attributes are legitimately optional. | |
 | ERR-E21 | Error | More than one object references the same target through a property the meta-model bounds at one via `oppositeUpper` — 26 properties declare it, covering nodes (`SourceNode`, `TargetNode`), connector-line endpoints (`Source`, `Target`) and equipment links (`Valve`, `Sensorwell`, `MountedObject`, …). A typical cause is every branch of a tee being wired to its first node. Nine (owning class, property) pairs are excluded because the DEXPI reference files themselves breach them — see the list in `validation.js`. | |
@@ -466,6 +468,7 @@ Rules marked **Profile required** only fire when at least one profile XML has be
 | PRF-E05 | Warning | A `PipingNodePosition` does not align with any profile-defined piping connection point of the placed symbol (within 0.5% of drawing size); or the connection point is designated as Auxiliary (actuator/operator port — piping must not be routed there). | ✓ |
 | PRF-E06 | Error | A `Core/Diagram.TextTemplate`'s `AttributeName` is not one of the attribute placeholders the placed symbol's own catalog `Profile/LabelTemplate`(s) actually define — even if that attribute happens to resolve to a real value elsewhere (see ERR-E20 above, which checks resolvability rather than the symbol's own declared placeholder set). | ✓ |
 | PRF-E07 | Warning | An object is drawn but its `RepresentationGroup` places no `SymbolUsage`, even though the profile defines at least one symbol for that class (via the symbol's `MetaData/usage`). Classes the profile offers no symbol for — pipes, segments, piping nodes, tees, signal lines — are skipped. | ✓ |
+| PRF-E08 | Error | A class or standard property is not allowed by the profile's `Profile/UsageConstraint`: the object's class is not in `AllowedClasses`, or a Data/Components/References property (qualified by the class that declares it, e.g. `Plant.Piping.PipingComponent.FluidCode`) is not in `AllowedProperties`. Profile-defined classes and prefixed profile properties (ERR-E18) are not checked. | ✓ |
 | PRF-007 | Info | A profile constraint was silently overridden by a later-loaded profile (logged when multiple profiles are stacked). | ✓ |
 | PRF-{profile}-{property} | Warning | A model object is missing a property that is required (`Lower ≥ 1`) by the loaded profile's `PropertyConstraint`. Generated dynamically per property. | ✓ |
 

@@ -587,7 +587,8 @@ const SIGNAL_CONVEYING_DASH_ARRAY = "3 3"; // 3 mm dash / 3 mm gap, as vegarring
 // When SignalConveyingFunctionTypeRepresentation is given, its representation
 // style wins over the DashStyle written on the drawn Core/Diagram.ConnectorLine:
 //   "SignalConveying"            -> dashed line (SIGNAL_CONVEYING_DASH_ARRAY)
-//   any sub-type listed below    -> SOLID line + the sub-type glyph from
+//   "InstrumentTubingConveying"  -> SOLID (continuous) line, no glyph
+//   any other sub-type below     -> SOLID line + the sub-type glyph from
 //                                   App.jsx's SIGNAL_CONVEYING_MARKS repeated
 //                                   along it (e.g. Electrical = italic "E";
 //                                   ElectromagneticUnguided hides the line and
@@ -602,6 +603,8 @@ const SIGNAL_CONVEYING_SOLID_TYPES = new Set([
     "UndefinedSignalConveying",
     "ElectromagneticGuidedSignalConveying",
     "ElectromagneticUnguidedSignalConveying",
+    // Instrument tubing: plain continuous line, no glyph (not in SIGNAL_CONVEYING_MARKS).
+    "InstrumentTubingConveying",
 ]);
 
 // Profiles published from https://draga.no (xBRIDGE exports, e.g. Model

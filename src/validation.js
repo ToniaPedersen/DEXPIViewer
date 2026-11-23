@@ -1,5 +1,5 @@
 // DEXPI Verificator – Validation Engine
-// Implements: VAL-001..005, VAX-001, VAX-003..005, VAE-001..006, PRF-001..007, ERR-E01..E20, RPT-001..004
+// Implements: VAL-001..005, VAX-001, VAX-003..005, VAE-001..006, PRF-001..008, ERR-E01..E21, RPT-001..004
 // (VAX-002 removed: duplicated ERR-E12's OperatedValveReference.Valve target-type check.)
 
 import { DEXPI_ALL_TYPES, DEXPI_STD_PREFIXES as _DEXPI_STD_PREFIXES } from "./dexpiTypes.js";
@@ -63,6 +63,7 @@ export const DEFAULT_SEVERITIES = {
     "PRF-E05": { level: "Warning", score: 2 },
     "PRF-E06": { level: "Error",   score: 3 },
     "PRF-E07": { level: "Warning", score: 2 },
+    "PRF-E08": { level: "Error",   score: 3 },
 };
 
 // Very short description of each verification code, shown next to the code in
@@ -93,11 +94,11 @@ export const CODE_DESCRIPTIONS = {
     "ERR-E08": "Object under the wrong or an undefined Components property",
     "ERR-E10": "Duplicate id",
     "ERR-E11": "Duplicate PersistentIdentifier",
-    "ERR-E12": "Valve reference points to a non-valve",
+    "ERR-E12": "Reference target has the wrong class",
     "ERR-E15": "PlantMetaData missing",
     "ERR-E16": "Graphics represent a missing object",
     "ERR-E17": "Important object has no graphics",
-    "ERR-E18": "Attribute not allowed on this class (profile)",
+    "ERR-E18": "Property not allowed on this class (profile)",
     "ERR-E19": "Attribute used too many times (profile)",
     "ERR-E20": "Label attribute has no value",
     "ERR-E21": "Target referenced more than once",
@@ -107,6 +108,7 @@ export const CODE_DESCRIPTIONS = {
     "PRF-E05": "Pipe end not on a symbol connection point",
     "PRF-E06": "Label attribute not defined by the symbol",
     "PRF-E07": "Object drawn without a symbol",
+    "PRF-E08": "Class or property not allowed by the profile",
     "PRF-007": "Profile constraint overridden",
 };
 
@@ -277,6 +279,75 @@ export function getMetaModelLookup(modelName) {
 
 // ─── Base Validation (VAL) ────────────────────────────────────────────────────
 
+// ─── Line numbers for objects and their properties ───────────────────────────
+// DOMParser does not expose line numbers. This scans the raw XML once and returns
+//   objLines  — line of each <Object> opening tag, in document order (index i
+//               matches the i-th element of doc.getElementsByTagName("Object"))
+//   propLines — "objectIndex::tag::property" → line of the first Data /
+//               Components / References element with that property directly
+//               under that object.
+// Works for objects without an id (graphics), which the id-keyed maps cannot.
+const _objectLineCache = new Map();
+function scanObjectLines(mainXml) {
+    if (_objectLineCache.has(mainXml)) return _objectLineCache.get(mainXml);
+    const objLines = [];
+    const propLines = new Map();
+    const stack = [];
+    const re = /<(\/?)(Object|Components|Data|References)\b([^>]*?)(\/?)>|\n/g;
+    let line = 1, m;
+    while ((m = re.exec(mainXml)) !== null) {
+        if (m[0] === "\n") { line++; continue; }
+        const [whole, close, tag, attrs, selfClose] = m;
+        if (tag === "Object") {
+            if (close) stack.pop();
+            else {
+                objLines.push(line);
+                if (!selfClose) stack.push(objLines.length - 1);
+            }
+        } else if (!close && stack.length) {
+            const pm = attrs.match(/\bproperty=["']([^"']*)["']/);
+            if (pm) {
+                const key = `${stack[stack.length - 1]}::${tag}::${pm[1]}`;
+                if (!propLines.has(key)) propLines.set(key, line);
+            }
+        }
+        for (let i = 0; i < whole.length; i++) if (whole.charCodeAt(i) === 10) line++;
+    }
+    const out = { objLines, propLines };
+    _objectLineCache.clear(); // keep only the latest file
+    _objectLineCache.set(mainXml, out);
+    return out;
+}
+
+// Nearest enclosing <Object> (including el itself when it is one) that has an id.
+// Graphics often have no id all the way up to the Diagram; then the object drawn
+// by the nearest enclosing RepresentationGroup (its Represents target) is used,
+// so the issue can still be selected in the viewer.
+function nearestObjectId(el) {
+    for (let cur = el; cur && cur.nodeType === 1; cur = cur.parentNode) {
+        if (cur.tagName !== "Object") continue;
+        if (cur.getAttribute("id")) return cur.getAttribute("id");
+        if (cur.getAttribute("type") === "Core/Diagram.RepresentationGroup") {
+            for (const c of Array.from(cur.childNodes || [])) {
+                if (c.nodeType === 1 && c.tagName === "References" && c.getAttribute("property") === "Represents") {
+                    const tok = (c.getAttribute("objects") || "").trim().split(/\s+/)[0] || "";
+                    if (tok.startsWith("#") && tok.length > 1) return tok.slice(1);
+                }
+            }
+        }
+    }
+    return "";
+}
+
+// Direct element children with the given tag name (works with xmldom, which has no .children).
+function childElementsByTag(el, tag) {
+    const out = [];
+    for (const c of Array.from(el.childNodes || [])) {
+        if (c.nodeType === 1 && (!tag || c.tagName === tag)) out.push(c);
+    }
+    return out;
+}
+
 export function runBaseValidation(mainXml, flatTree, severityConfig, externalValidIds = new Set()) {
     const issues = [];
 
@@ -348,6 +419,64 @@ export function runBaseValidation(mainXml, flatTree, severityConfig, externalVal
             });
         });
     });
+
+    // VAL-005 (every <References> element): the parsed tree above only carries
+    // objects with an id, so broken references on graphics objects without one
+    // were never checked — Core/Diagram.ConnectorLine Source/Target pointing at
+    // a missing NodePosition, RepresentationGroup.Represents, and
+    // AttributeRepresentation.Object. Scan every <References> element in the
+    // document and report each "#id" whose target is not in the file, skipping
+    // those already reported above. Non-"#" tokens (e.g. "DiscProfile/ND0004")
+    // are model references resolved elsewhere (PRF-E04).
+    try {
+        const doc = new DOMParser().parseFromString(mainXml, "application/xml");
+        if (doc.getElementsByTagName("parsererror").length === 0) {
+            const objects = Array.from(doc.getElementsByTagName("Object"));
+            const docIds = new Set(allIds);
+            const objIndex = new Map();
+            objects.forEach((o, i) => {
+                objIndex.set(o, i);
+                const id = o.getAttribute("id");
+                if (id) docIds.add(id);
+            });
+            const reported = new Set(issues
+                .filter(i => i.ruleId === "VAL-005")
+                .map(i => `${i.objectId}::${(i.location.match(/@property='([^']*)'/) || [])[1] || ""}::${(i.description.match(/references object '([^']*)'/) || [])[1] || ""}`));
+            const { propLines } = scanObjectLines(mainXml);
+            const sev = resolveSeverity("VAL-005", severityConfig);
+            for (const refEl of Array.from(doc.getElementsByTagName("References"))) {
+                const owner = refEl.parentNode;
+                if (!owner || owner.nodeType !== 1 || owner.tagName !== "Object") continue;
+                const prop = refEl.getAttribute("property") || "";
+                const ownerId = owner.getAttribute("id") || "";
+                const ownerType = owner.getAttribute("type") || "(no type)";
+                for (const token of (refEl.getAttribute("objects") || "").trim().split(/\s+/)) {
+                    if (!token.startsWith("#")) continue;
+                    const targetId = token.slice(1);
+                    if (!targetId || docIds.has(targetId) || externalValidIds.has(targetId)) continue;
+                    const key = `${ownerId || "(no id)"}::${prop}::${targetId}`;
+                    if (reported.has(key)) continue;
+                    reported.add(key);
+                    const ancId = ownerId || nearestObjectId(owner.parentNode);
+                    const where = ownerId
+                        ? `'${ownerType}' '${ownerId}'`
+                        : `'${ownerType}' (no id${ancId ? `, inside '${ancId}'` : ""})`;
+                    const lineNumber = propLines.get(`${objIndex.get(owner)}::References::${prop}`);
+                    issues.push({
+                        objectId: ancId || "(no id)", objectType: ownerType, ruleId: "VAL-005",
+                        severity: sev.level, score: sev.score,
+                        description: `Broken reference: '${prop}' on ${where} references object '${targetId}' which is not present in this file.`,
+                        location: ownerId
+                            ? `//*[@id='${ownerId}']/References[@property='${prop}']`
+                            : `${ancId ? `//*[@id='${ancId}']` : ""}//Object[@type='${ownerType}']/References[@property='${prop}' and @objects='${token}']`,
+                        profileSource: "Base",
+                        suggestedCorrection: `Ensure object '${targetId}' is included in the file, or remove/correct the reference.`,
+                        ...(lineNumber !== undefined ? { lineNumber } : {})
+                    });
+                }
+            }
+        }
+    } catch (_) { /* parse problems are reported by VAL-001 / ERR-E01 */ }
 
     return issues;
 }
@@ -900,35 +1029,121 @@ export function runXmlSchemaValidation(mainXml, flatTree, severityConfig, extern
         }
     });
 
-    // ERR-E12: Reference target wrong type for relationship
-    // OperatedValveReference.Valve must point to a valve type
-    const flatMap = new Map(flatTree.filter(n => n.objectId).map(n => [n.objectId, n]));
-    flatTree.forEach(node => {
-        if (!node.type.includes("OperatedValveReference")) return;
-        const loc = node.objectId ? `//*[@id='${node.objectId}']` : "(OperatedValveReference)";
-        node.refs.forEach(ref => {
-            if (ref.property.toLowerCase() !== "valve") return;
-            ref.objects.forEach(targetId => {
-                const target = flatMap.get(targetId);
-                if (!target) return;
-                const ts = target.type.split(".").pop().toLowerCase();
-                const isValve = ts.includes("valve") || ts.includes("gate") || ts.includes("ball") || ts.includes("butterfly") || ts.includes("check");
-                if (!isValve) {
-                    const sev = resolveSeverity("ERR-E12", severityConfig);
-                    const refLine = refLineMap.get(targetId);
+    // ERR-E12: References target of the wrong class (general check).
+    // Each <References property="P" objects="#id …"> on an object of class C is
+    // checked against the ReferenceProperty P that C declares or inherits in the
+    // DEXPI 2.0 meta model (Plant or Process, whichever the document uses). Every
+    // target must be of the property's ClassReference type or a subclass of it;
+    // profile subclasses count (e.g. a DiscProfile valve class under
+    // OperatedValve), via the composition map's class closure. Examples:
+    //   OperatedValveReference.Valve                    → OperatedValve
+    //   ProcessSignalGeneratingFunction.SensingLocation → SensingLocation
+    //   PipingNetworkSegment.SourceItem / TargetItem    → PipingSourceItem / PipingTargetItem
+    //   SignalConveyingFunction.Source / Target         → SignalConveyingFunctionSource / …Target
+    //   ConnectorLine.Source / Target                   → NodePosition
+    //   RepresentationGroup.Represents                  → ConceptualObject
+    // Not checked here: profile-prefixed properties, properties the class does not
+    // have (ERR-E07), targets missing from the file (VAL-005) and target objects of
+    // a class unknown to the meta model and the loaded profiles (ERR-E07).
+    {
+        const e12Model = detectMetaModel(doc);
+        const e12Hier  = e12Model === "Process" ? PROCESS_HIERARCHY : PLANT_HIERARCHY;
+        const e12Props = e12Model === "Process" ? PROCESS_PROPS     : PLANT_PROPS;
+        const e12Suffix = t => (t || "").split(/[./]/).pop();
+
+        // classSuffix → Map<propName, targetSuffix>, direct declarations only
+        const refDecl = new Map();
+        const known = new Set();
+        for (const [cls, , , refCsv] of e12Props) {
+            known.add(cls);
+            for (const entry of (refCsv || "").split("|")) {
+                const [name, , , target] = entry.split(":");
+                if (!name || !target) continue;
+                if (!refDecl.has(cls)) refDecl.set(cls, new Map());
+                refDecl.get(cls).set(name, target);
+            }
+        }
+        const hierarchy = compositionMap?.hierarchy || (() => {
+            const h = new Map();
+            for (const [c, sup] of e12Hier) { if (!h.has(c)) h.set(c, new Set()); h.get(c).add(sup); }
+            return h;
+        })();
+        for (const [c, sups] of hierarchy) { known.add(c); for (const sup of sups) known.add(sup); }
+        const closureCache = new Map();
+        const ancestorsOf = cls => {
+            const pre = compositionMap?.closure?.get(cls);
+            if (pre) return pre;
+            if (closureCache.has(cls)) return closureCache.get(cls);
+            const out = new Set([cls]); const stack = [cls];
+            while (stack.length) for (const sup of hierarchy.get(stack.pop()) || []) if (!out.has(sup)) { out.add(sup); stack.push(sup); }
+            closureCache.set(cls, out);
+            return out;
+        };
+        // Nearest declaration of a reference property: breadth-first up the hierarchy.
+        const declCache = new Map();
+        const findRefDecl = (cls, prop) => {
+            const key = `${cls}::${prop}`;
+            if (declCache.has(key)) return declCache.get(key);
+            let found = null;
+            const seen = new Set([cls]); const queue = [cls];
+            while (queue.length && !found) {
+                const cur = queue.shift();
+                const target = refDecl.get(cur)?.get(prop);
+                if (target) { found = { declaredOn: cur, target }; break; }
+                for (const sup of hierarchy.get(cur) || []) if (!seen.has(sup)) { seen.add(sup); queue.push(sup); }
+            }
+            declCache.set(key, found);
+            return found;
+        };
+
+        const objects = Array.from(doc.getElementsByTagName("Object"));
+        const byId = new Map();
+        const objIndex = new Map();
+        objects.forEach((o, i) => {
+            objIndex.set(o, i);
+            const id = o.getAttribute("id");
+            if (id && !byId.has(id)) byId.set(id, o);
+        });
+        const { propLines } = scanObjectLines(mainXml);
+        const sev = resolveSeverity("ERR-E12", severityConfig);
+
+        for (const obj of objects) {
+            const t = obj.getAttribute("type") || "";
+            const cls = e12Suffix(t);
+            if (!cls || !known.has(cls)) continue;
+            for (const refEl of childElementsByTag(obj, "References")) {
+                const prop = refEl.getAttribute("property") || "";
+                if (!prop || prop.includes("/") || prop.includes(".")) continue;
+                const decl = findRefDecl(cls, prop);
+                if (!decl) continue;
+                for (const token of (refEl.getAttribute("objects") || "").trim().split(/\s+/)) {
+                    if (!token.startsWith("#")) continue;
+                    const targetId = token.slice(1);
+                    const targetEl = byId.get(targetId);
+                    if (!targetEl) continue; // VAL-005
+                    const targetType = targetEl.getAttribute("type") || "";
+                    const tCls = e12Suffix(targetType);
+                    if (!tCls || !known.has(tCls)) continue; // ERR-E07
+                    if (tCls === decl.target || ancestorsOf(tCls).has(decl.target)) continue;
+                    const ownerId = obj.getAttribute("id") || "";
+                    const ancId = ownerId || nearestObjectId(obj.parentNode);
+                    const lineNumber = propLines.get(`${objIndex.get(obj)}::References::${prop}`);
                     issues.push({
-                        objectId: node.objectId || "(no id)", objectType: node.type, ruleId: "ERR-E12",
+                        objectId: ancId || "(no id)", objectType: t, ruleId: "ERR-E12",
                         severity: sev.level, score: sev.score,
-                        description: `OperatedValveReference.Valve references '${targetId}' (type '${target.type}') which is not a valve type.`,
-                        location: `${loc}/References[@property='Valve']`, profileSource: "Base",
-                        suggestedCorrection: "Change the Valve reference to point to an object of a valve type.",
+                        description: `References property '${prop}' on '${t}'${ownerId ? "" : ` (no id${ancId ? `, inside '${ancId}'` : ""})`} points to '${targetId}' of type '${targetType}', which is not suitable: '${decl.declaredOn}.${prop}' requires a ${decl.target} (or a subclass).`,
+                        location: ownerId
+                            ? `//*[@id='${ownerId}']/References[@property='${prop}']`
+                            : `${ancId ? `//*[@id='${ancId}']` : ""}//Object[@type='${t}']/References[@property='${prop}']`,
+                        profileSource: "Base",
+                        suggestedCorrection: `Point '${prop}' at an object of class ${decl.target} (or one of its subclasses), or remove the reference.`,
                         targetObjectId: targetId,
-                        ...(refLine !== undefined ? { lineNumber: refLine } : {})
+                        ...(lineNumber !== undefined ? { lineNumber } : {})
                     });
                 }
-            });
-        });
-    });
+            }
+        }
+    }
 
     // ERR-E15: PlantMetaData element absent
     if (!doc.querySelector('Object[type="Plant/Diagram.PlantMetaData"]')) {
@@ -3476,6 +3691,23 @@ export function runFullValidation({ mainXml, flatTree, profiles, severityConfig,
         }
     }
 
+    // ERR-E18 (class model): profile-namespaced Data/Components/References
+    // properties on a class the profile does not declare them for. Skip any
+    // object/property pair the PropertyConstraint-driven ERR-E18 already reported.
+    {
+        const profileXmlsForClassCheck = [...new Set(allProfileXmls.map(p => p.xml).filter(Boolean))];
+        const already = new Set(allIssues
+            .filter(i => i.ruleId === "ERR-E18")
+            .map(i => `${i.objectId}::${(i.description.match(/'([^']+)'/) || [])[1] || ""}`));
+        for (const iss of runProfilePropertyClassValidation(mainXml, profileXmlsForClassCheck, severityConfig)) {
+            if (already.has(`${iss.objectId}::${iss.propertyName}`)) continue;
+            allIssues.push(iss);
+        }
+
+        // PRF-E08: classes / standard properties the profile's UsageConstraint does not allow.
+        allIssues.push(...runProfileUsageConstraintValidation(mainXml, profileXmlsForClassCheck, severityConfig));
+    }
+
     // ── Post-processing: stamp line numbers onto every remaining issue ──────────
     // Several rule-producing functions (validateSymbolRules/PRF-E04/E05/E06,
     // runAttributeConstraintValidation/ERR-E18/E19, runStructuralValidation/VAX,
@@ -3508,7 +3740,378 @@ export function runFullValidation({ mainXml, flatTree, profiles, severityConfig,
     return allIssues;
 }
 
+// ─── Profile-namespaced property / class check (ERR-E18, class model) ────────
+//
+// ERR-E07 skips every prefixed property (e.g. "DiscProfile/Sequence") and the
+// PropertyConstraint-driven ERR-E18 only sees Data properties that some
+// PropertyConstraint mentions. Neither notices a profile property being put on
+// a class the profile never grants it to, e.g.
+//   - <Data property="DiscProfile/Sequence"> on a ProcessInstrumentationFunction
+//     (DiscProfile only declares Sequence on PipingComponent, Nozzle,
+//     ProcessEquipment, OperatedValve, InlineMeasuringElement, SafetyValveOrFitting)
+//   - <References property="DiscProfile/PlantArea"> on a PipingNetworkSegment
+//     (DiscProfile declares no PlantArea property at all).
+//
+// This check resolves each "Prefix/Name" property against the profile model the
+// prefix is imported from (matched by Import source = profile Model uri, falling
+// back to Model name = prefix) and requires that the profile declares Name, as
+// the right kind of property (Data → DataProperty, Components →
+// CompositionProperty, References → ReferenceProperty), on the object's class or
+// one of its supertypes (Core/Plant or Process hierarchy + profile classes).
+// Prefixes that do not resolve to a loaded profile are left alone.
+const PROFILE_PROP_KIND = { Data: "DataProperty", Components: "CompositionProperty", References: "ReferenceProperty" };
+
+export function runProfilePropertyClassValidation(mainXml, profileXmlList, severityConfig) {
+    const issues = [];
+    if (!mainXml || !profileXmlList || profileXmlList.length === 0) return issues;
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(mainXml, "application/xml");
+    if (doc.querySelector("parsererror")) return issues;
+
+    const suffixOf = s => (s || "").split(/[./]/).pop();
+    const modelName = detectMetaModel(doc);
+    const baseHierarchy = modelName === "Process" ? PROCESS_HIERARCHY : PLANT_HIERARCHY;
+    const baseProps     = modelName === "Process" ? PROCESS_PROPS     : PLANT_PROPS;
+
+    // Combined hierarchy: base meta model + every loaded profile's own classes.
+    const hierarchy = new Map();
+    const known = new Set();
+    const addEdge = (c, s) => {
+        if (!hierarchy.has(c)) hierarchy.set(c, new Set());
+        hierarchy.get(c).add(s); known.add(c); known.add(s);
+    };
+    for (const [c, s] of baseHierarchy) addEdge(c, s);
+    for (const [c] of baseProps) known.add(c);
+
+    // Per profile: { name, uri, props: Map<classSuffix, Map<kind, Set<propName>>> }
+    const profileModels = [];
+    for (const xml of profileXmlList) {
+        if (!xml) continue;
+        const pdoc = parser.parseFromString(xml, "application/xml");
+        if (pdoc.querySelector("parsererror")) continue;
+        const root = pdoc.documentElement;
+        if (!root || root.tagName !== "Model") continue;
+        const pm = { name: root.getAttribute("name") || "", uri: root.getAttribute("uri") || "", props: new Map(), classes: new Set() };
+        const addProp = (cls, kind, name) => {
+            if (!pm.props.has(cls)) pm.props.set(cls, new Map());
+            const byKind = pm.props.get(cls);
+            if (!byKind.has(kind)) byKind.set(kind, new Set());
+            byKind.get(kind).add(name);
+        };
+        const readProps = (clsEl, cls) => {
+            for (const child of Array.from(clsEl.childNodes || [])) {
+                if (child.nodeType !== 1) continue;
+                if (!Object.values(PROFILE_PROP_KIND).includes(child.tagName)) continue;
+                const n = suffixOf(child.getAttribute("name"));
+                if (n) addProp(cls, child.tagName, n);
+            }
+        };
+        for (const tag of ["ConcreteClass", "AbstractClass"]) {
+            for (const el of Array.from(pdoc.getElementsByTagName(tag))) {
+                const cls = suffixOf(el.getAttribute("name"));
+                if (!cls) continue;
+                known.add(cls);
+                pm.classes.add(cls);
+                for (const s of (el.getAttribute("superTypes") || "").trim().split(/\s+/)) {
+                    if (s) addEdge(cls, suffixOf(s));
+                }
+                readProps(el, cls);
+            }
+        }
+        for (const el of Array.from(pdoc.getElementsByTagName("ClassExtension"))) {
+            const cls = suffixOf(el.getAttribute("baseType"));
+            if (cls) readProps(el, cls);
+        }
+        profileModels.push(pm);
+    }
+    if (profileModels.length === 0) return issues;
+
+    const ancCache = new Map();
+    const ancestors = cls => {
+        if (ancCache.has(cls)) return ancCache.get(cls);
+        const out = new Set([cls]);
+        const stack = [cls];
+        while (stack.length) {
+            for (const s of hierarchy.get(stack.pop()) || []) {
+                if (!out.has(s)) { out.add(s); stack.push(s); }
+            }
+        }
+        ancCache.set(cls, out);
+        return out;
+    };
+
+    // Instance-file prefix → profile model.
+    const prefixToProfile = new Map();
+    for (const imp of Array.from(doc.getElementsByTagName("Import"))) {
+        const prefix = imp.getAttribute("prefix") || "";
+        const src = imp.getAttribute("source") || "";
+        const pm = profileModels.find(p => p.uri && p.uri === src) ||
+                   profileModels.find(p => p.name === prefix);
+        if (prefix && pm) prefixToProfile.set(prefix, pm);
+    }
+    if (prefixToProfile.size === 0) return issues;
+
+    // Line of each property element, keyed "ownerId::tag::property" (same scheme as ERR-E07).
+    const propLines = new Map();
+    {
+        const objStack = [];
+        mainXml.split("\n").forEach((line, i) => {
+            const pt = line.match(/<(Components|Data|References)\b[^>]*\bproperty=["']([^"']+)["']/);
+            if (pt && objStack.length && objStack[objStack.length - 1]) {
+                const key = `${objStack[objStack.length - 1]}::${pt[1]}::${pt[2]}`;
+                if (!propLines.has(key)) propLines.set(key, i + 1);
+            }
+            const open = line.match(/<Object\b([^>]*?)(\/)?>/);
+            if (open && !open[2]) {
+                const idm = open[1].match(/\bid=["']([^"']+)["']/);
+                objStack.push(idm ? idm[1] : "");
+            }
+            const closes = (line.match(/<\/Object>/g) || []).length;
+            for (let k = 0; k < closes; k++) objStack.pop();
+        });
+    }
+
+    const sev = resolveSeverity("ERR-E18", severityConfig);
+    for (const obj of Array.from(doc.getElementsByTagName("Object"))) {
+        const t = obj.getAttribute("type") || "";
+        if (!t) continue;
+        const cls = suffixOf(t);
+        if (!known.has(cls)) continue; // unknown class: ERR-E07 territory
+        const objId = obj.getAttribute("id") || "";
+        for (const child of Array.from(obj.childNodes || [])) {
+            if (child.nodeType !== 1) continue;
+            const kind = PROFILE_PROP_KIND[child.tagName];
+            if (!kind) continue;
+            const prop = child.getAttribute("property") || "";
+            const slash = prop.indexOf("/");
+            if (slash <= 0) continue;
+            const pm = prefixToProfile.get(prop.slice(0, slash));
+            if (!pm) continue;
+            const name = suffixOf(prop.slice(slash + 1));
+            if (!name) continue;
+
+            const anc = ancestors(cls);
+            let ok = false;
+            const otherKinds = new Set();
+            const declaredOn = new Set();
+            for (const [c, byKind] of pm.props) {
+                for (const [k, names] of byKind) {
+                    if (!names.has(name)) continue;
+                    if (anc.has(c)) { if (k === kind) ok = true; else otherKinds.add(k); }
+                    else if (k === kind) declaredOn.add(c);
+                }
+            }
+            if (ok) continue;
+
+            let description, suggestedCorrection;
+            if (otherKinds.size > 0) {
+                description = `${child.tagName} property '${prop}' on '${t}': profile '${pm.name}' declares '${name}' for this class as ${[...otherKinds].join("/")}, not ${kind}.`;
+                suggestedCorrection = `Write '${prop}' using the element that matches its ${[...otherKinds].join("/")} declaration.`;
+            } else if (declaredOn.size > 0) {
+                const list = [...declaredOn].sort().join(", ");
+                description = `${child.tagName} property '${prop}' is not allowed on class '${t}'. Profile '${pm.name}' only declares '${name}' (${kind}) on: ${list} (and their subclasses).`;
+                suggestedCorrection = `Remove '${prop}' from this object, or use the matching standard DEXPI property if one exists.`;
+            } else if (pm.classes.has(name)) {
+                // e.g. Data property="DiscProfile/AreaBreak" — AreaBreak is a class, not a property.
+                const hosts = [];
+                for (const [c, byKind] of pm.props) {
+                    for (const n of byKind.get("CompositionProperty") || []) {
+                        if (anc.has(c)) hosts.push(`${pm.name}/${n}`);
+                    }
+                }
+                description = `${child.tagName} property '${prop}' on '${t}': '${name}' is a class in profile '${pm.name}', not a property.`;
+                suggestedCorrection = hosts.length
+                    ? `Add an object of type '${pm.name}/InformationModel.${name}' under one of: ${hosts.join(", ")}.`
+                    : `Remove '${prop}'; '${name}' must be used as an object type, not a property name.`;
+            } else {
+                description = `${child.tagName} property '${prop}' is not defined in profile '${pm.name}' for any class.`;
+                suggestedCorrection = `Remove '${prop}', or use the standard DEXPI property on the class that defines it (check the parent object).`;
+            }
+            const lineNumber = objId ? propLines.get(`${objId}::${child.tagName}::${prop}`) : undefined;
+            issues.push({
+                objectId: objId || "(no id)", objectType: t, ruleId: "ERR-E18",
+                severity: sev.level, score: sev.score,
+                description,
+                location: objId ? `//*[@id='${objId}']/${child.tagName}[@property='${prop}']` : `//Object[@type='${t}']/${child.tagName}[@property='${prop}']`,
+                profileSource: pm.name,
+                suggestedCorrection,
+                propertyName: prop,
+                ...(lineNumber !== undefined ? { lineNumber } : {}),
+            });
+        }
+    }
+    return issues;
+}
+
 // ─── CSV Export (RPT-002, RPT-003) ────────────────────────────────────────────
+
+// ─── Profile UsageConstraint (PRF-E08) ───────────────────────────────────────
+//
+// A profile may restrict which DEXPI classes and properties a file may use with
+// a Profile/UsageConstraint object (Profile.xml: Constraint subclass with
+// AllowedClasses and AllowedProperties string lists). DiscProfile.xml has one:
+//   AllowedClasses    "Plant.Piping.PipingNode", "Core.Diagram.ConnectorLine", …
+//   AllowedProperties "Plant.Piping.PipingNode.NominalDiameter", …
+// Each property name is qualified by the class that DECLARES it, so an inherited
+// property is listed once under its declaring class (e.g. FluidCode on a
+// GlobeValve is "Plant.Piping.PipingComponent.FluidCode").
+//
+// Checked for every <Object> in the file:
+//   - class: an object whose type comes from a standard model (Core, Plant,
+//     Process, Profile) must be in AllowedClasses. Classes a profile defines
+//     itself (DiscProfile/…) are allowed by that profile and are not checked.
+//   - properties: every un-prefixed Data / Components / References property is
+//     resolved to its declaring class (breadth-first up the meta-model hierarchy,
+//     profile classes included) and "DeclaringClass.Property" must be in
+//     AllowedProperties. Prefixed profile properties are ERR-E18's job;
+//     properties no class declares are ERR-E07's.
+// Names are compared on their last segments (Class, Class.Property), as the
+// meta-model tables are keyed by class suffix.
+// With several loaded profiles that have a UsageConstraint, the lists are merged:
+// a class or property is allowed when any of them allows it.
+export function runProfileUsageConstraintValidation(mainXml, profileXmlList, severityConfig) {
+    const issues = [];
+    if (!mainXml || !profileXmlList || profileXmlList.length === 0) return issues;
+    const parser = new DOMParser();
+    const lastSegs = (s, n) => (s || "").trim().split(/[./]/).slice(-n).join(".");
+
+    const allowedClasses = new Set();
+    const allowedProps = new Set();
+    const qualified = new Map(); // classSuffix → "Model.Package.Class" for messages
+    const profileNames = [];
+    let hasClassList = false, hasPropList = false;
+    for (const xml of profileXmlList) {
+        if (!xml || !xml.includes("Profile/UsageConstraint")) continue;
+        const pdoc = parser.parseFromString(xml, "application/xml");
+        if (pdoc.getElementsByTagName("parsererror").length) continue;
+        let found = false;
+        for (const o of Array.from(pdoc.getElementsByTagName("Object"))) {
+            if (o.getAttribute("type") !== "Profile/UsageConstraint") continue;
+            found = true;
+            for (const d of childElementsByTag(o, "Data")) {
+                const p = d.getAttribute("property");
+                if (p !== "AllowedClasses" && p !== "AllowedProperties") continue;
+                for (const sEl of Array.from(d.getElementsByTagName("String"))) {
+                    const v = (sEl.textContent || "").trim();
+                    if (!v) continue;
+                    if (p === "AllowedClasses") {
+                        hasClassList = true;
+                        allowedClasses.add(lastSegs(v, 1));
+                        qualified.set(lastSegs(v, 1), v);
+                    } else {
+                        hasPropList = true;
+                        allowedProps.add(lastSegs(v, 2));
+                        const cq = v.split(".").slice(0, -1).join(".");
+                        if (cq && !qualified.has(lastSegs(cq, 1))) qualified.set(lastSegs(cq, 1), cq);
+                    }
+                }
+            }
+        }
+        if (found) profileNames.push(pdoc.documentElement?.getAttribute("name") || "Profile");
+    }
+    if (!hasClassList && !hasPropList) return issues;
+    const profileLabel = profileNames.length === 1 ? `profile '${profileNames[0]}'` : `profiles ${profileNames.map(n => `'${n}'`).join(", ")}`;
+    for (const t of DEXPI_ALL_TYPES) {
+        const suf = lastSegs(t, 1);
+        if (!qualified.has(suf)) qualified.set(suf, t.replace("/", "."));
+    }
+    const qual = cls => qualified.get(cls) || cls;
+
+    const doc = parser.parseFromString(mainXml, "application/xml");
+    if (doc.getElementsByTagName("parsererror").length) return issues;
+    const modelName = detectMetaModel(doc);
+    const baseProps = modelName === "Process" ? PROCESS_PROPS : PLANT_PROPS;
+    const hierarchy = buildProfileClassHierarchy(profileXmlList, modelName === "Process" ? PROCESS_HIERARCHY : PLANT_HIERARCHY);
+
+    // classSuffix → Map<propName, kind>, direct declarations of the base meta model.
+    const declared = new Map();
+    const KIND = ["DataProperty", "CompositionProperty", "ReferenceProperty"];
+    for (const row of baseProps) {
+        const cls = row[0];
+        for (let k = 0; k < 3; k++) {
+            for (const entry of (row[k + 1] || "").split("|")) {
+                const name = entry.split(":")[0];
+                if (!name) continue;
+                if (!declared.has(cls)) declared.set(cls, new Map());
+                if (!declared.get(cls).has(name)) declared.get(cls).set(name, KIND[k]);
+            }
+        }
+    }
+    const declCache = new Map();
+    const findDecl = (cls, prop) => {
+        const key = `${cls}::${prop}`;
+        if (declCache.has(key)) return declCache.get(key);
+        let found = null;
+        const seen = new Set([cls]); const queue = [cls];
+        while (queue.length) {
+            const cur = queue.shift();
+            const kind = declared.get(cur)?.get(prop);
+            if (kind) { found = { cls: cur, kind }; break; }
+            for (const sup of hierarchy.get(cur) || []) if (!seen.has(sup)) { seen.add(sup); queue.push(sup); }
+        }
+        declCache.set(key, found);
+        return found;
+    };
+
+    // Prefixes bound to the standard models (Core/Plant/Process/Profile).
+    const stdPrefixes = new Set(["Core", "Plant", "Process", "Profile"]);
+    for (const imp of Array.from(doc.getElementsByTagName("Import"))) {
+        const px = imp.getAttribute("prefix") || "";
+        const src = imp.getAttribute("source") || "";
+        if (px && /\/(Core|Plant|Process|Profile)\.xml$/i.test(src)) stdPrefixes.add(px);
+    }
+
+    const { objLines, propLines } = scanObjectLines(mainXml);
+    const sev = resolveSeverity("PRF-E08", severityConfig);
+    const objects = Array.from(doc.getElementsByTagName("Object"));
+    objects.forEach((obj, idx) => {
+        const t = obj.getAttribute("type") || "";
+        const slash = t.indexOf("/");
+        if (slash <= 0) return;
+        const prefix = t.slice(0, slash);
+        const cls = lastSegs(t, 1);
+        const ownerId = obj.getAttribute("id") || "";
+        const ancId = ownerId || nearestObjectId(obj.parentNode);
+        const noIdNote = ownerId ? "" : ` (no id${ancId ? `, inside '${ancId}'` : ""})`;
+        const objLoc = ownerId ? `//*[@id='${ownerId}']` : `${ancId ? `//*[@id='${ancId}']` : ""}//Object[@type='${t}']`;
+
+        if (hasClassList && stdPrefixes.has(prefix) && !allowedClasses.has(cls)) {
+            issues.push({
+                objectId: ancId || "(no id)", objectType: t, ruleId: "PRF-E08",
+                severity: sev.level, score: sev.score,
+                description: `Class ${qual(cls)} ('${t}'${noIdNote}) is not allowed by ${profileLabel}: it is not in the UsageConstraint AllowedClasses.`,
+                location: objLoc, profileSource: profileNames.join(", "),
+                suggestedCorrection: `Use a class the profile allows, or add '${qual(cls)}' to the profile's UsageConstraint AllowedClasses if it should be allowed.`,
+                ...(objLines[idx] !== undefined ? { lineNumber: objLines[idx] } : {}),
+            });
+        }
+        if (!hasPropList) return;
+        const seenProps = new Set();
+        for (const child of childElementsByTag(obj)) {
+            if (child.tagName !== "Data" && child.tagName !== "Components" && child.tagName !== "References") continue;
+            const prop = child.getAttribute("property") || "";
+            if (!prop || prop.includes("/") || prop.includes(".")) continue;
+            if (seenProps.has(`${child.tagName}::${prop}`)) continue; // duplicates are ERR-E07
+            seenProps.add(`${child.tagName}::${prop}`);
+            const decl = findDecl(cls, prop);
+            if (!decl) continue;
+            if (allowedProps.has(`${decl.cls}.${prop}`)) continue;
+            const full = `${qual(decl.cls)}.${prop}`;
+            const lineNumber = propLines.get(`${idx}::${child.tagName}::${prop}`);
+            issues.push({
+                objectId: ancId || "(no id)", objectType: t, ruleId: "PRF-E08",
+                severity: sev.level, score: sev.score,
+                description: `${decl.kind} ${full} on '${t}'${noIdNote} is not allowed by ${profileLabel}: it is not in the UsageConstraint AllowedProperties.`,
+                location: `${objLoc}/${child.tagName}[@property='${prop}']`,
+                profileSource: profileNames.join(", "),
+                suggestedCorrection: `Remove '${prop}' from this object, or add '${full}' to the profile's UsageConstraint AllowedProperties if it should be allowed.`,
+                propertyName: prop,
+                ...(lineNumber !== undefined ? { lineNumber } : {}),
+            });
+        }
+    });
+    return issues;
+}
 
 export function exportCSV(issues) {
     const headers = [

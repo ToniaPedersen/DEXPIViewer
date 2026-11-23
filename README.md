@@ -4,7 +4,7 @@ A browser-based viewer and validation engine for [DEXPI 2.0](https://dexpi.org) 
 
 **Live demo:** [toniapedersen.github.io/DEXPIViewer](https://toniapedersen.github.io/DEXPIViewer/)
 
-Version 2.6.0 - see [ChangeLog_2.5_to_2.6.md](ChangeLog_2.5_to_2.6.md) for the changes since 2.5.
+Version 2.7.0 - see [ChangeLog_2.6_to_2.7.md](ChangeLog_2.6_to_2.7.md) for the changes since 2.6.
 
 ---
 
@@ -39,7 +39,7 @@ It is intended to serve as a reference implementation for DEXPI 2.0 file parsing
 |---------|---------|-------------|
 | VAL-001 | Error   | XML is not well-formed (parse error) |
 | VAL-004 | Warning | Model object has no `id` attribute |
-| VAL-005 | Error   | Broken reference — `objects="…"` points to an ID not present in the file |
+| VAL-005 | Error   | Broken reference — `objects="#…"` points to an ID not present in the file. Every `<References>` element is checked, including graphics without an id (`ConnectorLine` `Source`/`Target`, `RepresentationGroup.Represents`, `AttributeRepresentation.Object`) |
 
 ### ERR — XML Schema & Structural Correctness (DEXPI XML)
 
@@ -55,11 +55,11 @@ It is intended to serve as a reference implementation for DEXPI 2.0 file parsing
 | ERR-E08  | Error           | Object placed under a `Components` property whose declared target class (per the Plant/Process Meta Model's `CompositionProperty`/`ClassReference`, including profile-declared subclasses) does not match the object's type or a subtype of it |
 | ERR-E10  | Error           | Duplicate `id` attribute — two or more objects share the same ID |
 | ERR-E11  | Error           | Duplicate `PersistentIdentifier` value across objects |
-| ERR-E12  | Error           | `OperatedValveReference.Valve` references a non-valve type |
+| ERR-E12  | Error           | A `References` target is not of the class the reference property requires (its `ClassReference` in the DEXPI 2.0 meta model, subclasses and profile subclasses allowed), e.g. `SensingLocation` → a `ProcessInstrumentationFunction`, `SignalConveyingFunction.Target` → a meter, `SourceItem` → a FlowOut off-page connector |
 | ERR-E15  | Error           | `PlantMetaData` element is absent from the file |
 | ERR-E16  | Error           | Graphical `Represents` reference points to a non-existent model object |
 | ERR-E17  | Error           | Important equipment/valve/connector has no `RepresentationGroup` (orphaned model object) |
-| ERR-E18  | Error           | Attribute used on an element whose class does not allow it per the loaded profile's `PropertyConstraint` definitions (or, absent a profile, per the base DEXPI 2.0 meta model); cross-profile class-model inheritance (`ClassExtension`, `DataProperty`) is honoured before raising |
+| ERR-E18  | Error           | Attribute used on an element whose class does not allow it per the loaded profile's `PropertyConstraint` definitions (or, absent a profile, per the base DEXPI 2.0 meta model); cross-profile class-model inheritance (`ClassExtension`, `DataProperty`) is honoured before raising. Also raised for a `Prefix/Name` Data, Components or References property that the loaded profile does not declare on the object's class or any supertype (e.g. `DiscProfile/Sequence` on a ProcessInstrumentationFunction) |
 | ERR-E19  | Error           | Attribute appears more times than the upper cardinality allows per the loaded profile (or the base DEXPI 2.0 meta model) |
 | ERR-E20  | Error           | A `Core/Diagram.TextTemplate`'s `AttributeName` doesn't resolve to a value reachable from the owning object, per the DEXPI 2.0 meta model |
 | ERR-E21  | Error           | More than one object references the same target through a property whose meta-model `oppositeUpper` bound is 1 (nodes, connector-line endpoints, equipment links); nine class/property pairs the DEXPI reference files themselves breach are excluded |
@@ -99,6 +99,7 @@ It is intended to serve as a reference implementation for DEXPI 2.0 file parsing
 | PRF-E04 | Error   | A `SymbolUsage` in the drawing references a Symbol name not declared in the profile (or any profile in the loaded stack); or the symbol's allowed types do not match the model object's DEXPI type |
 | PRF-E05 | Error   | A `PipingNodePosition` in the drawing does not align with any profile-defined connection point of the placed symbol (within 0.5 % of drawing size) |
 | PRF-E07 | Warning | An object is drawn but its `RepresentationGroup` places no `SymbolUsage`, though the profile defines at least one symbol for that class (via `MetaData/usage`) |
+| PRF-E08 | Error   | A class or standard property is not allowed by the profile's `Profile/UsageConstraint`: the object's class is not in `AllowedClasses`, or a Data/Components/References property (qualified by the class that declares it, e.g. `Plant.Piping.PipingComponent.FluidCode`) is not in `AllowedProperties`. Profile-defined classes and prefixed profile properties (ERR-E18) are not checked |
 | PRF-007 | Info    | A profile constraint was silently overridden by a later-loaded profile (logged when multiple profiles are stacked) |
 | PRF-{profile}-{property} | Warning | A model object is missing a property that is required (`Lower ≥ 1`) by the loaded profile's `PropertyConstraint`; property name matching handles bare, slash-prefixed, and fully-qualified forms |
 

@@ -250,6 +250,9 @@ const S = {
     rCollapsed: { borderLeft: "1px solid #d0d7de", background: "#f6f8fa", display: "flex", alignItems: "center", justifyContent: "center" },
     toolbar: { padding: "10px 12px", borderBottom: "1px solid #d0d7de", background: "#f6f8fa", flexShrink: 0 },
     scroll: { flex: 1, overflow: "auto" },
+    // Tab pane: header/button rows stay put, only the list (paneList) scrolls.
+    pane: { flex: 1, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" },
+    paneList: { flex: 1, minHeight: 0, overflow: "auto" },
     section: { padding: 12, borderBottom: "1px solid #eef2f6" },
     btn: { padding: "6px 10px", border: "1px solid #c7ced6", background: "white", borderRadius: 6, cursor: "pointer", fontSize: 13 },
     btnPrimary: { padding: "6px 10px", border: "1px solid #0969da", background: "#0969da", color: "white", borderRadius: 6, cursor: "pointer", fontSize: 13 },
@@ -538,15 +541,18 @@ function renderPrimitive(primitive, key, textColorOverride = null, strokeMult = 
 }
 
 function highlightPrimitive(p, key, color) {
-    const sw = Math.max((p.stroke?.width || 0.25) * 2.5, 0.9);
-    if (p.kind === "polyline") return <polyline key={key} points={p.points.map(pt => `${pt.x},${pt.y}`).join(" ")} fill="none" stroke={color} strokeWidth={sw} vectorEffect="non-scaling-stroke" opacity="0.85" />;
-    if (p.kind === "polygon") return <polygon key={key} points={p.points.map(pt => `${pt.x},${pt.y}`).join(" ")} fill="none" stroke={color} strokeWidth={sw} vectorEffect="non-scaling-stroke" opacity="0.85" />;
-    if (p.kind === "circle") return <circle key={key} cx={p.center.x} cy={p.center.y} r={p.radius} fill="none" stroke={color} strokeWidth={sw} vectorEffect="non-scaling-stroke" opacity="0.85" />;
-    if (p.kind === "ellipse") return <ellipse key={key} cx={p.center.x} cy={p.center.y} rx={p.rx} ry={p.ry} fill="none" stroke={color} strokeWidth={sw} vectorEffect="non-scaling-stroke" opacity="0.85" />;
-    if (p.kind === "rect") return <rect key={key} x={p.center.x - p.width / 2} y={p.center.y - p.height / 2} width={p.width} height={p.height} fill="none" stroke={color} strokeWidth={sw} vectorEffect="non-scaling-stroke" opacity="0.85" />;
+    // Drawn on top of the primitive with non-scaling stroke (px): wider than
+    // the 1 px original and fully opaque, so the selection colour is clearly
+    // visible over thin black lines (e.g. a label's leader PolyLine).
+    const sw = Math.max((p.stroke?.width || 0.25) * 2.5, 2);
+    if (p.kind === "polyline") return <polyline key={key} points={p.points.map(pt => `${pt.x},${pt.y}`).join(" ")} fill="none" stroke={color} strokeWidth={sw} vectorEffect="non-scaling-stroke" opacity="1" />;
+    if (p.kind === "polygon") return <polygon key={key} points={p.points.map(pt => `${pt.x},${pt.y}`).join(" ")} fill="none" stroke={color} strokeWidth={sw} vectorEffect="non-scaling-stroke" opacity="1" />;
+    if (p.kind === "circle") return <circle key={key} cx={p.center.x} cy={p.center.y} r={p.radius} fill="none" stroke={color} strokeWidth={sw} vectorEffect="non-scaling-stroke" opacity="1" />;
+    if (p.kind === "ellipse") return <ellipse key={key} cx={p.center.x} cy={p.center.y} rx={p.rx} ry={p.ry} fill="none" stroke={color} strokeWidth={sw} vectorEffect="non-scaling-stroke" opacity="1" />;
+    if (p.kind === "rect") return <rect key={key} x={p.center.x - p.width / 2} y={p.center.y - p.height / 2} width={p.width} height={p.height} fill="none" stroke={color} strokeWidth={sw} vectorEffect="non-scaling-stroke" opacity="1" />;
     if (p.kind === "ellipseArc") {
         const d = ellipseArcToPath(p.center.x, p.center.y, p.rx, p.ry, p.startAngle, p.endAngle, p.rotation);
-        return <path key={key} d={d} fill="none" stroke={color} strokeWidth={sw} vectorEffect="non-scaling-stroke" opacity="0.85" />;
+        return <path key={key} d={d} fill="none" stroke={color} strokeWidth={sw} vectorEffect="non-scaling-stroke" opacity="1" />;
     }
     return null;
 }
@@ -1109,10 +1115,13 @@ function PrimitiveGraphic({ el, selected, connHighlight, onSelect, nodePosMap, b
                 if (pts.length < 2) return null;
                 return <polyline points={pts.map(pt => `${pt.x},${pt.y}`).join(" ")} fill="none" stroke="transparent" strokeWidth={Math.max((prim.stroke?.width || 0.25) + 4, 5)} vectorEffect="non-scaling-stroke" pointerEvents="stroke" />;
             })()}
-            {hlColor && el.kind !== "connectorLine" && prim?.kind !== "text" && highlightPrimitive(prim, `hl_${el.key}`, hlColor)}
             {el.kind === "connectorLine"
                 ? <ConnectorLineSvg el={el} nodePosMap={nodePosMap} selected={selected} connColor={connHighlight} boostPct={boostPct} worldPerPx={worldPerPx} />
                 : renderPrimitive(prim, el.key, prim?.kind === "text" ? hlColor : null, (boostSymbolOutlines && el.elementRole === "symbol") ? boostPct / 100 : 1, showProfileLabels, 0, null, showMixedLabels)}
+            {/* Highlight drawn ON TOP of the primitive (outline only, fill="none"):
+                drawn underneath, the black original line (e.g. a label's leader
+                PolyLine) covered it completely and the selection was invisible. */}
+            {hlColor && el.kind !== "connectorLine" && prim?.kind !== "text" && highlightPrimitive(prim, `hl_${el.key}`, hlColor)}
         </g>
     );
 }
@@ -2206,8 +2215,15 @@ export default function App() {
     // Every drawn-element source node under the selected graphical node.
     const graphHighlightNodeIds = useMemo(() => {
         if (topologyView !== "graphical" || !selectedGraphNodeId || !parsed?.diagramNodeMap) return null;
-        const root = parsed.diagramNodeMap.get(selectedGraphNodeId);
+        let root = parsed.diagramNodeMap.get(selectedGraphNodeId);
         if (!root) return null;
+        // A selection inside a Core/Diagram.Label (e.g. a PropertyBreak's label
+        // SymbolUsage, or its leader PolyLine) highlights the whole Label, so the
+        // symbol and its leader line always light up together.
+        for (let id = root.id; id; id = parsed.diagramParent.get(id)) {
+            const n = parsed.diagramNodeMap.get(id);
+            if (n && /Diagram\.Label$/.test(n.type || "")) { root = n; break; }
+        }
         const ids = new Set();
         const walk = n => { ids.add(n.id); n.children.forEach(walk); };
         walk(root);
@@ -2441,25 +2457,31 @@ export default function App() {
                     </div>
 
                     {leftTab === "topology" && (
-                        <div style={S.scroll}>
+                        <div style={S.pane}>
                             <div style={{ padding: "6px 10px", borderBottom: "1px solid #eef2f6" }}>
                                 <input style={S.input} placeholder="Search tag, type, ID, persistent ID..." value={search} onChange={e => setSearch(e.target.value)} />
                             </div>
-                            <div style={{ padding: "4px 8px", borderBottom: "1px solid #eef2f6", display: "flex", gap: 0 }} role="group" aria-label="Topology view">
-                                {[["conceptual", "Conceptual model", "Engineering objects from the ConceptualModel part of the file"],
-                                    ["graphical", "Graphical model", "Drawing structure from the Diagram part of the file (groups, symbol usages, texts, node positions)"]].map(([v, label, tip], i) => (
-                                    <button key={v} title={tip} aria-pressed={topologyView === v} onClick={() => setTopologyView(v)}
-                                        style={{ ...S.btnSmall, flex: 1, borderRadius: i === 0 ? "4px 0 0 4px" : "0 4px 4px 0", marginLeft: i ? -1 : 0,
-                                            background: topologyView === v ? "#0969da" : "white", color: topologyView === v ? "white" : "#24292f",
-                                            borderColor: topologyView === v ? "#0969da" : undefined, fontWeight: topologyView === v ? 600 : 400 }}>{label}</button>
-                                ))}
-                            </div>
-                            <div style={{ padding: "4px 8px", borderBottom: "1px solid #eef2f6", display: "flex", gap: 6 }}>
-                                <button style={S.btnSmall} onClick={expandAll}>Expand all</button>
-                                <button style={S.btnSmall} onClick={collapseAll}>Collapse all</button>
+                            <div style={{ padding: "4px 8px", borderBottom: "1px solid #eef2f6", display: "flex", alignItems: "center", gap: 4 }}>
+                                <div style={{ display: "flex" }} role="group" aria-label="Topology view">
+                                    {[["conceptual", "Conceptual model: engineering objects from the ConceptualModel part of the file",
+                                        <svg key="c" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5"><rect x="5.5" y="1.5" width="5" height="4" rx="0.5" /><rect x="1.5" y="10.5" width="5" height="4" rx="0.5" /><rect x="9.5" y="10.5" width="5" height="4" rx="0.5" /><path d="M8 5.5v2.5M4 10.5V8h8v2.5" /></svg>],
+                                      ["graphical", "Graphical model: drawing structure from the Diagram part of the file (groups, symbol usages, texts, node positions)",
+                                        <svg key="g" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5"><circle cx="4.5" cy="11.5" r="3" /><rect x="8.5" y="1.5" width="6" height="6" rx="0.5" /><path d="M1.5 3.5l4-2M7 13l7.5-3" /></svg>]].map(([v, tip, icon], i) => (
+                                        <button key={v} title={tip} aria-label={tip} aria-pressed={topologyView === v} onClick={() => setTopologyView(v)}
+                                            style={{ ...S.btnSmall, display: "flex", alignItems: "center", padding: "3px 6px", borderRadius: i === 0 ? "4px 0 0 4px" : "0 4px 4px 0", marginLeft: i ? -1 : 0,
+                                                background: topologyView === v ? "#0969da" : "white", color: topologyView === v ? "white" : "#24292f",
+                                                borderColor: topologyView === v ? "#0969da" : undefined }}>{icon}</button>
+                                    ))}
+                                </div>
+                                <button style={{ ...S.btnSmall, display: "flex", alignItems: "center", padding: "3px 6px", marginLeft: 4 }} onClick={expandAll} title="Expand all" aria-label="Expand all">
+                                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M4 6l4-4 4 4M4 10l4 4 4-4" /></svg>
+                                </button>
+                                <button style={{ ...S.btnSmall, display: "flex", alignItems: "center", padding: "3px 6px" }} onClick={collapseAll} title="Collapse all" aria-label="Collapse all">
+                                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M4 2l4 4 4-4M4 14l4-4 4 4" /></svg>
+                                </button>
                                 {parsed && <span style={{ fontSize: 12, color: "#888", marginLeft: "auto" }}>{topologyView === "graphical" ? `${parsed.diagramFlatCount} graphical objects` : `${parsed.flatTree.length} objects`}</span>}
                             </div>
-                            <div style={{ padding: 6 }}>
+                            <div style={{ ...S.paneList, padding: 6 }}>
                                 {parseError && <div style={{ color: "#cf222e", padding: 8, fontSize: 13 }}>{parseError}</div>}
                                 {filteredTree ? (
                                     <TreeNode node={filteredTree} selectedId={selectedId} onSelect={handleSelect} expanded={expanded} setExpanded={setExpanded} level={0} issueMap={issueMap}
@@ -2472,7 +2494,7 @@ export default function App() {
                     )}
 
                     {leftTab === "validation" && (
-                        <div style={S.scroll}>
+                        <div style={S.pane}>
                             {!validationDone ? (
                                 <div style={{ padding: 16, color: "#888", fontSize: 13 }}>
                                     {parsed ? 'Click "Run Validation" above.' : "Load a DEXPI XML file first."}
@@ -2510,6 +2532,7 @@ export default function App() {
                                             </div>
                                         )}
                                     </div>
+                                    <div style={S.paneList}>
                                     {(() => {
                                         const renderIssueCard = (issue, i) => {
                                             const navId = getNavigableId(issue);
@@ -2600,6 +2623,7 @@ export default function App() {
                                             );
                                         });
                                     })()}
+                                    </div>
                                     {filteredIssues.length === 0 && <div style={{ padding: 16, color: "#888", fontSize: 13 }}>No {validationFilter !== "All" ? validationFilter.toLowerCase() + " " : ""}issues found.</div>}
                                 </>
                             )}
@@ -2682,7 +2706,7 @@ export default function App() {
                         )}
 
                     {leftTab === "folder" && (
-                        <div style={S.scroll}>
+                        <div style={S.pane}>
                             <input ref={folderInputRef} type="file" webkitdirectory="" directory="" multiple style={{ display: "none" }} onChange={handleFolderPick} />
                             <input ref={folderPngInputRef} type="file" webkitdirectory="" directory="" multiple style={{ display: "none" }} onChange={handleFolderPngPick} />
                             <input ref={folderElemInputRef} type="file" webkitdirectory="" directory="" multiple style={{ display: "none" }} onChange={handleFolderElemPick} />
@@ -2736,7 +2760,7 @@ export default function App() {
                                 </div>
                             )}
                             {!folderProgress && !pngProgress && !elemProgress && !folderResults && (
-                                <div style={{ padding: 16, color: "#888", fontSize: 13, lineHeight: 1.5 }}>
+                                <div style={{ ...S.paneList, padding: 16, color: "#888", fontSize: 13, lineHeight: 1.5 }}>
                                     Each button works on every .xml file in a folder and its subfolders. <b>Open</b> on a validated file also loads the .png with the same name from that folder as the BG image.
                                     <ul style={{ margin: "6px 0 0", paddingLeft: 18 }}>
                                         <li><b>Validate…</b> checks each file with the same validation as Run Validation.</li>
@@ -2789,6 +2813,7 @@ export default function App() {
                                         <button style={S.btnSmall} onClick={() => setCollapsedFolderFiles(new Set())}>Expand all</button>
                                         <button style={S.btnSmall} onClick={() => setCollapsedFolderFiles(new Set(folderResults.map(r => r.path)))}>Collapse all</button>
                                     </div>
+                                    <div style={S.paneList}>
                                     {folderResults.map(r => {
                                         const items = folderByFile.get(r.path) || [];
                                         if (!items.length && folderFilter !== "All" && !r.error) return null;
@@ -2830,6 +2855,7 @@ export default function App() {
                                             </div>
                                         );
                                     })}
+                                    </div>
                                 </>
                             )}
                         </div>
